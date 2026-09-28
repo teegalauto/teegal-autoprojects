@@ -490,14 +490,81 @@ export class ReActExecutor {
     }
 
     // 🔥 有工具，执行工具（即使有 completeReport 也要先执行完工具）
-    const tool = tools[0];
-    const toolName = tool.name;
-    const parameters = tool.parameters;
+    // 🔥 一轮多工具：无依赖操作（如同轮读多个文件）可一次传多个，顺序执行、逐个回报——
+    //    把"读10个文件=10轮"压成1轮，任务总轮次减半以上
+    const executedResults: ToolResult[] = [];
+    for (let i = 0; i < tools.length; i++) {
+      const tool = tools[i];
+      executedResults.push(await this.executeRoundTool({
+        // 🔥 多工具时每个工具独立 callId：前端按 callId 合并消息（同 callId 原地覆盖），
+        //    共用会让后面的工具把前面的执行轨迹覆盖掉，UI 只剩最后一个
+        callId: tools.length > 1 ? `${callId}-t${i + 1}` : callId,
+        toolName: tool.name,
+        parameters: tool.parameters || {},
+        // 🔥 推理文案只挂第一个工具，避免同一段 letMeDo 在 UI 里重复 N 遍
+        content: i === 0 ? letMeDo : '',
+        userId,
+        conversationId,
+        userEmail,
+        sessionId,
+        callbacks,
+        letMeDo,
+        roundNumber,
+      }));
+    }
+
+    // 🔥 递归调用
+    return this.handleRound({
+      sessionId,
+      userId,
+      conversationId,
+      userEmail,
+      userQuery,
+      letAgentTodo,
+      callbacks,
+      abortSignal,
+      roundNumber: roundNumber + 1,
+      toolResults: [...toolResults, ...executedResults],
+      writeNotes: currentWriteNotes,
+    });
+  }
+
+  /**
+   * 执行本轮中的单个工具：流式回报 → 执行 → 完成回报 → 执行日志/项目活动记录
+   * 🔥 一轮多工具改造：handleRound 循环调用本方法，返回记录由调用方收集进 toolResults
+   */
+  private async executeRoundTool(params: {
+    callId: string;
+    toolName: string;
+    parameters: Record<string, any>;
+    userId: string;
+    conversationId: string;
+    userEmail?: string;
+    sessionId: string;
+    callbacks: ReActCallbacks;
+    letMeDo: string;
+    /** 🔥 UI 展示文案：多工具轮只让第一个工具带 letMeDo，后续传空串避免重复 */
+    content: string;
+    roundNumber: number;
+  }): Promise<ToolResult> {
+    const {
+      callId,
+      toolName,
+      parameters,
+      userId,
+      conversationId,
+      userEmail,
+      sessionId,
+      callbacks,
+      letMeDo,
+      content,
+      roundNumber,
+    } = params;
 
     await this.safeOnMessage(callbacks, callId, {
       role: 'auto',
       apiRole: 'reactor',
-      content: letMeDo,
+      content: content,
       result: '',
       status: 'streaming',
       iconText: getToolDisplayName(toolName),
@@ -542,7 +609,7 @@ export class ReActExecutor {
     await this.safeOnMessage(callbacks, callId, {
       role: 'auto',
       apiRole: 'reactor',
-      content: letMeDo,
+      content: content,
       result: shouldIncludeDetail
         ? JSON.stringify({
             type: existingType,
@@ -579,28 +646,7 @@ export class ReActExecutor {
       }
     }
 
-    // 🔥 递归调用
-    return this.handleRound({
-      sessionId,
-      userId,
-      conversationId,
-      userEmail,
-      userQuery,
-      letAgentTodo,
-      callbacks,
-      abortSignal,
-      roundNumber: roundNumber + 1,
-      toolResults: [
-        ...toolResults,
-        {
-          toolName,
-          parameters,
-          roundNumber,
-          result: toolResult,
-        },
-      ],
-      writeNotes: currentWriteNotes,
-    });
+    return { toolName, parameters, roundNumber, result: toolResult };
   }
 
   /**

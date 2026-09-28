@@ -19,6 +19,18 @@ const AuthenticatedWorkspace: React.FC<AuthenticatedWorkspaceProps> = ({ user })
   const sendRef = useRef(handlers.handleSendMessage);
   sendRef.current = handlers.handleSendMessage;
 
+  // 终态回包需要挖最终 summary 文本：.then 闭包里直接读 workspace.messages 可能是旧值，经 ref 取最新
+  const messagesRef = useRef(workspace.messages);
+  messagesRef.current = workspace.messages;
+
+  /** 尽力而为取最近一条已完成总结（summarizer）的文本：summary 正文在 result，content 为空 */
+  const pickLatestSummary = (): string | undefined => {
+    const list: any[] = messagesRef.current || [];
+    const last = [...list].reverse().find((m: any) => m.apiRole === 'summarizer' && m.status === 'completed');
+    const text = last?.result || last?.content;
+    return text ? String(text) : undefined;
+  };
+
   useEffect(() => {
     const electron = (window as any).electron;
     if (!electron?.isHeadless || !electron?.onAgentQuery) return;
@@ -27,9 +39,15 @@ const AuthenticatedWorkspace: React.FC<AuthenticatedWorkspaceProps> = ({ user })
       console.log(`🧬 [AGENT-BRIDGE] 收到 agent query: ${userQuery.slice(0, 80)}...`);
       try {
         // 受理即回包（不阻塞 HTTP 响应等执行完成——执行结果经项目文件/GPU任务回流）
-        sendRef.current(userQuery).catch((e: any) => {
-          console.error('❌ [AGENT-BRIDGE] 执行编排异常:', e);
-        });
+        // 任务真正收尾（handleSendMessage resolve/reject）时另发终态，供 GET /api/agent/result 轮询
+        sendRef.current(userQuery)
+          // 等一拍让最终 summary 落进 React state，再挖文本回终态（headless 场景百毫秒延迟无感）
+          .then(() => new Promise((r) => setTimeout(r, 100)))
+          .then(() => electron.agentQueryFinal?.({ reqId, ok: true, summary: pickLatestSummary() }))
+          .catch((e: any) => {
+            console.error('❌ [AGENT-BRIDGE] 执行编排异常:', e);
+            electron.agentQueryFinal?.({ reqId, ok: false, error: e?.message || '执行异常' });
+          });
         electron.agentQueryResult({ reqId, ok: true });
       } catch (e: any) {
         console.error('❌ [AGENT-BRIDGE] 受理失败:', e);

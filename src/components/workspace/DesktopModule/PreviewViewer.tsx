@@ -224,9 +224,15 @@ export const PreviewViewer: React.FC<PreviewViewerProps> = ({
             console.log(`[PreviewViewer] 尝试解析 JSON, 长度: ${jsonStr.length}`);
             const parsed = JSON.parse(jsonStr);
             if (parsed.output) {
-              // 🔥 JSON 解析成功，只返回 output 字段
-              console.log(`[PreviewViewer] JSON 解析成功, output 长度: ${parsed.output.length}`);
-              decoded = parsed.output;
+              // 🔥 output 可能是非字符串（对象/数组/数字），直接赋给 decoded 会让后面的
+              //    decoded.replace 炸掉（L.replace is not a function）——非字符串先序列化
+              if (typeof parsed.output === 'string') {
+                console.log(`[PreviewViewer] JSON 解析成功, output 长度: ${parsed.output.length}`);
+                decoded = parsed.output;
+              } else {
+                console.log(`[PreviewViewer] JSON 解析成功, output 为非字符串(${typeof parsed.output})，已序列化`);
+                decoded = JSON.stringify(parsed.output, null, 2);
+              }
             } else {
               console.log(`[PreviewViewer] JSON 解析成功但无 output 字段`);
             }

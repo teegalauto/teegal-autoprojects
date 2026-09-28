@@ -297,6 +297,11 @@ class ModelManagerClass {
   async refreshPackageModelTokens(): Promise<void> {
     const token = CloudAuthService.getAccessToken();
     if (!token) return;
+    // 🔥 用户模型可能尚未加载完（启动 3s 定时器早于 loadUserModels 完成，后端冷启动尤甚）：
+    //    空列表会让下面的循环静默空转，旧快照永远补不上 refreshToken（401 自愈失去凭据）
+    if (this.userModels.length === 0) {
+      await this.loadUserModels();
+    }
     // 🔥 同步存 refreshToken（30天）：local-backend 后台链路 401 时靠它自动续期（CloudTokenRefresher）
     const refreshToken = localStorage.getItem('cloud_refresh_token') || undefined;
 

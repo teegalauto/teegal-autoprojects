@@ -1,5 +1,21 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+// 🔥 Headless 分身：页面脚本运行前注入部署人凭据（主进程 headless-auth.json → localStorage）。
+// AuthContext 随后照常从 localStorage 恢复登录态 → 模型/桥/执行链零改动可用。
+// 部署人身份权威：文件存在即覆盖（谁部署用谁的身份）。
+try {
+  const _isHeadless = (process.argv || []).includes('--headless') || process.env?.TEEGAL_HEADLESS === '1';
+  if (_isHeadless) {
+    const _auth = ipcRenderer.sendSync('headless:auth:get');
+    if (_auth?.accessToken) {
+      localStorage.setItem('cloud_access_token', _auth.accessToken);
+      if (_auth.refreshToken) localStorage.setItem('cloud_refresh_token', _auth.refreshToken);
+      if (_auth.user) localStorage.setItem('teegal-user', JSON.stringify(_auth.user));
+      console.log('🧬 [PRELOAD] 已注入部署人凭据（headless-auth.json → localStorage）');
+    }
+  }
+} catch { /* 注入失败按未登录走 */ }
+
 /**
  * Electron Preload Script
  * 
@@ -147,6 +163,13 @@ contextBridge.exposeInMainWorld('electron', {
    */
   agentQueryResult: (result: { reqId: string; ok: boolean; error?: string }) => {
     ipcRenderer.send('agent:query:result', result);
+  },
+
+  /**
+   * 🔥 Headless 分身：任务真正收尾的终态回包（写入主进程内存注册表，GET /api/agent/result 可轮询）
+   */
+  agentQueryFinal: (payload: { reqId: string; ok: boolean; error?: string; summary?: string }) => {
+    ipcRenderer.send('agent:query:final', payload);
   },
 
   /**

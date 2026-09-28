@@ -19,6 +19,19 @@ function cleanMarkdownContent(content: string): string {
 // 🔥 套餐模型 401 自愈：判断 URL 是否指向云端 llm-proxy + 用 refreshToken 换新
 import { isCloudProxyUrl, refreshPackageToken } from './llm/CloudTokenRefresher';
 
+/**
+ * 🔥 无法自愈的套餐模型 401（快照缺 refreshToken / refreshToken 已失效 / 续期后仍被拒）：
+ * 原始错误对用户是天书（"API 调用失败: 401 令牌无效或已过期"），改成明确处置动作。
+ * 原始错误打回后端控制台留痕，不丢诊断信息。
+ */
+function authExpiredMessage(errorMsg: string, config: LLMConfig): string {
+  if (isCloudProxyUrl(config.url) && errorMsg.includes('调用失败: 401 ')) {
+    console.warn('⚠️ [LLM-SERVICE] 套餐模型 401 无法自愈（快照缺 refreshToken 或已失效），需用户重新登录:', errorMsg);
+    return '云端登录态已过期且无法自动续期，请重新登录账号后再试';
+  }
+  return errorMsg;
+}
+
 export interface LLMConfig {
   url: string;
   apiKey: string;
@@ -143,7 +156,7 @@ export class LLMService {
 
         if (!isOverloaded || attempt === maxRetries) {
           const duration = Date.now() - startTime;
-          return { ...result, duration };
+          return { ...result, error: authExpiredMessage(errorMsg, config), duration };
         }
 
         const delay = baseDelay * Math.pow(2, attempt - 1);
@@ -175,7 +188,7 @@ export class LLMService {
 
         if (!isOverloaded || attempt === maxRetries) {
           const duration = Date.now() - startTime;
-          return { success: false, error: errorMsg, duration };
+          return { success: false, error: authExpiredMessage(errorMsg, config), duration };
         }
 
         const delay = baseDelay * Math.pow(2, attempt - 1);

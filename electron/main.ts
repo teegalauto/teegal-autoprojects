@@ -3,7 +3,7 @@ import path from 'path';
 import { spawn, spawnSync, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { initAutoUpdater } from './autoUpdater';
-import { startAgentServer } from './agentServer';
+import { startAgentServer, readHeadlessAuth } from './agentServer';
 
 /**
  * 🔥 Headless 分身模式（TEEGAL_HEADLESS=1 或 --headless）：
@@ -308,6 +308,10 @@ function createWindow() {
   // 🔥 headless 分身：起 localhost HTTP 激活入口（POST /api/agent/query）
   if (isHeadless) {
     console.log('🧬 [HEADLESS] 分身模式：窗口已隐藏，激活入口待页面就绪后启动');
+    // preload 在页面脚本运行前同步来取部署人凭据（注入 localStorage 恢复登录态）
+    ipcMain.on('headless:auth:get', (event) => {
+      event.returnValue = readHeadlessAuth();
+    });
     startAgentServer(() => mainWindow);
   }
 

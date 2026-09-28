@@ -46,7 +46,11 @@ const STANDARD_REACT_PROTOCOL: ReActProtocolConfig = {
 \`\`\`
 
 任务完成，提前跳出循环:
-- 必须总结，且 tools 传空数组 []`,
+- 必须总结，且 tools 传空数组 []
+
+省轮次规则（重要）:
+- 无依赖的操作合并到同一轮：tools 数组一次传多个（如同轮读多个文件，单轮不超过5个）；依赖前序结果的才等下一轮
+- 编码任务先用 list_project_files 的 search 模式定位带行号的片段，再 read_project_file 带 offset/limit 精读相关段落，不要无目的整文件通读`,
 
   // 🔥 排列顺序优化缓存命中率：固定前缀尽可能长
   // staticEnvironment（固定）→ executionHistory（早期round可命中）→ dynamicEnvironment（动态）→ 轮次（动态）
