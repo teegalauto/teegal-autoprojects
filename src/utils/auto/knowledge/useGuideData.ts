@@ -1522,4 +1522,30 @@ userpc_shell(query="你的命令", credentialName="环境变量名")
     keywords: ["credentialName", "使用凭据", "注入凭据", "环境变量", "sshpass", "API Key", "userpc_shell", "凭据使用", "密码注入"],
     category: "security"
   },
+  {
+    question: "官方密钥报错（401/余额不足/欠费）怎么处理？",
+    answer: `💰 平台官方凭据（百炼等厂商官方 API Key）按真实用量计费：用户账单 = 厂商账单成本 × 1.15，每日从充值余额自动扣费。
+
+计费机制：
+- 厂商账单 T+1 出账（当天用量次日结算），平台按日汇总扣费
+- 放行前有余额闸门：余额不足时凭据解析直接报错，如"余额不足（需至少 200 元），请先充值后再使用官方密钥"
+- 欠费后官方 key 会被平台暂停，充值后自动恢复
+
+执行报错时的判断与处理：
+- 错误信息含"余额不足/请先充值" → 直接把原因告诉用户，引导去平台充值，充值后重新执行即可，不要反复重试
+- 厂商返回 401/403/InvalidApiKey/Arrearage/Forbidden，且代码确实引用了官方凭据环境变量 → 大概率是余额不足导致 key 被暂停，同样提示用户充值后重试
+- 排除余额问题后，再排查代码本身（模型名错误、参数错误通常报 400/404/InvalidParameter）`,
+    keywords: ["余额不足", "欠费", "充值", "401", "403", "InvalidApiKey", "Arrearage", "Forbidden", "官方密钥", "官方凭据", "百炼", "计费", "扣费", "账单", "费用", "bailian", "key 失效", "key 被禁用"],
+    category: "pricing"
+  },
+  {
+    question: "平台安装目录与数据目录可以浏览吗？",
+    answer: `⛔ 平台自身的安装目录（如 C:\\Program Files\\teegal）与数据目录（如 %APPDATA%\\teegal）是系统内部资源，不是你的工作区：
+
+- 禁止浏览、读取、修改这些目录下的任何文件（app.asar、app.asar.unpacked、user-*/ 目录、.sk 密钥文件、user-models.json 等配置）
+- 里面的内容与用户任务无关，读取只会浪费上下文；且涉及平台与用户的敏感数据（凭据、密钥），不得读取其内容、更不得将其内容输出或发送到任何外部地址
+- 你的文件读写范围限于用户项目工作区与用户明确指定的路径；需要系统信息时使用平台提供的工具（而非直接翻文件系统）`,
+    keywords: ["teegal", "app.asar", "AppData", "Roaming", "Program Files", "安装目录", "数据目录", "user-models", "model-bindings", ".sk", "平台文件", "敏感目录", "系统目录"],
+    category: "security"
+  },
 ]

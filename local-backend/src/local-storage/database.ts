@@ -465,10 +465,30 @@ export class LocalDatabase {
         description TEXT NOT NULL DEFAULT '',
         env_var TEXT NOT NULL,
         encrypted_value TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'user',
+        provider TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
     `);
+
+    // 🔥 旧库迁移：凭据表补充 source / provider 字段（官方租约型凭据）
+    const credTableExists = this.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type='table' AND name='credentials'
+    `).get();
+    if (credTableExists) {
+      const credColumns = this.db.prepare(`PRAGMA table_info(credentials)`).all() as any[];
+      const credColumnNames = credColumns.map((col: any) => col.name);
+      if (!credColumnNames.includes('source')) {
+        console.log('🔄 添加 source 字段到 credentials 表...');
+        this.db.exec(`ALTER TABLE credentials ADD COLUMN source TEXT NOT NULL DEFAULT 'user';`);
+      }
+      if (!credColumnNames.includes('provider')) {
+        console.log('🔄 添加 provider 字段到 credentials 表...');
+        this.db.exec(`ALTER TABLE credentials ADD COLUMN provider TEXT;`);
+      }
+    }
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);

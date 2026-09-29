@@ -6,6 +6,8 @@
  */
 
 import { executeCpuTask, CpuExecutionOptions, CpuExecutionResult } from './CpuExecutionService';
+import { resolveCredentialEnv, LeaseCredentialError } from './AppExecutionService';
+import { getAppBasePath } from './AppPathHelper';
 import { executionLogStorage, desktopAppStorage } from '@/services/storage';
 
 export interface LocalExecuteOptions {
@@ -59,7 +61,35 @@ export async function executeLocalCode(
     error_message: null,
   });
 
-  // 2. 执行代码
+  // 2. 🔥 凭据注入：与 GPU/App 执行共用 resolveCredentialEnv（扫描代码引用的环境变量名 → 匹配凭据 → 注入）
+  //    多文件项目 code 可能为空（项目模式）→ 补读入口候选文件内容一起扫描
+  let scanTarget = options.code || '';
+  if (options.isMultiFile && !scanTarget.trim() && options.mainFile) {
+    try {
+      const electron = (window as any).electron;
+      const basePath = await getAppBasePath(options.appId);
+      const fullPath = `${basePath}\\${options.mainFile.replace(/\//g, '\\')}`;
+      const r = await electron?.userpcFile?.read?.(fullPath);
+      if (r?.success && r?.data?.content) scanTarget = r.data.content;
+    } catch {
+      // 读不到入口文件就只扫 code（可能为空 → 无注入，等同无凭据引用）
+    }
+  }
+  let credentialEnv: Record<string, string> = {};
+  try {
+    credentialEnv = await resolveCredentialEnv(options.userId, scanTarget);
+  } catch (e: any) {
+    // 官方租约类错误（余额不足等）：直接失败并明确告知，不留 running 日志孤儿
+    const msg = e instanceof LeaseCredentialError ? e.message : `凭据解析失败: ${e?.message || e}`;
+    await executionLogStorage.update(logId, {
+      status: 'failed',
+      error_message: msg,
+      duration: 0,
+    });
+    return { logId, success: false, output: '', error: msg, exitCode: null, duration: 0 };
+  }
+
+  // 3. 执行代码
   const cpuOptions: CpuExecutionOptions = {
     code: options.code,
     language: options.language,
@@ -68,6 +98,8 @@ export async function executeLocalCode(
     appId: options.appId,
     isMultiFile: options.isMultiFile,
     mainFile: options.mainFile,
+    // 🔥 凭据环境变量（执行时注入，值不进 LLM）
+    env: credentialEnv,
   };
 
   let result: CpuExecutionResult;

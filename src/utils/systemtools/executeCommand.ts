@@ -489,9 +489,23 @@ export async function executeExecuteCommandTool(
       const electron = (window as any).electron;
       if (electron?.localStorage?.getCredentialByName) {
         const credential = await electron.localStorage.getCredentialByName(credentialName, context.userId);
-        if (credential && credential.value) {
-          credentialEnv = { [credential.env_var]: credential.value };
-          console.log(`🔑 [EXECUTE-COMMAND-TOOL] 已注入凭据 "${credentialName}" → 环境变量 ${credential.env_var}`);
+        if (credential) {
+          // 🔥 platform 型凭据：值由官方租约服务运行时下发（厂商临时 key），LLM 零感知
+          let credValue: string;
+          if (credential.source === 'platform' && credential.provider) {
+            const { resolvePlatformCredential } = await import('../../services/cloud/CredentialLeaseService');
+            credValue = await resolvePlatformCredential(context.userId, credential.provider);
+          } else if (credential.value) {
+            credValue = credential.value;
+          } else {
+            return {
+              success: false,
+              error: `凭据 "${credentialName}" 不存在或值为空`,
+              metadata: { toolName: 'userpc_shell' },
+            };
+          }
+          credentialEnv = { [credential.env_var]: credValue };
+          console.log(`🔑 [EXECUTE-COMMAND-TOOL] 已注入凭据 "${credentialName}" → 环境变量 ${credential.env_var}${credential.source === 'platform' ? '（官方租约）' : ''}`);
         } else {
           return {
             success: false,

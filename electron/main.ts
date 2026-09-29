@@ -3097,9 +3097,12 @@ async function migrateEncryptedParams(credentials: any[]) {
  * param 型存明文（兼容旧加密数据），env 型才解密
  */
 function decryptCredentialForUI(credential: any): any {
-  const value = credential.type === 'param'
-    ? tryDecryptParamValue(credential.encrypted_value)  // 🔥 param 型存明文，兼容旧加密数据
-    : decryptCredentialValue(credential.encrypted_value);  // env 型解密
+  // 🔥 platform 型凭据 encrypted_value 恒为空串，value 由租约服务运行时下发（不落库不解密）
+  const value = credential.source === 'platform'
+    ? ''
+    : credential.type === 'param'
+      ? tryDecryptParamValue(credential.encrypted_value)  // 🔥 param 型存明文，兼容旧加密数据
+      : decryptCredentialValue(credential.encrypted_value);  // env 型解密
   return {
     id: credential.id,
     user_id: credential.user_id,
@@ -3107,6 +3110,8 @@ function decryptCredentialForUI(credential: any): any {
     type: credential.type,
     description: credential.description,
     env_var: credential.env_var,
+    source: credential.source || 'user',
+    provider: credential.provider || undefined,
     value,
     created_at: credential.created_at,
     updated_at: credential.updated_at,
@@ -3130,6 +3135,7 @@ function stripCredentialValueForLLM(credential: any): any {
     id: credential.id,
     env_var: credential.env_var,
     description: credential.description,
+    source: credential.source || 'user',  // 🔥 platform 型：描述里已说明官方租约，LLM 正常引用即可
   };
 }
 
@@ -3200,18 +3206,19 @@ ipcMain.handle('local-storage:credential:get-by-name', async (_, { name, userId 
 // 创建凭据（加密 value 后转发后端）
 ipcMain.handle('local-storage:credential:create', async (_, data) => {
   try {
-    const { user_id, name, type, description, env_var, value } = data;
+    const { user_id, name, type, description, env_var, value, source, provider } = data;
 
     // 🔥 param 型允许空值（如 updateSourceUrl 留空=官方源），env 型必须有值
+    // 🔥 platform 型凭据值由租约服务运行时下发，不落库（value 恒为空）
     if (!user_id || !name || !env_var) {
       return { success: false, error: 'user_id, name, env_var 为必填项' };
     }
-    if (type !== 'param' && !value) {
+    if (type !== 'param' && !value && source !== 'platform') {
       return { success: false, error: 'env 型凭据的 value 为必填项' };
     }
 
-    // 🔥 param 型存明文，env 型加密
-    const encryptedValue = type === 'param' ? value : encryptCredentialValue(value);
+    // 🔥 param 型存明文，env 型加密，platform 型不存值
+    const encryptedValue = source === 'platform' ? '' : (type === 'param' ? value : encryptCredentialValue(value));
 
     const response = await fetch(`${getBackendStorageUrl()}/credentials`, {
       method: 'POST',
@@ -3223,6 +3230,8 @@ ipcMain.handle('local-storage:credential:create', async (_, data) => {
         description: description || '',
         env_var,
         encrypted_value: encryptedValue,
+        source: source === 'platform' ? 'platform' : 'user',
+        provider: provider || undefined,
       }),
     });
 

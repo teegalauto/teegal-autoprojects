@@ -19,6 +19,18 @@ import { importantObjectTracker } from "../auto/context/ImportantObjectTracker";
 import { getProjectCode, ProjectFile } from './ProjectPackager';
 
 /**
+ * 🔥 官方租约凭据解析失败（余额不足 / 服务未配置等）
+ * 必须传导给 LLM/用户——代码引用了该凭据，缺值执行必然失败，
+ * 静默吞掉会让 LLM 只看到厂商 401 而误判原因
+ */
+export class LeaseCredentialError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseCredentialError';
+  }
+}
+
+/**
  * 🔥 凭据注入（轻量版）：扫描代码中的环境变量引用，匹配 CredentialManager 凭据
  *
  * 设计原则：
@@ -51,8 +63,9 @@ function scanEnvVarNames(code: string): Set<string> {
 /**
  * 解析代码引用的凭据环境变量：只返回凭据表中存在的 env 型凭据
  * 值不写日志、不进 prompt，仅用于执行注入
+ * （GPU 容器执行 / 本地 CPU 执行 / LocalExecutor 共用）
  */
-async function resolveCredentialEnv(
+export async function resolveCredentialEnv(
   userId: string,
   codeContent: string,
   projectFiles?: ProjectFile[]
@@ -73,19 +86,32 @@ async function resolveCredentialEnv(
     }
     if (names.size === 0) return {};
 
-    // 逐个查凭据（env 型才注入；param 型是明文参数，不走环境变量）
+    // 逐个查凭据（env 型才注入；param 型是明文参数，不走环境变量；platform 型值由租约服务下发）
     const env: Record<string, string> = {};
     for (const name of names) {
       const credential = await electron.localStorage.getCredentialByName(name, userId);
-      if (credential?.value && credential.type !== 'param') {
-        env[credential.env_var || name] = credential.value;
+      if (!credential || credential.type === 'param') continue;
+      let credValue: string;
+      if (credential.source === 'platform' && credential.provider) {
+        const { resolvePlatformCredential } = await import('../../services/cloud/CredentialLeaseService');
+        try {
+          credValue = await resolvePlatformCredential(userId, credential.provider);
+        } catch (e: any) {
+          throw new LeaseCredentialError(e?.message || '官方凭据解析失败');
+        }
+      } else if (credential.value) {
+        credValue = credential.value;
+      } else {
+        continue;
       }
+      env[credential.env_var || name] = credValue;
     }
     if (Object.keys(env).length > 0) {
       console.log(`🔑 [APP-EXECUTION-SERVICE] 注入凭据环境变量: ${Object.keys(env).join(', ')}`);
     }
     return env;
   } catch (error) {
+    if (error instanceof LeaseCredentialError) throw error; // 租约类错误必须传导，不吞
     console.warn('[APP-EXECUTION-SERVICE] 凭据注入跳过:', error);
     return {};
   }
@@ -254,9 +280,21 @@ export const executeApp = async (
     // 🔥 2. 判断执行模式
     // GPU 任务 → 后端执行（必须通过后端访问阿里云 ECI）
     // CPU 任务 → 前端本地执行（直接调用本地 Python，无需后端）
+
+    // 🔥 凭据注入：扫描代码引用的环境变量名，匹配的凭据解析为注入值（GPU=容器 env_vars，本地=进程 env）
+    let credentialEnv: Record<string, string>;
+    try {
+      credentialEnv = await resolveCredentialEnv(userId, codeContent, isMultiFile ? projectFiles : undefined);
+    } catch (error: any) {
+      // 官方租约类错误（余额不足等）直接终止执行并明确告知，而不是让代码跑到厂商 401 才失败
+      return {
+        success: false,
+        executionMode: isGpu ? 'gpu' : 'local',
+        error: error?.message || '凭据解析失败',
+      };
+    }
+
     if (isGpu) {
-      // 🔥 凭据注入：扫描代码引用的环境变量名，匹配的凭据塞进 env_vars（云端容器注入）
-      const credentialEnv = await resolveCredentialEnv(userId, codeContent, isMultiFile ? projectFiles : undefined);
       const gpuConfig = Object.keys(credentialEnv).length > 0
         ? { ...config, env_vars: { ...(config.env_vars || {}), ...credentialEnv } }
         : config;
@@ -274,8 +312,6 @@ export const executeApp = async (
         entryPoint: entryPoint || mainFile,
       });
     } else {
-      // 🔥 凭据注入：匹配的凭据作为环境变量注入本地执行进程
-      const credentialEnv = await resolveCredentialEnv(userId, codeContent, isMultiFile ? projectFiles : undefined);
       return await executeLocalTask(codeContent, {
         appId,
         userId,

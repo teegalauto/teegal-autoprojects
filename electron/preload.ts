@@ -253,7 +253,8 @@ contextBridge.exposeInMainWorld('electron', {
     getCredentialByName: (name: string, userId: string) => ipcRenderer.invoke('local-storage:credential:get-by-name', { name, userId }),
     // createCredential: 创建凭据/参数（IPC 层根据 type 决定是否加密 value）
     // 🔥 type: 'env'（加密，注入环境变量）| 'param'（明文，代码读取）
-    createCredential: (data: { userId: string; name: string; type: 'env' | 'param'; description?: string; envVar: string; value: string }) =>
+    // 🔥 source: 'user'（默认，用户自维护）| 'platform'（官方租约，值运行时下发不落库）
+    createCredential: (data: { userId: string; name: string; type: 'env' | 'param'; description?: string; envVar: string; value: string; source?: 'user' | 'platform'; provider?: string }) =>
       ipcRenderer.invoke('local-storage:credential:create', {
         user_id: data.userId,
         name: data.name,
@@ -261,6 +262,8 @@ contextBridge.exposeInMainWorld('electron', {
         description: data.description,
         env_var: data.envVar,
         value: data.value,
+        source: data.source,
+        provider: data.provider,
       }),
     // updateCredential: 更新凭据/参数（IPC 层根据 type 决定是否加密 value）
     updateCredential: (id: string, updates: { name?: string; type?: 'env' | 'param'; description?: string; envVar?: string; value?: string }) =>
@@ -547,7 +550,7 @@ declare global {
         listCredentials: (userId: string) => Promise<any[]>;
         listCredentialsMeta: (userId: string) => Promise<any[]>;
         getCredentialByName: (name: string, userId: string) => Promise<any | null>;
-        createCredential: (data: { userId: string; name: string; type: 'env' | 'param'; description?: string; envVar: string; value: string }) =>
+        createCredential: (data: { userId: string; name: string; type: 'env' | 'param'; description?: string; envVar: string; value: string; source?: 'user' | 'platform'; provider?: string }) =>
           Promise<{ success: boolean; data?: any; error?: string; code?: string }>;
         updateCredential: (id: string, updates: { name?: string; type?: 'env' | 'param'; description?: string; envVar?: string; value?: string }) =>
           Promise<{ success: boolean; data?: any; error?: string; code?: string }>;

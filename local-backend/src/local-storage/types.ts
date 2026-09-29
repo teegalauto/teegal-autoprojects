@@ -140,7 +140,9 @@ export interface Credential {
   type: string;              // ssh_password | api_key | env_var | token
   description: string;       // 描述（LLM 可见）
   env_var: string;           // 环境变量名（如 "SSHPASS"）
-  encrypted_value: string;   // 加密后的值（LLM 不可见）
+  encrypted_value: string;   // 加密后的值（LLM 不可见；platform 型存空串）
+  source?: string;           // 凭据来源：user（用户自维护，默认）| platform（官方租约，值运行时下发）
+  provider?: string;         // platform 型的厂商标识（如 volcengine-ark），租约接口按此分发
   created_at: number;
   updated_at: number;
 }

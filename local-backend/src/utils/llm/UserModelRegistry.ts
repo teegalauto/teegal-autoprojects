@@ -11,6 +11,7 @@
 
 import { ModelDefinition, ModelProvider } from './types';
 import { resolveAppDataDir } from '../appDataDir';
+import { encryptSecret, decryptSecret } from '../secretBox';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -289,9 +290,13 @@ export class UserModelRegistry {
         const config: UserModelConfig = JSON.parse(content);
 
         if (config.version === '1.0') {
-          // 加载模型
+          // 加载模型（apiKey/refreshToken 落盘为密文，读入解密到内存；旧明文原样兼容）
           config.models.forEach(model => {
-            userData.userModels.set(model.id, model);
+            userData.userModels.set(model.id, {
+              ...model,
+              apiKey: decryptSecret(model.apiKey) || '',
+              refreshToken: decryptSecret(model.refreshToken),
+            });
           });
           console.log(`[USER-MODEL-REGISTRY] 用户 ${userId}: 已加载 ${config.models.length} 个用户自定义模型`);
           // 🔥 不再自动添加系统默认模型，所有模型必须由用户自己配置
@@ -299,7 +304,10 @@ export class UserModelRegistry {
           // 加载搜索源（如果配置文件中有）
           if (config.searchProviders && config.searchProviders.length > 0) {
             config.searchProviders.forEach(provider => {
-              userData.searchProviders.set(provider.id, provider);
+              userData.searchProviders.set(provider.id, {
+                ...provider,
+                apiKey: decryptSecret(provider.apiKey) || '',
+              });
             });
             console.log(`[USER-MODEL-REGISTRY] 用户 ${userId}: 已加载 ${config.searchProviders.length} 个搜索源`);
             // 🔥 不再自动添加默认搜索源，所有搜索源必须由用户自己配置
@@ -501,11 +509,19 @@ export class UserModelRegistry {
     }
     try {
       const userData = this.getUserData(userId);
+      // 🔥 敏感字段落盘加密（apiKey/refreshToken）；内存持有明文，消费方零改动
       const config: UserModelConfig = {
         version: '1.0',
         lastUpdated: new Date().toISOString(),
-        models: Array.from(userData.userModels.values()),
-        searchProviders: Array.from(userData.searchProviders.values()),
+        models: Array.from(userData.userModels.values()).map(m => ({
+          ...m,
+          apiKey: encryptSecret(m.apiKey) || '',
+          refreshToken: encryptSecret(m.refreshToken),
+        })),
+        searchProviders: Array.from(userData.searchProviders.values()).map(p => ({
+          ...p,
+          apiKey: encryptSecret(p.apiKey) || '',
+        })),
       };
       fs.writeFileSync(userData.configPath, JSON.stringify(config, null, 2), 'utf-8');
       console.log(`[USER-MODEL-REGISTRY] 用户 ${userId}: 配置已保存到文件`);

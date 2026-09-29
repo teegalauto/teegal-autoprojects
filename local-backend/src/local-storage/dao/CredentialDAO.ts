@@ -18,9 +18,9 @@ export class CredentialDAO {
     const stmt = db.prepare(`
       INSERT INTO credentials (
         id, user_id, name, type, description,
-        env_var, encrypted_value, created_at, updated_at
+        env_var, encrypted_value, source, provider, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -31,6 +31,8 @@ export class CredentialDAO {
       credential.description,
       credential.env_var,
       credential.encrypted_value,
+      credential.source || 'user',
+      credential.provider || null,
       now,
       now
     );
@@ -118,6 +120,8 @@ export class CredentialDAO {
       description: row.description,
       env_var: row.env_var,
       encrypted_value: row.encrypted_value,
+      source: row.source || 'user',
+      provider: row.provider || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at
     };

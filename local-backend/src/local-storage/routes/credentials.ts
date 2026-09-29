@@ -84,13 +84,14 @@ router.get('/by-name/:name', (req, res) => {
  */
 router.post('/', (req, res) => {
   try {
-    const { id, user_id, name, type, description, env_var, encrypted_value } = req.body;
+    const { id, user_id, name, type, description, env_var, encrypted_value, source, provider } = req.body;
 
     // 🔥 param 型允许空值（如 updateSourceUrl 留空=官方源），其他类型要求 encrypted_value 非空
+    // platform 型凭据 encrypted_value 恒为空串（值由租约服务运行时下发，不落库）
     if (!user_id || !name || !env_var) {
       return res.status(400).json({ error: 'user_id, name, env_var are required' });
     }
-    if (type !== 'param' && !encrypted_value) {
+    if (type !== 'param' && !encrypted_value && source !== 'platform') {
       return res.status(400).json({ error: 'encrypted_value is required for env types' });
     }
 
@@ -107,7 +108,9 @@ router.post('/', (req, res) => {
       type: type || 'env_var',
       description: description || '',
       env_var,
-      encrypted_value,
+      encrypted_value: encrypted_value || '',
+      source: source === 'platform' ? 'platform' : 'user',
+      provider: provider || undefined,
     };
 
     const credential = credentialDAO.create(credentialData);

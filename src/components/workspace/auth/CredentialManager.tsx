@@ -38,9 +38,21 @@ interface CredentialItem {
   description: string;
   env_var: string;
   value: string;
+  source?: 'user' | 'platform'; // 🔥 platform = 官方租约（值运行时下发，UI 只读）
+  provider?: string;
   created_at: number;
   updated_at: number;
 }
+
+// 🔥 官方预置凭据（platform 型）：首次打开时自动创建，值由云端租约服务运行时下发，UI 只读
+// 🔥 首发百炼：临时 key 继承官方母 key 全部权限、不绑定模型，LLM 即时选模型零预设（TTL ≤30min 自动失效）
+const PLATFORM_CREDENTIALS: Array<{ name: string; description: string; provider: string }> = [
+  {
+    name: 'BAILIAN_PLATFORM_KEY',
+    description: '官方百炼租约密钥（阿里云百炼全系：qwen-vl 多模态、通义万相视频、wanx 图片、cosyvoice 语音、embedding），即时代码直连 DashScope 时引用，按用量计费',
+    provider: 'bailian',
+  },
+];
 
 // 🔥 系统默认参数：首次打开时自动创建，让用户知道这些参数存在且可调
 const DEFAULT_PARAMS: Array<{ name: string; value: string; description: string }> = [
@@ -150,6 +162,33 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
         setCredentials(refreshed || []);
       } else {
         setCredentials(list);
+      }
+
+      // 🔥 官方预置凭据（platform 型）：缺少的自动创建（值不落库，租约服务运行时下发）
+      const refreshedFinal = await electron.localStorage.listCredentials(userId);
+      const finalList: CredentialItem[] = refreshedFinal || [];
+      const missingPlatform = PLATFORM_CREDENTIALS.filter(
+        p => !finalList.some((c: CredentialItem) => c.source === 'platform' && c.env_var === p.name)
+      );
+      if (missingPlatform.length > 0) {
+        for (const p of missingPlatform) {
+          const created = await electron.localStorage.createCredential({
+            userId,
+            name: p.name,
+            type: 'env',
+            description: p.description,
+            envVar: p.name,
+            value: '',
+            source: 'platform',
+            provider: p.provider,
+          });
+          if (!created?.success) {
+            // 🔥 不阻塞列表加载，但失败必须留痕（通常是 electron 主进程/local-backend 未更新到含 platform 逻辑的版本）
+            console.warn('[CREDENTIAL] 官方预置凭据创建失败:', p.name, created?.error);
+          }
+        }
+        const reloaded = await electron.localStorage.listCredentials(userId);
+        setCredentials(reloaded || []);
       }
     } catch (error: any) {
       toast.error(`加载失败: ${error.message}`);
@@ -315,6 +354,15 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
             {/* 🔥 优先显示凭据名（如 ssh_ins-xxx，区分多台机子）；param 型无独立名，显示 env_var */}
             {isParam ? cred.env_var : (cred.name || cred.env_var)}
           </span>
+          {/* 🔥 官方租约凭据徽标（platform 型：值运行时下发，无需配置） */}
+          {cred.source === 'platform' && (
+            <span
+              className="text-[10px] leading-none px-1.5 py-0.5 rounded bg-orange-100 text-orange-700 border border-orange-200 flex-shrink-0"
+              title="官方提供，按用量计费，无需配置"
+            >
+              官方
+            </span>
+          )}
         </div>
         {isParam ? (
           // 🔥 param 型直接显示值（明文，对 LLM 透明）
@@ -327,43 +375,51 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
             {cred.name && cred.name !== cred.env_var && (
               <p className="text-xs text-muted-foreground mt-0.5 pl-5 truncate">注入变量: {cred.env_var}</p>
             )}
-            <button
-              onClick={() => toggleShowValue(cred.id)}
-              className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-0.5 mt-1 pl-5"
-            >
-              {showValues[cred.id] ? (
-                <>
-                  <EyeOff className="h-3 w-3" />
-                  <span className="font-mono">{cred.value.slice(0, 20)}{cred.value.length > 20 ? '...' : ''}</span>
-                </>
-              ) : (
-                <>
-                  <Eye className="h-3 w-3" />
-                  <span>显示值</span>
-                </>
-              )}
-            </button>
-            {/* 🔥 值可见时的复制按钮（成功后显示对勾反馈） */}
-            {showValues[cred.id] && (
-              <button
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(cred.value);
-                    setCopiedId(cred.id);
-                    setTimeout(() => setCopiedId(null), 1500);
-                  } catch { /* 剪贴板不可用时静默 */ }
-                }}
-                className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center ml-1 mt-1 p-0.5"
-                title="复制值"
-              >
-                {copiedId === cred.id ? <Check className="h-3 w-3 text-green-600" /> : <Copy className="h-3 w-3" />}
-              </button>
+            {cred.source === 'platform' ? (
+              // 🔥 platform 型：值由租约服务运行时下发，无需查看/复制
+              <p className="text-xs text-muted-foreground mt-1 pl-5">使用时自动下发临时密钥，按用量计费</p>
+            ) : (
+              <>
+                <button
+                  onClick={() => toggleShowValue(cred.id)}
+                  className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-0.5 mt-1 pl-5"
+                >
+                  {showValues[cred.id] ? (
+                    <>
+                      <EyeOff className="h-3 w-3" />
+                      <span className="font-mono">{cred.value.slice(0, 20)}{cred.value.length > 20 ? '...' : ''}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Eye className="h-3 w-3" />
+                      <span>显示值</span>
+                    </>
+                  )}
+                </button>
+                {/* 🔥 值可见时的复制按钮（成功后显示对勾反馈） */}
+                {showValues[cred.id] && (
+                  <button
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(cred.value);
+                        setCopiedId(cred.id);
+                        setTimeout(() => setCopiedId(null), 1500);
+                      } catch { /* 剪贴板不可用时静默 */ }
+                    }}
+                    className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center ml-1 mt-1 p-0.5"
+                    title="复制值"
+                  >
+                    {copiedId === cred.id ? <Check className="h-3 w-3 text-green-600" /> : <Copy className="h-3 w-3" />}
+                  </button>
+                )}
+              </>
             )}
           </>
         )}
       </div>
       <div className="flex items-center gap-1 flex-shrink-0">
-        {deleteConfirmId === cred.id ? (
+        {/* 🔥 platform 型只读：不可编辑/删除（官方预置，删除后下次打开自动重建） */}
+        {cred.source === 'platform' ? null : deleteConfirmId === cred.id ? (
           <>
             <Button
               size="sm"
