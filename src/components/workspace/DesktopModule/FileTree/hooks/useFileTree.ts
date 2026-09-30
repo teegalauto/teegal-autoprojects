@@ -1,9 +1,10 @@
 /**
  * 文件树状态管理 Hook
  * 
- * 🔥 简化架构：
- * - files/ 目录：当前工作目录（最新版本）
- * - history/ 目录：上一个 commit 版本（每个文件只保留一个版本）
+ * 🔥 git 化架构（isomorphic-git 快照）：
+ * - 工作目录：当前版本（可直接编辑）
+ * - HEAD：最近一次「接受修改」checkpoint
+ * - changes：相对 HEAD 的变更文件列表（ChangeList 数据源）
  * 
  * 🔥 跨平台：所有目录操作通过 Electron IPC API（read-directory），
  * 不依赖 PowerShell/Bash 命令，Windows/macOS/Linux 通用。
@@ -12,7 +13,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { FileNode, FileHistory, FileVersion, FileTreeState } from '../types';
 import { sortFileNodes, filterFileNodes } from '../utils';
-import { getAppBasePath, getAppHistoryPath } from '@/utils/apptool/AppPathHelper';
+import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
 
 /**
  * 🔥 模块级缓存：按 appId 缓存文件树数据
@@ -23,7 +24,7 @@ import { getAppBasePath, getAppHistoryPath } from '@/utils/apptool/AppPathHelper
  */
 interface FileTreeCache {
   files: FileNode[];
-  history: FileHistory[];
+  changes: FileHistory[];
   timestamp: number;
 }
 const fileTreeCache = new Map<string, FileTreeCache>();
@@ -37,14 +38,14 @@ export function useFileTree(appId: string) {
     if (cached) {
       return {
         files: cached.files,
-        history: cached.history,
+        changes: cached.changes,
         loading: false, // 有缓存时不显示 loading
         error: '',
       };
     }
     return {
       files: [],
-      history: [],
+      changes: [],
       loading: true,
       error: '',
     };
@@ -70,7 +71,7 @@ export function useFileTree(appId: string) {
       console.log('[FileTree] 使用缓存，跳过加载:', appId);
       setState({
         files: cached.files,
-        history: cached.history,
+        changes: cached.changes,
         loading: false,
         error: '',
       });
@@ -87,21 +88,20 @@ export function useFileTree(appId: string) {
 
       // 🔥 获取文件目录（支持导入项目的自定义路径）
       const filesDir = await getAppBasePath(appId);
-      const historyDir = await getAppHistoryPath(appId);
 
-      // 🔥 加载 files 目录（当前版本，排除 history 子目录）
+      // 🔥 加载 files 目录（当前版本）
       const allFiles = await scanDirectory(filesDir);
-      const files = allFiles.filter(f => f.name !== 'history'); // 🔥 排除 history 目录
+      const files = allFiles.filter(f => f.name !== 'history'); // 🔥 兼容：隐藏旧版 history 目录残留
 
-      // 🔥 加载 history 目录（每个文件只保留一个版本）
-      const history = await scanHistoryDirectory(historyDir);
+      // 🔥 加载相对 HEAD 的变更文件列表（git status）
+      const changes = await loadChanges();
 
       const sortedFiles = sortFileNodes(filterFileNodes(files));
-      const sortedHistory = history.sort((a, b) => a.fileName.localeCompare(b.fileName));
+      const sortedChanges = changes;
 
       setState({
         files: sortedFiles,
-        history: sortedHistory,
+        changes: sortedChanges,
         loading: false,
         error: '',
       });
@@ -109,11 +109,11 @@ export function useFileTree(appId: string) {
       // 🔥 写入缓存
       fileTreeCache.set(appId, {
         files: sortedFiles,
-        history: sortedHistory,
+        changes: sortedChanges,
         timestamp: Date.now(),
       });
 
-      console.log('[FileTree] 加载完成:', { filesCount: sortedFiles.length, historyCount: sortedHistory.length });
+      console.log('[FileTree] 加载完成:', { filesCount: sortedFiles.length, changesCount: sortedChanges.length });
 
     } catch (error: any) {
       console.error('[FileTree] 加载失败:', error);
@@ -157,82 +157,29 @@ export function useFileTree(appId: string) {
   };
 
   /**
-   * 🔥 扫描 history 目录（每个文件只保留一个版本）
-   * 🔥 支持嵌套目录结构：history/DRL/main.py/v1.py
+   * 🔥 加载相对 HEAD 的变更文件列表（git status）
+   * 复用 FileHistory 结构：fileName=相对路径，version.versionName=changeType
    */
-  const scanHistoryDirectory = async (dir: string): Promise<FileHistory[]> => {
+  const loadChanges = async (): Promise<FileHistory[]> => {
     try {
       const electron = (window as any).electron;
+      if (!electron?.listAppCodeChanges) return [];
 
-      // 🔥 检查 history 目录是否存在
-      if (electron?.readDirectory) {
-        const result = await electron.readDirectory(dir);
-        if (!result.success) return [];
+      const result = await electron.listAppCodeChanges({ appId });
+      const list: any[] = result?.success ? (result.changes || []) : [];
 
-        const histories: FileHistory[] = [];
-
-        // 🔥 递归扫描 history 目录，找到所有版本文件
-        await scanHistoryRecursive(dir, '', histories);
-
-        return histories;
-      }
-
-      return [];
-
+      return list.map(c => ({
+        fileName: c.fileName,
+        filePath: '',
+        version: {
+          versionName: c.changeType || 'modified',
+          path: '',
+          createdAt: '',
+        },
+      }));
     } catch (error) {
-      console.error('[FileTree] 扫描 history 目录失败:', dir, error);
+      console.error('[FileTree] 加载变更列表失败:', error);
       return [];
-    }
-  };
-
-  /**
-   * 🔥 递归扫描 history 目录
-   * 🔥 限制最大递归深度为 5 层，防止目录嵌套过深导致性能问题
-   */
-  const scanHistoryRecursive = async (
-    currentDir: string,
-    relativePath: string,
-    histories: FileHistory[],
-    depth: number = 0
-  ): Promise<void> => {
-    // 🔥 限制递归深度
-    if (depth > 5) {
-      console.warn('[FileTree] history 目录嵌套深度超过 5 层，跳过:', currentDir);
-      return;
-    }
-
-    try {
-      const electron = (window as any).electron;
-
-      if (!electron?.readDirectory) return;
-
-      const result = await electron.readDirectory(currentDir);
-      if (!result.success || !result.files) return;
-
-      for (const item of result.files) {
-        if (item.type === 'directory') {
-          // 🔥 继续递归
-          const newRelativePath = relativePath ? `${relativePath}/${item.name}` : item.name;
-          await scanHistoryRecursive(item.path, newRelativePath, histories, depth + 1);
-        } else if (item.type === 'file' && item.name.match(/^v\d+\./)) {
-          // 🔥 找到版本文件
-          // relativePath 就是原始文件路径（如 DRL/main.py）
-          const fileName = relativePath || item.name.replace(/^v\d+\./, '');
-          
-          histories.push({
-            fileName: fileName,
-            filePath: '',
-            version: {
-              versionName: item.name,
-              path: item.path,
-              createdAt: item.modifiedTime || new Date().toISOString(),
-            },
-          });
-        }
-      }
-
-    } catch (error) {
-      console.error('[FileTree] 递归扫描 history 失败:', currentDir, error);
     }
   };
 

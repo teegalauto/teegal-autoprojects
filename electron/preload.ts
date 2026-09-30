@@ -321,10 +321,18 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.invoke('app-code:rename', data),
   commitAppCodeHistory: (data: { appId: string; fileName?: string; codePath?: string }) =>
     ipcRenderer.invoke('app-code:commit', data),
-  saveAppCodeHistory: (data: { appId: string; fileName: string; codePath?: string }) =>
-    ipcRenderer.invoke('app-code:save-history', data),
   readAppCodeHistory: (data: { appId: string; fileName: string; codePath?: string }) =>
     ipcRenderer.invoke('app-code:read-history', data),
+  // 🔥 相对 HEAD 的变更文件列表（变更记录面板数据源）
+  listAppCodeChanges: (data: { appId: string; codePath?: string }) =>
+    ipcRenderer.invoke('app-code:git-status', data),
+  // 🔥 git checkpoint 时间线 / 版本文件查看 / 回滚
+  listAppCodeCheckpoints: (data: { appId: string; codePath?: string; limit?: number }) =>
+    ipcRenderer.invoke('app-code:git-log', data),
+  readAppCodeFileAt: (data: { appId: string; oid: string; fileName: string; codePath?: string }) =>
+    ipcRenderer.invoke('app-code:git-file', data),
+  restoreAppCodeTo: (data: { appId: string; oid: string; codePath?: string }) =>
+    ipcRenderer.invoke('app-code:git-restore', data),
   checkAppCodeDirExists: (data: { appId: string; dirPath: string; codePath?: string }) =>
     ipcRenderer.invoke('app-code:dir-exists', data),
   ensureAppCodeDir: (data: { appId: string; dirPath: string; codePath?: string }) =>

@@ -1,9 +1,10 @@
 /**
  * FileTree 模块类型定义
- * 
- * 🔥 简化架构：
- * - files/ 目录：当前工作目录（最新版本）
- * - history/ 目录：上一个 commit 版本（每个文件只保留一个版本）
+ *
+ * 🔥 git 化架构（isomorphic-git 快照）：
+ * - 工作目录：当前版本（可直接编辑）
+ * - HEAD：最近一次「接受修改」checkpoint
+ * - changes：相对 HEAD 的变更文件列表（ChangeList 数据源）
  */
 
 export interface FileNode {
@@ -39,8 +40,8 @@ export interface FileVersion {
  * 🔥 文件树状态
  */
 export interface FileTreeState {
-  files: FileNode[];       // files 目录下的文件（当前版本）
-  history: FileHistory[];  // 每个文件的历史版本（只有一个）
+  files: FileNode[];       // 工作目录文件（当前版本）
+  changes: FileHistory[];  // 相对 HEAD 的变更文件列表（fileName=相对路径）
   loading: boolean;
   error: string;
 }

@@ -27,7 +27,7 @@ export const QuickCreateApp: React.FC<QuickCreateAppProps> = ({ disabled = false
     try {
       const timestamp = new Date().toLocaleTimeString();
       const newApp = await createApp({
-        name: `新项目 ${timestamp} 🐣`,
+        name: `新项目 ${timestamp} 🌈`,
         description: '通过快捷按钮创建的空白项目',
         current_code: '',
         code: '',

@@ -1,9 +1,10 @@
 /**
  * FileTree 工具函数
  * 
- * 🔥 简化架构：
- * - files/ 目录：当前工作目录（最新版本）
- * - history/ 目录：上一个 commit 版本（每个文件只保留一个版本）
+ * 🔥 git 化架构（isomorphic-git 快照）：
+ * - 工作目录：当前版本（可直接编辑）
+ * - HEAD：最近一次「接受修改」checkpoint
+ * - 变更列表/旧版本内容/时间线均由 git 承载
  * 
  * 🔥 跨平台：所有文件操作通过 Electron IPC API（主进程 Node.js fs），
  * 不依赖 PowerShell/Bash 命令，Windows/macOS/Linux 通用。
@@ -248,10 +249,7 @@ export async function renameFile(
 }
 
 /**
- * 🔥 保存文件
- * 跨平台：通过 Electron IPC API
- * - save-history：将当前版本备份到 history 目录（如果还没有）
- * - app-code:save：写入新内容
+ * 保存文件（git 化：仅写工作区；「接受修改」的 checkpoint 由 commitFiles 落 git）
  */
 export async function saveFile(
   appId: string,
@@ -262,7 +260,7 @@ export async function saveFile(
   try {
     const electron = (window as any).electron;
 
-    if (!electron?.saveAppCodeFile || !electron?.saveAppCodeHistory) {
+    if (!electron?.saveAppCodeFile) {
       return { success: false, error: '非 Electron 环境' };
     }
 
@@ -278,14 +276,6 @@ export async function saveFile(
       if (match) {
         relativeFileName = match[1];
       }
-    }
-
-    // 🔥 检查当前文件是否存在
-    const existsResult = await electron.checkAppCodeFileExists({ appId, fileName: relativeFileName, codePath: cp });
-
-    // 🔥 如果当前文件存在，先备份到 history（如果还没有备份的话）
-    if (existsResult?.exists) {
-      await electron.saveAppCodeHistory({ appId, fileName: relativeFileName, codePath: cp });
     }
 
     // 🔥 写入新内容（使用相对路径）
@@ -304,7 +294,7 @@ export async function saveFile(
 }
 
 /**
- * 🔥 Commit - 清空 history 目录
+ * 🔥 Commit - git checkpoint（接受修改 = 快照当前工作区全量变更）
  * 跨平台：通过 Electron IPC API（app-code:commit）
  */
 export async function commitFiles(appId: string, fileName?: string, codePath?: string): Promise<FileOperationResult> {
@@ -336,7 +326,7 @@ export async function commitFiles(appId: string, fileName?: string, codePath?: s
       return { success: false, error: result?.error || '清空失败' };
     }
 
-    // 🔥 触发事件通知 HistoryPanel 刷新
+    // 🔥 触发事件通知文件树刷新
     window.dispatchEvent(new CustomEvent('trainProjectFilesChanged', {
       detail: { appId }
     }));
@@ -392,6 +382,62 @@ export async function getHistoryContent(
   } catch (error) {
     console.error('[getHistoryContent] 获取失败:', error);
     return null;
+  }
+}
+
+/**
+ * 🔥 checkpoint 时间线（git log，新→旧）
+ * 跨平台：通过 Electron IPC API（app-code:git-log）
+ */
+export async function listCheckpointTimeline(
+  appId: string,
+  limit: number = 50,
+  codePath?: string
+): Promise<{ oid: string; message: string; timestamp: number }[]> {
+  try {
+    const electron = (window as any).electron;
+    if (!electron?.listAppCodeCheckpoints) return [];
+
+    const cp = codePath ?? ((await getCodePath(appId)) || undefined);
+    const result = await electron.listAppCodeCheckpoints({ appId, limit, codePath: cp });
+    return result?.success ? (result.checkpoints || []) : [];
+  } catch (error) {
+    console.error('[listCheckpointTimeline] 获取失败:', error);
+    return [];
+  }
+}
+
+/**
+ * 🔥 回滚整个项目到指定 checkpoint（未接受的修改将丢失）
+ * 跨平台：通过 Electron IPC API（app-code:git-restore）
+ */
+export async function restoreToCheckpoint(
+  appId: string,
+  oid: string,
+  codePath?: string
+): Promise<FileOperationResult> {
+  try {
+    const electron = (window as any).electron;
+    if (!electron?.restoreAppCodeTo) {
+      return { success: false, error: '非 Electron 环境' };
+    }
+
+    const cp = codePath ?? ((await getCodePath(appId)) || undefined);
+    const result = await electron.restoreAppCodeTo({ appId, oid, codePath: cp });
+
+    if (!result?.success) {
+      return { success: false, error: result?.error || '回滚失败' };
+    }
+
+    // 🔥 通知文件树刷新
+    window.dispatchEvent(new CustomEvent('trainProjectFilesChanged', {
+      detail: { appId }
+    }));
+
+    return { success: true };
+  } catch (error: any) {
+    console.error('[restoreToCheckpoint] 回滚失败:', error);
+    return { success: false, error: error.message };
   }
 }
 

@@ -16,6 +16,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Badge } from "@/components/ui/badge";
 import { ModelManager } from "@/utils/llm/ModelManager";
+import { syncModelKeyCredentials } from "@/components/workspace/auth/modelKeySync";
 import { SimpleUserModel, isMediaGenerationModel, ModelCategoryIcon, getMediaGenerationKind } from "@/components/profile/CustomModelDialog";
 import { CodeBlockPreview, extractCodeBlockMarkers, CodeBlockData } from "./CodeBlockPreview";
 
@@ -109,6 +110,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
   // 🔥 资源引用相关：Popover 开关 + 凭据列表
   const [isResourcePopoverOpen, setIsResourcePopoverOpen] = useState(false);
   const [credentials, setCredentials] = useState<CredentialMeta[]>([]);
+  const [credentialsLoading, setCredentialsLoading] = useState(false);
 
   // 🔥 跟踪执行开始时间
   useEffect(() => {
@@ -172,16 +174,23 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
   );
 
   // 🔥 加载凭据元信息（仅名称/描述，不含明文值）：Popover 打开时刷新
+  // 🔥 先跑模型 Key 镜像同步（幂等）：「模型/搜索源 API Key（自动同步）」凭据只在
+  //    凭据管理页打开时才入库——用户从不打开凭据管理时，@ 列表会一直是空的
   useEffect(() => {
     if (!isResourcePopoverOpen || !userId) return;
     const loadCredentials = async () => {
+      setCredentialsLoading(true);
       try {
+        // 同步失败不阻塞列表加载（还能看到手工创建的凭据）
+        await syncModelKeyCredentials(userId).catch(e => logger.error('[CHAT-INPUT] 模型 Key 同步失败:', e));
         const electron = (window as any).electron;
         if (!electron?.localStorage?.listCredentialsMeta) return;
         const creds = await electron.localStorage.listCredentialsMeta(userId);
         setCredentials(creds || []);
       } catch (error) {
         logger.error('[CHAT-INPUT] 加载凭据失败:', error);
+      } finally {
+        setCredentialsLoading(false);
       }
     };
     loadCredentials();
@@ -714,7 +723,12 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
                   {/* 凭据组 */}
                   <div className="px-3 py-1.5 text-[11px] font-medium text-gray-400">凭据（API Key 等）</div>
-                  {credentials.length === 0 ? (
+                  {credentialsLoading ? (
+                    <div className="flex items-center gap-1.5 px-3 py-2 text-xs text-gray-400">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      加载中…
+                    </div>
+                  ) : credentials.length === 0 ? (
                     <div className="px-3 py-2 text-xs text-gray-400">暂无凭据，请先在「凭据管理」中添加</div>
                   ) : (
                     credentials.map(cred => {

@@ -25,8 +25,8 @@ interface FileTreeNodeProps {
   // 🔥 子节点展开状态管理
   expandedDirs?: Set<string>;
   toggleDir?: (path: string) => void;
-  // 🔥 历史版本列表（用于检查文件是否有历史版本）
-  history?: FileHistory[];
+  // 🔥 相对 HEAD 的变更文件列表（用于标记有未接受修改的文件）
+  changes?: FileHistory[];
 }
 
 export const FileTreeNode = React.memo(function FileTreeNode({
@@ -40,7 +40,7 @@ export const FileTreeNode = React.memo(function FileTreeNode({
   onRefresh,
   expandedDirs,
   toggleDir,
-  history = [],
+  changes = [],
 }: FileTreeNodeProps) {
   const { toast } = useToast();
   const { t } = useTranslation();
@@ -68,8 +68,8 @@ export const FileTreeNode = React.memo(function FileTreeNode({
   // 🔥 相对路径（给 LLM 用）
   const relativePath = getRelativePath(node.path);
   
-  // 🔥 检查当前文件是否有历史版本
-  const hasHistory = !isDir && history.some(h => {
+  // 🔥 检查当前文件是否有未接受的修改（相对 HEAD 有变更）
+  const hasChanges = !isDir && changes.some(h => {
     // 🔥 使用相对路径匹配
     return h.fileName === relativePath;
   });
@@ -355,8 +355,8 @@ export const FileTreeNode = React.memo(function FileTreeNode({
           />
         ) : (
           <span 
-            className={`text-xs truncate flex-1 ${hasHistory && !isDir ? 'text-green-600 font-medium' : ''}`}
-            title={hasHistory && !isDir ? t('workspace.desktopModule.fileTree.hasHistoryVersion') : undefined}
+            className={`text-xs truncate flex-1 ${hasChanges && !isDir ? 'text-green-600 font-medium' : ''}`}
+            title={hasChanges && !isDir ? t('workspace.desktopModule.fileTree.hasHistoryVersion') : undefined}
           >
             {node.name}
           </span>
@@ -462,7 +462,7 @@ export const FileTreeNode = React.memo(function FileTreeNode({
               onRefresh={onRefresh}
               expandedDirs={expandedDirs}
               toggleDir={toggleDir}
-              history={history}
+              changes={changes}
             />
           ))}
         </div>

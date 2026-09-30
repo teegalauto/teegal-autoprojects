@@ -31,8 +31,11 @@ export const useDesktopAppCache = (userId?: string, options: DesktopAppCacheOpti
   const totalCountRef = useRef<number>(0);
   // 🔥 拉取成功标记：后端冷启动兜底重试用
   const fetchSucceededRef = useRef(false);
+  // 🔥 当前已加载数量 ref：keepCount 刷新时按它拉取（避免闭包过期 + 不把 fetchApps 依赖挂上 state）
+  const appsLengthRef = useRef(0);
+  appsLengthRef.current = state.apps.length;
 
-  const fetchApps = useCallback(async (silent = false, appType?: 'normal' | 'system_base') => {
+  const fetchApps = useCallback(async (silent = false, appType?: 'normal' | 'system_base', keepCount = false) => {
     if (!userId) {
       setState(prev => ({ ...prev, loading: false }));
       return;
@@ -43,14 +46,17 @@ export const useDesktopAppCache = (userId?: string, options: DesktopAppCacheOpti
         setState(prev => ({ ...prev, loading: true, error: null }));
       }
 
+      // 🔥 keepCount：刷新时保留已加载的分页数量（跨窗口联动/更新事件重拉时，不把已展开的列表缩回第一页）
+      const fetchCount = keepCount ? Math.max(pageSize, appsLengthRef.current) : pageSize;
+
       // 🔥 使用本地存储服务获取应用列表（appType 可选类型过滤）
-      const desktopApps = await desktopAppStorage.getByUserId(userId, pageSize, 0, appType);
+      const desktopApps = await desktopAppStorage.getByUserId(userId, fetchCount, 0, appType);
       const count = desktopApps.length;
 
       const mappedApps = desktopApps?.map((dbApp: any) => mapDbAppToDesktopApp(dbApp)) || [];
 
       // 🔥 修复：当返回数量等于 pageSize 时，认为可能还有更多数据
-      const hasMore = count >= pageSize;
+      const hasMore = count >= fetchCount;
 
       setState({
         apps: mappedApps,

@@ -264,10 +264,10 @@ async function performInstall(version: string) {
   await new Promise(resolve => setTimeout(resolve, 500));
 
   // 🔥 执行安装
-  // isSilent=false: 显示安装界面（用户可以看到进度，一键安装只需点一次）
+  // isSilent=true: 纯静默安装（配合 perMachine=false 用户目录安装，全程无 UAC 弹窗，零点击）
   // forceRunAfter=true: 安装完成后自动运行新版本
-  log.info('[AutoUpdater] 启动一键安装...');
-  autoUpdater.quitAndInstall(false, true);
+  log.info('[AutoUpdater] 启动静默安装...');
+  autoUpdater.quitAndInstall(true, true);
 }
 
 function onUpdateError(error: Error) {

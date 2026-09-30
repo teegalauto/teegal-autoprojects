@@ -1,9 +1,10 @@
 /**
  * FileTree 模块主入口
  * 
- * 🔥 简化架构：
- * - files/ 目录：当前工作目录（最新版本）
- * - history/ 目录：上一个 commit 版本（每个文件只保留一个版本）
+ * 🔥 git 化架构（isomorphic-git 快照）：
+ * - 工作目录：当前版本（可直接编辑）
+ * - HEAD：最近一次「接受修改」checkpoint
+ * - changes：相对 HEAD 的变更文件列表（ChangeList 数据源）
  */
 
 import React, { useState } from 'react';
@@ -46,7 +47,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
   const { toast } = useToast();
   const {
     files,
-    history,
+    changes,
     loading,
     error,
     expandedDirs,
@@ -293,7 +294,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
                 onRefresh={refresh}
                 expandedDirs={expandedDirs}
                 toggleDir={toggleDir}
-                history={history}
+                changes={changes}
               />
             ))}
           </div>
@@ -303,7 +304,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
       {/* 变更记录 */}
       <ChangeList
         appId={appId}
-        history={history}
+        changes={changes}
         onRefresh={refresh}
         onViewDiff={onViewDiff}
         selectedFileName={selectedChange}
@@ -336,7 +337,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
   const { toast } = useToast();
   const {
     files,
-    history,
+    changes,
     loading,
     error,
     expandedDirs,
@@ -524,16 +525,6 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
     }
   };
 
-  // 🔥 检查文件是否有历史版本
-  const checkHasHistory = (filePath: string): boolean => {
-    // 简单匹配：检查 history 中是否有该文件
-    return history.some(h => {
-      // 🔥 匹配文件名或相对路径
-      const fileName = filePath.split(/[\\/]/).pop() || '';
-      return h.fileName === fileName || h.fileName === filePath;
-    });
-  };
-
   if (loading) {
     return (
       <div className="flex items-center justify-center py-4">
@@ -668,7 +659,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
                 onRefresh={refresh}
                 expandedDirs={expandedDirs}
                 toggleDir={toggleDir}
-                history={history}
+                changes={changes}
               />
             ))}
           </div>
@@ -678,7 +669,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
       {/* 变更记录 */}
       <ChangeList
         appId={appId}
-        history={history}
+        changes={changes}
         onRefresh={refresh}
         onViewDiff={onViewDiff}
         selectedFileName={selectedChange}

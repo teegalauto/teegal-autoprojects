@@ -110,7 +110,7 @@ export const DesktopPanel: React.FC<DesktopPanelProps> = ({ userId, conversation
       }
 
       // 3. 刷新应用列表
-      fetchApps(true);
+      fetchApps(true, undefined, true);
 
       // 4. 通知其他组件
       desktopAppEventService.emitAppCreated(newApp.id, currentUserId, { code: newApp.code || '' });
@@ -143,7 +143,7 @@ export const DesktopPanel: React.FC<DesktopPanelProps> = ({ userId, conversation
       console.log('📡 [DesktopPanel] 收到 app_created 事件:', event);
       if (currentUserId && event.userId === currentUserId) {
         console.log('📡 [DesktopPanel] userId 匹配，刷新应用列表');
-        fetchApps(true);
+        fetchApps(true, undefined, true);
       } else {
         console.log('📡 [DesktopPanel] userId 不匹配:', { currentUserId, eventUserId: event.userId });
       }
@@ -210,14 +210,14 @@ export const DesktopPanel: React.FC<DesktopPanelProps> = ({ userId, conversation
 
     const handleDesktopAppUpdated = () => {
       console.log('📡 [DesktopPanel] 收到 desktopAppUpdated 事件，刷新列表');
-      fetchApps(true);
+      fetchApps(true, undefined, true);
     };
     window.addEventListener('desktopAppUpdated', handleDesktopAppUpdated);
 
     // 🔥 跨窗口联动：独立 viewer 窗口更新/关闭时通过 localStorage storage 事件通知（同源窗口共享）
     const handleStorage = (e: StorageEvent) => {
       if (e.key === 'desktopAppUpdatedSignal' && e.newValue) {
-        fetchApps(true);
+        fetchApps(true, undefined, true);
       }
     };
     window.addEventListener('storage', handleStorage);

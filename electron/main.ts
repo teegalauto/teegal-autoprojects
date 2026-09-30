@@ -4,6 +4,7 @@ import { spawn, spawnSync, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { initAutoUpdater } from './autoUpdater';
 import { startAgentServer, readHeadlessAuth } from './agentServer';
+import { snapshotApp, snapshotFile, listChanges, getHeadFileContent, listCheckpoints, getFileAt, restoreTo } from './appCodeGit';
 
 /**
  * 🔥 Headless 分身模式（TEEGAL_HEADLESS=1 或 --headless）：
@@ -2161,14 +2162,6 @@ function getAppCodeDir(appId: string, codePath?: string): string {
 }
 
 /**
- * 🔥 获取 App 默认目录（不受 codePath 影响，用于 history 等固定位置）
- */
-function getAppDefaultDir(appId: string): string {
-  const appCodeRoot = pathModule.join(app.getPath('userData'), 'apps');
-  return pathModule.join(appCodeRoot, appId);
-}
-
-/**
  * 确保目录存在
  */
 function ensureDir(dirPath: string): void {
@@ -2184,33 +2177,9 @@ ipcMain.handle('app-code:save', async (_, { appId, fileName, content, codePath }
   try {
     const appDir = getAppCodeDir(appId, codePath);
     ensureDir(appDir);
-    
+
     const filePath = pathModule.join(appDir, fileName);
-    
-    // 🔥 检查文件是否存在
-    const fileExists = fs.existsSync(filePath);
-    
-    // 🔥 如果文件已存在，先备份当前版本到 history 目录
-    // 🔥 history 始终在默认路径下（不受 codePath 影响）
-    if (fileExists) {
-      const defaultDir = getAppDefaultDir(appId);
-      const historyDir = pathModule.join(defaultDir, 'history', fileName);
-      
-      // 🔥 检查 history 目录下是否已有该文件的版本目录
-      if (!fs.existsSync(historyDir)) {
-        // 🔥 创建 history 文件目录
-        fs.mkdirSync(historyDir, { recursive: true });
-        
-        // 🔥 备份当前版本到 history 目录（命名为 v1）
-        const ext = fileName.split('.').pop() || 'txt';
-        const versionFileName = `v1.${ext}`;
-        const versionFilePath = pathModule.join(historyDir, versionFileName);
-        fs.copyFileSync(filePath, versionFilePath);
-        
-        console.log('✅ [APP-CODE] 备份当前版本成功:', versionFilePath);
-      }
-    }
-    
+
     // 🔥 确保子目录存在
     const fileDir = pathModule.dirname(filePath);
     if (!fs.existsSync(fileDir)) {
@@ -2370,17 +2339,6 @@ ipcMain.handle('app-code:delete', async (_, { appId, fileName, isDirectory, code
       fs.unlinkSync(filePath);
     }
 
-    // 🔥 同时删除 history 中的版本（始终在默认路径下）
-    const defaultDir = getAppDefaultDir(appId);
-    const historyPath = pathModule.join(defaultDir, 'history', fileName);
-    if (fs.existsSync(historyPath)) {
-      if (fs.statSync(historyPath).isDirectory()) {
-        removeDirRobust(historyPath);
-      } else {
-        fs.unlinkSync(historyPath);
-      }
-    }
-
     console.log('✅ [APP-CODE] 已删除:', fileName);
     return { success: true };
   } catch (error) {
@@ -2414,18 +2372,6 @@ ipcMain.handle('app-code:rename', async (_, { appId, oldFileName, newFileName, c
 
     fs.renameSync(oldPath, newPath);
 
-    // 🔥 同时重命名 history 中的版本（始终在默认路径下）
-    const defaultDir = getAppDefaultDir(appId);
-    const oldHistoryPath = pathModule.join(defaultDir, 'history', oldFileName);
-    const newHistoryPath = pathModule.join(defaultDir, 'history', newFileName);
-    if (fs.existsSync(oldHistoryPath)) {
-      const newHistoryDir = pathModule.dirname(newHistoryPath);
-      if (!fs.existsSync(newHistoryDir)) {
-        fs.mkdirSync(newHistoryDir, { recursive: true });
-      }
-      fs.renameSync(oldHistoryPath, newHistoryPath);
-    }
-
     console.log('✅ [APP-CODE] 已重命名:', oldFileName, '->', newFileName);
     return { success: true };
   } catch (error) {
@@ -2435,109 +2381,107 @@ ipcMain.handle('app-code:rename', async (_, { appId, oldFileName, newFileName, c
 });
 
 /**
- * 🔥 Commit - 清空 history 目录
- * 跨平台：使用 Node.js fs API
+ * 🔥 Commit - git checkpoint（接受修改 = 快照当前工作区）
+ * 「版本历史」由 git log 全量承载，替代旧 history 目录单版本快照
  */
 ipcMain.handle('app-code:commit', async (_, { appId, fileName, codePath }: { appId: string; fileName?: string; codePath?: string }) => {
   try {
-    // 🔥 history 始终在默认路径下（不受 codePath 影响）
-    const defaultDir = getAppDefaultDir(appId);
-    const historyDir = pathModule.join(defaultDir, 'history');
-
-    if (!fs.existsSync(historyDir)) {
+    const appDir = getAppCodeDir(appId, codePath);
+    if (!fs.existsSync(appDir)) {
       return { success: true };
     }
-
-    if (fileName) {
-      // 🔥 只清空指定文件的历史版本
-      const fileHistoryDir = pathModule.join(historyDir, fileName);
-      if (fs.existsSync(fileHistoryDir)) {
-        fs.rmSync(fileHistoryDir, { recursive: true, force: true });
-      }
-      console.log('✅ [APP-CODE] 已清空文件历史版本:', fileName);
-    } else {
-      // 🔥 清空整个 history 目录内容
-      const items = fs.readdirSync(historyDir);
-      for (const item of items) {
-        const itemPath = pathModule.join(historyDir, item);
-        fs.rmSync(itemPath, { recursive: true, force: true });
-      }
-      console.log('✅ [APP-CODE] 已清空 history 目录:', appId);
-    }
-
-    return { success: true };
+    // 指定 fileName → 单文件 checkpoint（接受该文件）；否则全量 checkpoint
+    const message = fileName ? `接受修改 ${fileName}` : '接受修改';
+    const result = fileName
+      ? await snapshotFile(appDir, fileName, message)
+      : await snapshotApp(appDir, message);
+    return { success: true, committed: result.committed, oid: result.oid };
   } catch (error) {
     console.error('❌ [APP-CODE] commit 失败:', error);
-    return { success: false, error: error instanceof Error ? error.message : '清空失败' };
+    return { success: false, error: error instanceof Error ? error.message : '快照失败' };
   }
 });
 
 /**
- * 🔥 保存历史版本（将当前文件备份到 history 目录）
- * 跨平台：使用 Node.js fs API
- */
-ipcMain.handle('app-code:save-history', async (_, { appId, fileName, codePath }: { appId: string; fileName: string; codePath?: string }) => {
-  try {
-    // 🔥 当前文件从 codePath 目录读取
-    const appDir = getAppCodeDir(appId, codePath);
-    const currentFilePath = pathModule.join(appDir, fileName);
-
-    if (!fs.existsSync(currentFilePath)) {
-      return { success: false, error: '当前文件不存在' };
-    }
-
-    // 🔥 history 始终存到默认路径下
-    const defaultDir = getAppDefaultDir(appId);
-    const ext = fileName.split('.').pop() || 'txt';
-    const fileHistoryDir = pathModule.join(defaultDir, 'history', fileName);
-    const historyFilePath = pathModule.join(fileHistoryDir, `v1.${ext}`);
-
-    // 🔥 如果 history 中已有版本，跳过
-    if (fs.existsSync(historyFilePath)) {
-      return { success: true, skipped: true };
-    }
-
-    // 🔥 创建 history 目录
-    if (!fs.existsSync(fileHistoryDir)) {
-      fs.mkdirSync(fileHistoryDir, { recursive: true });
-    }
-
-    // 🔥 复制当前文件到 history
-    fs.copyFileSync(currentFilePath, historyFilePath);
-
-    console.log('✅ [APP-CODE] 已保存历史版本:', historyFilePath);
-    return { success: true };
-  } catch (error) {
-    console.error('❌ [APP-CODE] 保存历史版本失败:', error);
-    return { success: false, error: error instanceof Error ? error.message : '保存历史版本失败' };
-  }
-});
-
-/**
- * 🔥 读取历史版本内容
- * 跨平台：使用 Node.js fs API
+ * 🔥 读取文件在 HEAD（最近一次 checkpoint）中的内容（变更对比/回退用）
  */
 ipcMain.handle('app-code:read-history', async (_, { appId, fileName, codePath }: { appId: string; fileName: string; codePath?: string }) => {
   try {
-    // 🔥 history 始终在默认路径下
-    const defaultDir = getAppDefaultDir(appId);
-    const ext = fileName.split('.').pop() || 'txt';
-    const historyFilePath = pathModule.join(defaultDir, 'history', fileName, `v1.${ext}`);
-
-    if (!fs.existsSync(historyFilePath)) {
-      return { success: false, error: '历史版本不存在' };
+    const appDir = getAppCodeDir(appId, codePath);
+    const content = await getHeadFileContent(appDir, fileName);
+    if (content === null) {
+      return { success: false, error: '该文件尚无提交版本' };
     }
-
-    let content = fs.readFileSync(historyFilePath, 'utf-8');
-    // 🔥 去除 BOM
-    if (content.charCodeAt(0) === 0xfeff) {
-      content = content.slice(1);
-    }
-
     return { success: true, content };
   } catch (error) {
     console.error('❌ [APP-CODE] 读取历史版本失败:', error);
     return { success: false, error: error instanceof Error ? error.message : '读取历史版本失败' };
+  }
+});
+
+/**
+ * 🔥 相对 HEAD 的变更文件列表（git status 语义，变更记录面板数据源）
+ */
+ipcMain.handle('app-code:git-status', async (_, { appId, codePath }: { appId: string; codePath?: string }) => {
+  try {
+    const appDir = getAppCodeDir(appId, codePath);
+    if (!fs.existsSync(appDir)) {
+      return { success: true, changes: [] };
+    }
+    const changes = await listChanges(appDir);
+    return { success: true, changes };
+  } catch (error) {
+    console.error('❌ [APP-CODE] 读取变更列表失败:', error);
+    return { success: false, error: error instanceof Error ? error.message : '读取变更列表失败' };
+  }
+});
+
+/**
+ * 🔥 checkpoint 时间线（git log，新→旧）
+ */
+ipcMain.handle('app-code:git-log', async (_, { appId, codePath, limit }: { appId: string; codePath?: string; limit?: number }) => {
+  try {
+    const appDir = getAppCodeDir(appId, codePath);
+    if (!fs.existsSync(appDir)) {
+      return { success: true, checkpoints: [] };
+    }
+    const checkpoints = await listCheckpoints(appDir, limit);
+    return { success: true, checkpoints };
+  } catch (error) {
+    console.error('❌ [APP-CODE] 读取 checkpoint 列表失败:', error);
+    return { success: false, error: error instanceof Error ? error.message : '读取版本历史失败' };
+  }
+});
+
+/**
+ * 🔥 读指定 checkpoint 中某文件内容（只读查看）
+ */
+ipcMain.handle('app-code:git-file', async (_, { appId, oid, fileName, codePath }: { appId: string; oid: string; fileName: string; codePath?: string }) => {
+  try {
+    const appDir = getAppCodeDir(appId, codePath);
+    const content = await getFileAt(appDir, oid, fileName);
+    if (content === null) {
+      return { success: false, error: '该版本中不存在此文件' };
+    }
+    return { success: true, content };
+  } catch (error) {
+    console.error('❌ [APP-CODE] 读取版本文件失败:', error);
+    return { success: false, error: error instanceof Error ? error.message : '读取版本文件失败' };
+  }
+});
+
+/**
+ * 🔥 回滚整个项目到指定 checkpoint（工作区重置，未跟踪文件保留）
+ */
+ipcMain.handle('app-code:git-restore', async (_, { appId, oid, codePath }: { appId: string; oid: string; codePath?: string }) => {
+  try {
+    const appDir = getAppCodeDir(appId, codePath);
+    await restoreTo(appDir, oid);
+    console.log('✅ [APP-CODE] 已回滚到 checkpoint:', oid, 'appId:', appId);
+    return { success: true };
+  } catch (error) {
+    console.error('❌ [APP-CODE] 回滚失败:', error);
+    return { success: false, error: error instanceof Error ? error.message : '回滚失败' };
   }
 });
 
