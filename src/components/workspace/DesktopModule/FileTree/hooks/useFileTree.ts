@@ -13,7 +13,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { FileNode, FileHistory, FileVersion, FileTreeState } from '../types';
 import { sortFileNodes, filterFileNodes } from '../utils';
-import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
+import { getAppBasePath, getCodePath } from '@/utils/apptool/AppPathHelper';
 
 /**
  * 🔥 模块级缓存：按 appId 缓存文件树数据
@@ -30,6 +30,19 @@ interface FileTreeCache {
 const fileTreeCache = new Map<string, FileTreeCache>();
 
 const CACHE_TTL = 30 * 1000; // 30秒内不重复加载
+
+/**
+ * 🔥 变更列表独立缓存：listAppCodeChanges 是全树逐文件 readFile+hash 的重操作
+ * （数千文件），focus/拖动等高频触发源必须在短 TTL 内复用结果，否则连续全树
+ * hash 直接卡死。文件变更事件（trainProjectFilesChanged）走 forceChanges 强刷。
+ */
+interface ChangesCache {
+  changes: FileHistory[];
+  timestamp: number;
+  codePath: string; // 🔥 归属校验：导入/取消导入会更换 codePath，目录变了缓存必须作废
+}
+const changesCache = new Map<string, ChangesCache>();
+const CHANGES_TTL = 10 * 1000; // 10秒内复用变更列表
 
 export function useFileTree(appId: string) {
   const [state, setState] = useState<FileTreeState>(() => {
@@ -53,6 +66,23 @@ export function useFileTree(appId: string) {
 
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
 
+  // 🔥 项目代码根目录（绝对路径）：scanDirectory/loadSubDirectory 用它计算每个节点的 relativePath
+  // 主进程 read-directory 不返回 relativePath，若缺省回退到裸文件名，
+  // 会导致嵌套目录/文件的新建落点、删除路径全部错到根目录
+  const basePathRef = useRef<string>('');
+  const toRelativePath = (absolutePath: string): string => {
+    // 🔥 统一分隔符后比较：getAppBasePath 可能返回混合分隔符（teegal/apps/{id}），
+    // 而主进程 path.join 输出全反斜杠——直接 startsWith 会失败 → 回退裸文件名，
+    // 多级目录前缀被丢（复制相对路径 b/c.py 变 c.py、嵌套文件删除也中招）
+    const base = basePathRef.current.replace(/[\\/]+$/, '');
+    const norm = (p: string) => p.replace(/\\/g, '/');
+    if (base && norm(absolutePath).startsWith(norm(base))) {
+      const rel = norm(absolutePath).slice(norm(base).length).replace(/^\/+/, '');
+      return rel || '';
+    }
+    return absolutePath.split(/[\\/]/).pop() || '';
+  };
+
   // 🔥 使用 ref 保存最新的 expandedDirs，避免 refresh 函数依赖 expandedDirs 导致频繁重建
   const expandedDirsRef = useRef(expandedDirs);
   useEffect(() => {
@@ -62,12 +92,12 @@ export function useFileTree(appId: string) {
   /**
    * 加载文件树
    */
-  const loadFileTree = useCallback(async (silent = false) => {
+  const loadFileTree = useCallback(async (silent = false, forceChanges = false) => {
     if (!appId) return;
 
     // 🔥 检查缓存是否未过期，未过期则跳过
     const cached = fileTreeCache.get(appId);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL && !forceChanges) {
       console.log('[FileTree] 使用缓存，跳过加载:', appId);
       setState({
         files: cached.files,
@@ -88,13 +118,14 @@ export function useFileTree(appId: string) {
 
       // 🔥 获取文件目录（支持导入项目的自定义路径）
       const filesDir = await getAppBasePath(appId);
+      basePathRef.current = filesDir;
 
       // 🔥 加载 files 目录（当前版本）
       const allFiles = await scanDirectory(filesDir);
       const files = allFiles.filter(f => f.name !== 'history'); // 🔥 兼容：隐藏旧版 history 目录残留
 
-      // 🔥 加载相对 HEAD 的变更文件列表（git status）
-      const changes = await loadChanges();
+      // 🔥 加载相对 HEAD 的变更文件列表（git status）；短 TTL 内复用，forceChanges 强刷
+      const changes = await loadChanges(forceChanges);
 
       const sortedFiles = sortFileNodes(filterFileNodes(files));
       const sortedChanges = changes;
@@ -139,7 +170,7 @@ export function useFileTree(appId: string) {
           return result.files.map((f: any) => ({
             name: f.name,
             path: f.path,
-            relativePath: f.relativePath || f.name,
+            relativePath: toRelativePath(f.path),
             type: f.type,
             ext: f.ext,
             size: f.size,
@@ -160,15 +191,28 @@ export function useFileTree(appId: string) {
    * 🔥 加载相对 HEAD 的变更文件列表（git status）
    * 复用 FileHistory 结构：fileName=相对路径，version.versionName=changeType
    */
-  const loadChanges = async (): Promise<FileHistory[]> => {
+  const loadChanges = async (force = false): Promise<FileHistory[]> => {
     try {
       const electron = (window as any).electron;
       if (!electron?.listAppCodeChanges) return [];
 
-      const result = await electron.listAppCodeChanges({ appId });
+      // 🔥 传入 codePath：导入项目的 git 仓库在自定义目录，不传会读到默认 apps/<appId> 目录，
+      // 导致导入项目里（尤其新建子文件夹的文件）的变更永远查不出来
+      const cp = await getCodePath(appId);
+      const codePath = cp || '';
+
+      // 🔥 短 TTL 内复用上次结果（全树 hash 重操作，见 changesCache 注释）；
+      // codePath 变了（重新导入/取消导入）立即作废
+      const cached = changesCache.get(appId);
+      if (!force && cached && cached.codePath === codePath
+          && Date.now() - cached.timestamp < CHANGES_TTL) {
+        return cached.changes;
+      }
+
+      const result = await electron.listAppCodeChanges({ appId, codePath: cp || undefined });
       const list: any[] = result?.success ? (result.changes || []) : [];
 
-      return list.map(c => ({
+      const mapped = list.map(c => ({
         fileName: c.fileName,
         filePath: '',
         version: {
@@ -176,33 +220,48 @@ export function useFileTree(appId: string) {
           path: '',
           createdAt: '',
         },
+        changeType: c.changeType || 'modified',
       }));
+      changesCache.set(appId, { changes: mapped, timestamp: Date.now(), codePath });
+      return mapped;
     } catch (error) {
       console.error('[FileTree] 加载变更列表失败:', error);
       return [];
     }
   };
 
+  // 🔥 相对路径 → 绝对路径归一化（expandedDirs/toggleDir 均以绝对路径为键；
+  // resolveTargetDir 等场景传入的是相对路径，需先转换）
+  const toAbsolutePath = (p: string): string => {
+    // 🔥 绝对路径直接返回：Windows 盘符（C:\）、UNC（\\）、POSIX（/开头，macOS/Linux）；
+    // 缺 POSIX 判定会把 Mac 的绝对路径当相对路径拼出 doubling 垃圾路径，
+    // readDirectory 必败 → 目录永远点不开（Mac 独有的文件树展开 bug 根因）
+    if (/^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/')) return p;
+    const base = basePathRef.current.replace(/[\\/]+$/, '');
+    return base ? `${base}/${p.replace(/^[\\/]+/, '')}` : p;
+  };
+
   /**
    * 展开/折叠目录
    */
   const toggleDir = useCallback(async (path: string) => {
-    const isCurrentlyExpanded = expandedDirs.has(path);
-    
+    const absPath = toAbsolutePath(path);
+    const isCurrentlyExpanded = expandedDirs.has(absPath);
+
     if (isCurrentlyExpanded) {
       // 折叠
       setExpandedDirs(prev => {
         const newSet = new Set(prev);
-        newSet.delete(path);
+        newSet.delete(absPath);
         return newSet;
       });
     } else {
       // 展开 - 先加载子目录，失败则不展开（避免"展开图标但无内容"的假亮）
-      const children = await loadSubDirectory(path);
+      const children = await loadSubDirectory(absPath);
       if (!children) return;
       setExpandedDirs(prev => {
         const newSet = new Set(prev);
-        newSet.add(path);
+        newSet.add(absPath);
         return newSet;
       });
     }
@@ -224,7 +283,7 @@ export function useFileTree(appId: string) {
       const children = sortFileNodes(result.files.map((f: any) => ({
         name: f.name,
         path: f.path,
-        relativePath: f.relativePath || f.name,
+        relativePath: toRelativePath(f.path),
         type: f.type,
         ext: f.ext,
         size: f.size,
@@ -265,15 +324,17 @@ export function useFileTree(appId: string) {
    * 判断目录是否展开
    */
   const isDirExpanded = useCallback((path: string) => {
-    return expandedDirs.has(path);
+    return expandedDirs.has(toAbsolutePath(path));
   }, [expandedDirs]);
 
   /**
    * 刷新文件树
    * 🔥 强制刷新（忽略缓存），用于文件变更事件
+   * 🔥 forceChanges=true 强刷变更列表（agent 改完文件/接受修改后必须重算全树 hash）；
+   * 缺省复用 10s TTL 内的变更列表（focus/拖动触发，避免连续全树 hash 卡死）
    * 🔥 使用 ref 读取 expandedDirs，避免函数依赖 expandedDirs 导致重建
    */
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { forceChanges?: boolean }) => {
     // 🔥 强制刷新前清除缓存
     fileTreeCache.delete(appId);
 
@@ -281,7 +342,7 @@ export function useFileTree(appId: string) {
     const currentExpandedDirs = new Set(expandedDirsRef.current);
 
     // 🔥 静默刷新：不设 loading: true，避免 ChangeList 被卸载丢失 diffStats
-    await loadFileTree(true);
+    await loadFileTree(true, opts?.forceChanges ?? false);
 
     // 🔥 重新加载已展开目录的子目录；读取失败的目录（被删/瞬时不可用）从展开态移除，
     // 避免"展开图标但无内容"的残留假亮
@@ -375,14 +436,15 @@ export function useFileTree(appId: string) {
         }
         refreshTimerRef.current = setTimeout(() => {
           console.log('[FileTree] 收到文件变更事件，刷新文件树（防抖）');
-          refreshRef.current();
+          // 🔥 agent 改完文件/接受修改：变更列表必须强刷（绕过 10s TTL 重算全树 hash）
+          refreshRef.current({ forceChanges: true });
           refreshTimerRef.current = null;
         }, 500);
       }
     };
 
     window.addEventListener('trainProjectFilesChanged', handleFilesChanged as EventListener);
-    
+
     return () => {
       window.removeEventListener('trainProjectFilesChanged', handleFilesChanged as EventListener);
       if (refreshTimerRef.current) {
@@ -390,6 +452,21 @@ export function useFileTree(appId: string) {
       }
     };
   }, [appId]);
+
+  // 🔥 窗口聚焦时静默刷新：用户在系统文件管理器新建/删除文件后切回应用即可看到，
+  // 不需要重新导入/重进项目（refresh 自带清缓存 + 保展开态）
+  // 🔥 节流：拖动文件/切窗口会连续触发 focus，每次全量刷新连环重算直接卡死，5s 内只刷一次
+  const lastFocusRefreshRef = useRef(0);
+  useEffect(() => {
+    const onFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusRefreshRef.current < 5000) return;
+      lastFocusRefreshRef.current = now;
+      refreshRef.current();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, []);
 
   return {
     ...state,

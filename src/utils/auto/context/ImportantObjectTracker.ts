@@ -1,12 +1,14 @@
 /**
  * ImportantObjectTracker
  * 跟踪对话中的重要对象 ID
- * 
+ *
  * 职责：
  * 1. 从对话历史中提取重要对象 ID（appId, fileId 等）
  * 2. 按时间顺序维护 ID 列表（由旧到新）
  * 3. 提供格式化输出供环境注入使用
  */
+
+import { isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
 
 export interface ProjectActivityStats {
   trainCount: number;      // GPU 训练次数
@@ -657,8 +659,9 @@ export class ImportantObjectTracker {
   /**
    * 获取格式化的重要对象列表（用于环境注入）
    * 🔥 排序策略：先按 mentionCount 降序（活跃度），再按 lastSeenAt 降序（最近性）
+   * @param activeInstances 活跃 SSH 实例快照（可选）：归属匹配的项目条目下直接带出，免调 ssh_instance 查询省一轮
    */
-  getFormattedObjects(conversationId: string): string {
+  getFormattedObjects(conversationId: string, activeInstances?: any[], rootHints?: Map<string, string>): string {
     const objects = this.getConversationObjects(conversationId);
 
     if (objects.length === 0) {
@@ -713,44 +716,28 @@ export class ImportantObjectTracker {
         }
 
         lines.push(`${index + 1}. [${timeStr}] ${shortId} (${summary})`);
-      });
-      lines.push('');
-    }
 
-    if (files.length > 0) {
-      lines.push('### 文件 (Files)');
-      files.forEach((file, index) => {
-        const timeStr = formatTime(file.lastSeenAt);
-        lines.push(`${index + 1}. [${timeStr}] fileId: ${file.id} (提及${file.mentionCount}次)${file.context ? ` | ${file.context}` : ''}`);
-      });
-      lines.push('');
-    }
-
-    if (paths.length > 0) {
-      lines.push('### 本地路径 (Paths)');
-      paths.forEach((path, index) => {
-        const timeStr = formatTime(path.lastSeenAt);
-        // 🔥 过滤 context 中的中文，只保留 ASCII 字符
-        let contextStr = '';
-        if (path.context) {
-          const asciiOnly = path.context.replace(/[^\x00-\x7F]/g, '');
-          contextStr = asciiOnly.substring(0, 50);
-          if (path.context.length > 50) contextStr += '...';
-          if (contextStr.trim()) contextStr = ` | ${contextStr}`;
+        // 🔥 内容根提示（穿透子目录名）：LLM 直接写对 read/push 的相对路径前缀，免跑一轮文件树确认
+        const rootHint = rootHints?.get(app.id) || [...(rootHints?.keys() || [])].find(k => isSameProjectId(k, app.id) && rootHints!.get(k));
+        if (rootHint) {
+          lines.push(`   内容根: ${rootHint}/`);
         }
-        lines.push(`${index + 1}. [${timeStr}] ${path.id} (提及${path.mentionCount}次)${contextStr}`);
+
+        // 🔥 附带该项目归属的活跃实例（快照，免调 ssh_instance 查询）
+        if (activeInstances && activeInstances.length > 0) {
+          const owned = activeInstances.filter(it => isSameProjectId(it.app_id, app.id));
+          for (const it of owned) {
+            const addr = it.host ? `${it.username || 'ubuntu'}@${it.host}` : (it.public_ip || '开机中');
+            const status = it.status === 'pending' ? '开机中' : (it.status || '');
+            lines.push(`   实例: ${it.id} (${it.instance_type || '未知规格'}, ${addr}${status ? `, ${status}` : ''})`);
+          }
+        }
       });
       lines.push('');
     }
 
-    if (others.length > 0) {
-      lines.push('### 其他对象');
-      others.forEach((obj, index) => {
-        const timeStr = formatTime(obj.lastSeenAt);
-        lines.push(`${index + 1}. [${timeStr}] ${obj.type}Id: ${obj.id} (提及${obj.mentionCount}次)${obj.context ? ` | ${obj.context}` : ''}`);
-      });
-      lines.push('');
-    }
+    // 🔥 聚焦项目关联：Files/Paths/其他对象段已移除——fileId/路径在执行历史里随取随用，
+    // 常驻注入只会膨胀上下文，对"快速建立项目认知"没有增量价值
 
     return lines.join('\n');
   }

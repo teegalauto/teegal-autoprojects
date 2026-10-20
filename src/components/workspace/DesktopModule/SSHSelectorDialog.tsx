@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Sparkles, Cloud, Loader2, OctagonX, Copy, Check, Unlink, Plus } from 'lucide-react';
+import { Sparkles, Cloud, Loader2, OctagonX, Copy, Check, Unlink, Plus, CalendarSync } from 'lucide-react';
 import { getBackendUrl } from '@/config/env';
-import { sshListActive, sshCloseInstance, sshAddSelfInstance } from '@/utils/systemtools/sshInstance';
+import { sshListActive, sshCloseInstance, sshAddSelfInstance, sshGetInstanceDetail, sshRenewInstance } from '@/utils/systemtools/sshInstance';
 
 /**
  * 云端常驻实例选择弹窗（长期租赁语义，与 GPUSelectorDialog 的短任务区分）
@@ -20,6 +20,21 @@ export interface SshSpecOption {
   memoryGB: number;
   pricePerHour: number;
   pricePerDay: number;
+}
+
+// ===== 长租月租（与云端 RentalService 折扣口径一致：>6月 5/6，1-6月 11/12；月=720 时）=====
+export const PREPAID_MAX_MONTHS = 12;
+const PREPAID_MONTH_HOURS = 720;
+/** 低毛利机型不参与长租折扣（与云端 RentalService.PREPAID_NO_DISCOUNT_TYPES 同口径，预付一律原价） */
+const PREPAID_NO_DISCOUNT_TYPES = new Set(['SA5.LARGE16']);
+
+export function prepaidUnitPrice(basePerHour: number, months: number, instanceType?: string): number {
+  if (instanceType && PREPAID_NO_DISCOUNT_TYPES.has(instanceType)) return basePerHour;
+  return Math.round(basePerHour * (months > 6 ? 5 / 6 : 11 / 12) * 100) / 100;
+}
+
+export function prepaidTotalPrice(basePerHour: number, months: number, instanceType?: string): number {
+  return Math.round(prepaidUnitPrice(basePerHour, months, instanceType) * PREPAID_MONTH_HOURS * months * 100) / 100;
 }
 
 /** 活跃实例（本地资源表字段，sync 自愈校正后） */
@@ -42,10 +57,12 @@ interface SSHSelectorDialogProps {
   userBalance: number;
   /** 当前项目 appId（归属标签用：本项目 / 其他项目 / 未关联） */
   currentAppId?: string | null;
-  onSelect: (spec: SshSpecOption) => void;
+  onSelect: (spec: SshSpecOption, months?: number) => void;
   onCancel: () => void;
   onRecharge?: () => void;
   userId?: string;
+  /** 续费成功后刷新余额显示 */
+  onBalanceChanged?: () => void;
 }
 
 const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
@@ -55,14 +72,22 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
   onSelect,
   onCancel,
   onRecharge,
-  userId
+  userId,
+  onBalanceChanged
 }) => {
   const [selectedSpec, setSelectedSpec] = useState<SshSpecOption | null>(null);
+  const [rentMonths, setRentMonths] = useState<number | null>(null);
   const [specs, setSpecs] = useState<SshSpecOption[]>([]);
   const [activeInstances, setActiveInstances] = useState<ActiveInstance[]>([]);
   const [loading, setLoading] = useState(false);
   const [closingId, setClosingId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 续费（预付长租）：展开行内月数选择 + 确认；按量实例点开提示无需续费
+  const [renewId, setRenewId] = useState<string | null>(null);
+  const [renewMonths, setRenewMonths] = useState(1);
+  const [renewExpireAt, setRenewExpireAt] = useState<number | null>(null);
+  const [renewBusy, setRenewBusy] = useState(false);
+  const [renewError, setRenewError] = useState<string | null>(null);
   // 自有机器绑定表单
   const [showSelfForm, setShowSelfForm] = useState(false);
   const [selfHost, setSelfHost] = useState('');
@@ -135,9 +160,51 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
   useEffect(() => {
     if (isOpen) {
       setSelectedSpec(null);
+      setRentMonths(null);
+      setRenewId(null);
       fetchData();
     }
   }, [isOpen, fetchData]);
+
+  // 续费：先查详情判断长租（按量实例提示无需续费），展开行内月数选择
+  const handleRenewClick = async (inst: ActiveInstance) => {
+    if (renewId === inst.id) {
+      setRenewId(null);
+      return;
+    }
+    setRenewId(inst.id);
+    setRenewMonths(1);
+    setRenewExpireAt(null);
+    setRenewError(null);
+    const d = await sshGetInstanceDetail(inst.id, userId);
+    if (d.ok && d.instance?.prepaid) {
+      setRenewExpireAt(d.instance.prepaid.expire_at);
+    } else if (d.ok) {
+      setRenewError('按量计费实例无需续费（关机即停止计费）');
+    } else {
+      setRenewError(d.error || '查询预付信息失败');
+    }
+  };
+
+  const handleRenewConfirm = async () => {
+    if (!renewId || renewExpireAt === null) return;
+    setRenewBusy(true);
+    setRenewError(null);
+    try {
+      const r = await sshRenewInstance(renewId, renewMonths, userId);
+      if (!r.ok) {
+        setRenewError(r.error || '续费失败');
+        return;
+      }
+      setRenewId(null);
+      await fetchData();
+      onBalanceChanged?.();
+    } catch (error: any) {
+      setRenewError(error?.message || String(error));
+    } finally {
+      setRenewBusy(false);
+    }
+  };
 
   // 关机/解绑（核心层统一处理：云端实例走云端结算；自有机器仅解绑 + 凭据同步删除）
   const handleCloseInstance = async (inst: ActiveInstance) => {
@@ -191,13 +258,19 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
 
   if (!isOpen) return null;
 
-  const hasEnoughBalance = userBalance > 0;
+  const prepaidNeed = selectedSpec && rentMonths ? prepaidTotalPrice(selectedSpec.pricePerHour, rentMonths, selectedSpec.instanceType) : 0;
+  // 按量只要余额 > 0（开机预检 1 小时费）；长租需一次付清总额
+  const hasEnoughBalance = rentMonths ? userBalance >= prepaidNeed : userBalance > 0;
+  const pillCls = (active: boolean) =>
+    `px-2 py-1 text-xs rounded-md border transition-colors ${
+      active ? 'border-blue-500 bg-blue-50 text-blue-700 font-medium' : 'border-gray-200 bg-white text-gray-600 hover:border-blue-300'
+    }`;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4 backdrop-blur-sm">
-      <div className="bg-white rounded-xl w-full max-w-2xl shadow-2xl border border-gray-100 animate-in fade-in zoom-in duration-200 overflow-hidden">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4 backdrop-blur-sm overflow-y-auto">
+      <div className="bg-white rounded-xl w-full max-w-2xl max-h-full shadow-2xl border border-gray-100 animate-in fade-in zoom-in duration-200 flex flex-col">
 
-        <div className="p-6 border-b border-gray-100 flex justify-between items-center">
+        <div className="p-6 border-b border-gray-100 flex justify-between items-center shrink-0">
           <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
             <Cloud className="h-5 w-5" /> 常驻实例
             {loading && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
@@ -210,7 +283,7 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
           </button>
         </div>
 
-        <div className="p-6 max-h-[420px] overflow-y-auto">
+        <div className="p-6 flex-1 min-h-0 overflow-y-auto">
           {/* 活跃实例：常驻中，可关机（云端）/ 解绑（自有机器，不影响机器本身） */}
           <div className="mb-4">
             <div className="flex items-center justify-between mb-2">
@@ -245,7 +318,8 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
             {activeInstances.length > 0 && (
               <div className="grid gap-2">
                 {activeInstances.map((inst) => (
-                  <div key={inst.id} className={`p-3 rounded-lg border flex justify-between items-center ${inst.source === 'workstation' ? 'border-violet-200 bg-violet-50/50' : 'border-blue-200 bg-blue-50/50'}`}>
+                  <div key={inst.id} className={`rounded-lg border ${inst.source === 'workstation' ? 'border-violet-200 bg-violet-50/50' : 'border-blue-200 bg-blue-50/50'}`}>
+                    <div className="p-3 flex justify-between items-center">
                     <div className="flex items-center gap-3">
                       {inst.status === 'running' ? (
                         <span className="h-2 w-2 rounded-full bg-green-500" />
@@ -293,22 +367,65 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
                         </div>
                       </div>
                     </div>
-                    <button
-                      onClick={() => handleCloseInstance(inst)}
-                      disabled={closingId === inst.id}
-                      className={`px-2 py-1 text-xs rounded-md inline-flex items-center gap-1 transition-colors disabled:opacity-50 ${
-                        inst.source === 'workstation' ? 'text-gray-500 hover:bg-gray-100' : 'text-red-600 hover:bg-red-50'
-                      }`}
-                    >
-                      {closingId === inst.id ? (
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                      ) : inst.source === 'workstation' ? (
-                        <Unlink className="w-3 h-3" />
-                      ) : (
-                        <OctagonX className="w-3 h-3" />
+                    <div className="flex items-center gap-1">
+                      {inst.source !== 'workstation' && (
+                        <button
+                          onClick={() => handleRenewClick(inst)}
+                          className="px-2 py-1 text-xs rounded-md text-blue-600 hover:bg-blue-50 inline-flex items-center gap-1 transition-colors"
+                        >
+                          <CalendarSync className="w-3 h-3" /> 续费
+                        </button>
                       )}
-                      {inst.source === 'workstation' ? '解绑' : '关机'}
-                    </button>
+                      <button
+                        onClick={() => handleCloseInstance(inst)}
+                        disabled={closingId === inst.id}
+                        className={`px-2 py-1 text-xs rounded-md inline-flex items-center gap-1 transition-colors disabled:opacity-50 ${
+                          inst.source === 'workstation' ? 'text-gray-500 hover:bg-gray-100' : 'text-red-600 hover:bg-red-50'
+                        }`}
+                      >
+                        {closingId === inst.id ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : inst.source === 'workstation' ? (
+                          <Unlink className="w-3 h-3" />
+                        ) : (
+                          <OctagonX className="w-3 h-3" />
+                        )}
+                        {inst.source === 'workstation' ? '解绑' : '关机'}
+                      </button>
+                    </div>
+                    </div>
+                    {renewId === inst.id && (
+                      <div className="px-3 pb-3">
+                        <div className="p-2 rounded-md bg-white border border-blue-100 text-xs flex items-center gap-2 flex-wrap">
+                          <select
+                            value={renewMonths}
+                            onChange={(e) => setRenewMonths(Number(e.target.value))}
+                            disabled={renewBusy}
+                            className="px-1.5 py-1 rounded-md border border-gray-200 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-300"
+                          >
+                            {Array.from({ length: PREPAID_MAX_MONTHS }, (_, i) => i + 1).map(m => (
+                              <option key={m} value={m}>{m} 个月</option>
+                            ))}
+                          </select>
+                          <span className="text-gray-600">
+                            预付 <span className="font-bold text-blue-600">{(prepaidUnitPrice(inst.price_per_hour, renewMonths, inst.instance_type) * 720 * renewMonths).toFixed(2)}</span> 积分（{prepaidUnitPrice(inst.price_per_hour, renewMonths, inst.instance_type).toFixed(2)}/时）
+                          </span>
+                          {renewExpireAt !== null && (
+                            <span className="text-gray-500">
+                              {new Date(renewExpireAt).toLocaleDateString()} → {new Date(renewExpireAt + renewMonths * 30 * 86400000).toLocaleDateString()}
+                            </span>
+                          )}
+                          <button
+                            onClick={handleRenewConfirm}
+                            disabled={renewBusy || renewExpireAt === null || userBalance < prepaidUnitPrice(inst.price_per_hour, renewMonths, inst.instance_type) * 720 * renewMonths}
+                            className="ml-auto px-2.5 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+                          >
+                            {renewBusy ? '续费中...' : '确认续费'}
+                          </button>
+                        </div>
+                        {renewError && <div className="mt-1.5 text-xs text-red-600">{renewError}</div>}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -353,18 +470,53 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
         </div>
 
         {selectedSpec && (
-          <div className="p-4 bg-gray-50 border-t border-gray-100">
+          <div className="p-4 bg-gray-50 border-t border-gray-100 shrink-0">
+            {/* 计费方式：按量 / 长租两档（1-6月 0.55，6月以上 0.5），选中档后选具体月数 */}
+            <div className="flex items-center gap-1.5 mb-3 flex-wrap">
+              <span className="text-xs text-gray-500 mr-0.5">计费：</span>
+              <button onClick={() => setRentMonths(null)} className={pillCls(rentMonths === null)}>
+                按量 {selectedSpec.pricePerHour.toFixed(2)}/时
+              </button>
+              <button
+                onClick={() => setRentMonths(rentMonths && rentMonths <= 6 ? rentMonths : 1)}
+                className={pillCls(rentMonths !== null && rentMonths <= 6)}
+              >
+                1-6个月 {prepaidUnitPrice(selectedSpec.pricePerHour, 1, selectedSpec.instanceType).toFixed(2)}/时
+              </button>
+              <button
+                onClick={() => setRentMonths(rentMonths && rentMonths > 6 ? rentMonths : 7)}
+                className={pillCls(rentMonths !== null && rentMonths > 6)}
+              >
+                6个月以上 {prepaidUnitPrice(selectedSpec.pricePerHour, 7, selectedSpec.instanceType).toFixed(2)}/时
+              </button>
+              {rentMonths !== null && (
+                <select
+                  value={rentMonths}
+                  onChange={(e) => setRentMonths(Number(e.target.value))}
+                  className="px-1.5 py-1 text-xs rounded-md border border-gray-200 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-300"
+                >
+                  {/* 全量 1-12：下拉直接选任意月数，档位 pill 联动高亮（>6 自动切 0.50 档） */}
+                  {Array.from({ length: PREPAID_MAX_MONTHS }, (_, i) => i + 1).map(m => (
+                    <option key={m} value={m}>{m} 个月</option>
+                  ))}
+                </select>
+              )}
+            </div>
             <div className="flex justify-between items-center">
               <span className="text-sm text-gray-600 inline-flex items-center gap-1">
                 当前余额：<span className={`font-bold inline-flex items-center gap-0.5 ${userBalance <= 0 ? 'text-red-600' : 'text-green-600'}`}><Sparkles className="h-3.5 w-3.5 text-violet-500" />{userBalance.toFixed(2)}</span>
               </span>
               <div className="text-sm text-gray-500">
-                ⏱️ 开机即计费，关机停止
+                {rentMonths ? (
+                  <>预付总额：<span className="font-bold text-blue-600">{prepaidNeed.toFixed(2)} 积分</span>（到期自动关机，提前关机按原价折算退差额）</>
+                ) : (
+                  '⏱️ 开机即计费，关机停止'
+                )}
               </div>
             </div>
             {!hasEnoughBalance && (
               <div className="mt-2 p-2 bg-red-50 border-l-4 border-red-500 rounded-r text-sm text-red-700">
-                ⚠️ 余额不足，请先充值
+                ⚠️ {rentMonths ? `余额不足付长租总额 ${prepaidNeed.toFixed(2)}，` : ''}请先充值
                 {onRecharge && (
                   <button onClick={onRecharge} className="ml-2 text-blue-600 underline">
                     去充值
@@ -375,7 +527,7 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
           </div>
         )}
 
-        <div className="p-4 border-t border-gray-100 flex gap-3">
+        <div className="p-4 border-t border-gray-100 flex gap-3 shrink-0">
           <button
             onClick={onCancel}
             className="flex-1 py-2.5 px-4 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-all font-medium"
@@ -383,7 +535,7 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
             取消
           </button>
           <button
-            onClick={() => selectedSpec && onSelect(selectedSpec)}
+            onClick={() => selectedSpec && onSelect(selectedSpec, rentMonths || undefined)}
             disabled={!selectedSpec || !hasEnoughBalance}
             className={`flex-1 py-2.5 px-4 rounded-lg transition-all font-bold ${
               selectedSpec && hasEnoughBalance
@@ -391,7 +543,13 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
                 : 'bg-gray-300 text-gray-500 cursor-not-allowed'
             }`}
           >
-            {!selectedSpec ? '请选择实例规格' : !hasEnoughBalance ? '余额不足' : '开机'}
+            {!selectedSpec
+              ? '请选择实例规格'
+              : !hasEnoughBalance
+                ? '余额不足'
+                : rentMonths
+                  ? `预付开机（${prepaidNeed.toFixed(2)}）`
+                  : '开机'}
           </button>
         </div>
       </div>

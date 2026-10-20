@@ -11,6 +11,7 @@ import { isVideoFile } from './VideoViewer';
 import { isPdfFile } from './PdfViewer';
 import { isOfficeFile } from './OfficeViewer';
 import { isAudioFile } from './AudioViewer';
+import { isUnsupportedPreviewFile } from './UnsupportedViewer';
 
 // 重新导出组件和判断函数
 export { CadPreview } from './CadPreview';
@@ -19,7 +20,8 @@ export { VideoViewer } from './VideoViewer';
 export { PdfViewer } from './PdfViewer';
 export { OfficeViewer } from './OfficeViewer';
 export { AudioViewer } from './AudioViewer';
-export { isCadFile, isImageFile, isVideoFile, isPdfFile, isOfficeFile, isAudioFile };
+export { UnsupportedViewer } from './UnsupportedViewer';
+export { isCadFile, isImageFile, isVideoFile, isPdfFile, isOfficeFile, isAudioFile, isUnsupportedPreviewFile };
 
 // 通用文件类型判断（用于 FileTree 图标等场景）
 export function getFileKind(filePath: string): 'cad' | 'image' | 'video' | 'pdf' | 'office' | 'audio' | 'code' {

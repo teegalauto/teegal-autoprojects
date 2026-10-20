@@ -1,10 +1,10 @@
-import { app, BrowserWindow, ipcMain, Menu, desktopCapturer, screen, dialog, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, desktopCapturer, screen, dialog, safeStorage, powerSaveBlocker } from 'electron';
 import path from 'path';
 import { spawn, spawnSync, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { initAutoUpdater } from './autoUpdater';
 import { startAgentServer, readHeadlessAuth } from './agentServer';
-import { snapshotApp, snapshotFile, listChanges, getHeadFileContent, listCheckpoints, getFileAt, restoreTo } from './appCodeGit';
+import { snapshotApp, snapshotFile, listChanges, getHeadFileContent, listCheckpoints, getFileAt, restoreTo, syncExternalCommits } from './appCodeGit';
 
 /**
  * 🔥 Headless 分身模式（TEEGAL_HEADLESS=1 或 --headless）：
@@ -761,6 +761,24 @@ ipcMain.handle('get-backend-url', () => {
  */
 ipcMain.handle('get-app-version', () => {
   return app.getVersion();
+});
+
+/**
+ * 🔥 离线指挥电源保持：启用期间阻止系统睡眠（屏幕可自由关闭），停用释放。
+ * 进程退出时 blocker 随进程自动失效，无需退出钩子。
+ */
+let offlinePowerBlockerId: number | null = null;
+ipcMain.handle('offline-powersave', (_e, on: boolean) => {
+  if (on) {
+    if (offlinePowerBlockerId === null || !powerSaveBlocker.isStarted(offlinePowerBlockerId)) {
+      offlinePowerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+      console.log('🔌 [OFFLINE-POWER] 保持系统唤醒已开启（屏幕可关，系统不睡眠）');
+    }
+  } else if (offlinePowerBlockerId !== null && powerSaveBlocker.isStarted(offlinePowerBlockerId)) {
+    powerSaveBlocker.stop(offlinePowerBlockerId);
+    offlinePowerBlockerId = null;
+    console.log('🔌 [OFFLINE-POWER] 保持系统唤醒已释放');
+  }
 });
 
 /**
@@ -2053,7 +2071,8 @@ ipcMain.handle('local-file:read', async (_, { localPath }) => {
 ipcMain.handle('local-file:delete', async (_, { localPath }) => {
   try {
     if (fs.existsSync(localPath)) {
-      fs.unlinkSync(localPath);
+      // ⚠️ promises 版本：同步 unlinkSync 在 Electron 40 上对中文路径会原生崩溃
+      await fs.promises.unlink(localPath);
       console.log('✅ [LOCAL-FILE] 文件已删除:', localPath);
     }
     return { success: true };
@@ -2186,12 +2205,12 @@ ipcMain.handle('app-code:save', async (_, { appId, fileName, content, codePath }
       fs.mkdirSync(fileDir, { recursive: true });
     }
     
-    // 🔥 使用 Buffer 确保正确的 UTF-8 编码（带 BOM）
-    const BOM = '\ufeff';
-    const buffer = Buffer.from(BOM + content, 'utf-8');
-    fs.writeFileSync(filePath, buffer);
-    
-    console.log('✅ [APP-CODE] 代码文件已保存 (UTF-8 with BOM):', filePath);
+    // 🔥 标准 UTF-8（无 BOM）写入：Node writeFileSync utf8 本身就是标准 UTF-8，
+    // 中文不会乱码；历史版本曾在此写 BOM（防老工具乱码），导致 vite/tsc/git 等读 BOM 文件全炸
+    // （package.json 带 BOM → PostCSS JSON.parse 失败）。读端 app-code:read 保留剥 BOM 兼容旧文件。
+    fs.writeFileSync(filePath, content, 'utf-8');
+
+    console.log('✅ [APP-CODE] 代码文件已保存 (UTF-8):', filePath);
     return { success: true, localPath: filePath };
   } catch (error) {
     console.error('❌ [APP-CODE] 保存代码文件失败:', error);
@@ -2292,32 +2311,37 @@ ipcMain.handle('app-code:fork', async (_, { sourceAppId, targetAppId, codePath }
 
 /**
  * 🔥 删除目录（Windows 强化版）：
- * 1. git clone 的项目里 .git 对象文件全部带只读属性，rmSync 删只读文件报 EPERM
- *    → 先用 attrib -r 递归剥掉只读属性再删
+ * 1. git clone 的项目里 .git 对象文件全部带只读属性 → 先用 attrib -r 递归剥掉只读属性再删
  * 2. Defender/索引服务可能短暂锁住句柄 → 删失败时延迟重试
+ *
+ * ⚠️ 必须用异步 fs.promises.rm，不能用同步 fs.rmSync/rmdirSync：
+ * Electron 40 起同步删除改为 C++ 实现（libc++ std::filesystem），在 Windows 上
+ * 处理含非 ASCII 字符（如中文）的路径会原生崩溃整个主进程（无 JS 异常、
+ * crashpad "not connected"、退出码 4294930435）。已实测复现；
+ * 异步 fs.promises.rm 仍走旧 JS 实现，不受影响。
  */
-function removeDirRobust(targetPath: string): void {
+async function removeDirRobust(targetPath: string): Promise<void> {
   const isWindows = process.platform === 'win32';
-  const tryRemove = (): boolean => {
+  const tryRemove = async (): Promise<boolean> => {
     try {
       if (isWindows) {
         // /S /D 递归处理目录及文件（含目录本身），静默失败不阻塞
         spawnSync('attrib', ['-r', targetPath + '\\*.*', '/s', '/d'], { windowsHide: true });
       }
-      fs.rmSync(targetPath, { recursive: true, force: true });
+      await fs.promises.rm(targetPath, { recursive: true, force: true });
       return true;
     } catch {
       return false;
     }
   };
-  if (tryRemove()) return;
+  if (await tryRemove()) return;
   // 句柄被短暂占用（杀毒扫描/索引）：等 400ms 再试两次
   for (let i = 0; i < 2; i++) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); // 同步 sleep，不阻塞事件循环的替代方案有限，此处删除操作短暂可接受
-    if (tryRemove()) return;
+    await new Promise(resolve => setTimeout(resolve, 400));
+    if (await tryRemove()) return;
   }
   // 最后一次直接抛出让上层返回错误
-  fs.rmSync(targetPath, { recursive: true, force: true });
+  await fs.promises.rm(targetPath, { recursive: true, force: true });
 }
 
 /**
@@ -2334,9 +2358,10 @@ ipcMain.handle('app-code:delete', async (_, { appId, fileName, isDirectory, code
     }
 
     if (fs.statSync(filePath).isDirectory()) {
-      removeDirRobust(filePath);
+      await removeDirRobust(filePath);
     } else {
-      fs.unlinkSync(filePath);
+      // ⚠️ 用 promises 版本：同步 unlinkSync 在 Electron 40 上对中文路径会原生崩溃（见 removeDirRobust 注释）
+      await fs.promises.unlink(filePath);
     }
 
     console.log('✅ [APP-CODE] 已删除:', fileName);
@@ -2428,6 +2453,7 @@ ipcMain.handle('app-code:git-status', async (_, { appId, codePath }: { appId: st
     if (!fs.existsSync(appDir)) {
       return { success: true, changes: [] };
     }
+    await syncExternalCommits(appDir); // 外部 git 提交自动补账（无外部 git 时为空操作）
     const changes = await listChanges(appDir);
     return { success: true, changes };
   } catch (error) {
@@ -2772,9 +2798,10 @@ ipcMain.handle('read-directory-recursive', async (_, dirPath: string, options?: 
   // 🔥 扫描时过滤的目录名（不区分大小写）
   const IGNORED_DIRS = new Set([
     'node_modules', '__pycache__', '.venv', 'venv', 'env',
-    '.git', '.svn', '.hg', 'dist', 'build', '.next', '.nuxt',
+    '.git', '.svn', '.hg', 'dist', 'dist-server', 'dist-electron', 'build', 'out', 'release', '.next', '.nuxt',
     '.cache', '.pytest_cache', '.mypy_cache', '.ruff_cache',
     'logs', 'wandb', 'runs', 'checkpoints', '.ipynb_checkpoints',
+    'tmp', 'temp', 'data',
     'history',
   ]);
 
@@ -3612,7 +3639,8 @@ ipcMain.handle('userpc:file:delete', async (_, { filePath }: { filePath: string 
       return { success: false, error: '不能删除目录，只能删除文件' };
     }
 
-    fs.unlinkSync(resolvedPath);
+    // ⚠️ promises 版本：同步 unlinkSync 在 Electron 40 上对中文路径会原生崩溃
+    await fs.promises.unlink(resolvedPath);
     console.log('✅ [USERPC-FILE] 删除文件成功:', filePath);
 
     return {

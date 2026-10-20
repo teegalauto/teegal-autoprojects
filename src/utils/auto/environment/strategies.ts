@@ -22,7 +22,6 @@ export const DEFAULT_STRATEGY: InjectionStrategy = {
   includeUserInjectMessages: false,
   includeKnowledgeBase: true, // 🔥 默认启用知识库
   includeImportantObjects: true, // 🔥 默认启用重要对象引用
-  includeMemories: true, // 🔥 默认启用记忆
 };
 
 /**
@@ -40,7 +39,6 @@ export const SUMMARY_STRATEGIES: Record<string, InjectionStrategy> = {
     includeUserInjectMessages: true,
     includeKnowledgeBase: true,
     includeImportantObjects: true,
-    includeMemories: true,
   },
   /** Summary 调查轮（depth>=1） */
   summary_investigation: {
@@ -53,7 +51,6 @@ export const SUMMARY_STRATEGIES: Record<string, InjectionStrategy> = {
     includeUserInjectMessages: true,
     includeKnowledgeBase: false,
     includeImportantObjects: true,
-    includeMemories: true,
   },
 };
 
@@ -72,7 +69,6 @@ export const REACTOR_STRATEGIES: Record<string, InjectionStrategy> = {
     includeUserInjectMessages: true,
     includeKnowledgeBase: false,
     includeImportantObjects: false,
-    includeMemories: false,
   },
 };
 

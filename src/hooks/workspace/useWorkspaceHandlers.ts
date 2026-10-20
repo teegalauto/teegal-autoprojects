@@ -7,27 +7,12 @@ import { loadMessagesForConversation } from "./handlers/messageHandlers";
 import { generateTitle } from "./utils/titleUtils";
 
 import { SummaryHandler, SummaryInput, SummaryHandlerCallbacks } from "./handlers/SummaryHandler";
+import { splitRounds, renderRoundLines } from "@/utils/auto/context/RoundMemory";
 import { MessageFactory } from "./utils/messageFactory";
 import { MessagePersistence } from "./handlers/message/MessagePersistence";
 import { globalAbortManager } from "@/utils/abort/AbortManager";
 import { useAuth } from "@/context/AuthContext";
 import { useRef, useEffect } from "react";
-
-/**
- * 🔥 截断消息中 ```代码块``` 的内部内容，保留首尾各 maxCodeLen/2 字符。
- * 非代码文本不动；短代码块不截断。
- * 用于滑动窗口上下文压缩，避免单条消息里的长代码撑爆 token。
- */
-const truncateCodeBlocks = (text: string, maxCodeLen = 600): string => {
-  if (!text) return text;
-  return text.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
-    const trimmed = code.replace(/^\n+/, '').replace(/\n+$/, '');
-    if (trimmed.length <= maxCodeLen) return match;
-    const half = Math.floor(maxCodeLen / 2);
-    const omitted = trimmed.length - maxCodeLen;
-    return '```' + lang + '\n' + trimmed.slice(0, half) + '\n...[已截断 ' + omitted + ' 字符]...\n' + trimmed.slice(-half) + '```';
-  });
-};
 
 export const useWorkspaceHandlers = (workspace: any) => {
   const authContext = useAuth();
@@ -192,19 +177,20 @@ export const useWorkspaceHandlers = (workspace: any) => {
 
       const effectiveUserId = workspace.userId || `guest_${Math.random().toString(36).slice(2, 8)}`;
 
-      // 🔥 从凭据表读取 param 型参数（可配置，默认 15）
-      let maxMessages = 15;
+      // 🔥 从凭据表读取 param 型参数：对话历史窗口的回合数（一个回合 = 一条 userquery + 它引发的全部消息），
+      // 默认 5，按值执行（非上限）。实测 5 回合上下文前缀稳定，上游缓存命中可达 60%-80%；窗口越长前缀漂移越大命中越差
+      let contextHistoryRounds = 5;
       try {
         const electron = (window as any).electron;
         if (electron?.localStorage?.getCredentialByName) {
-          const param = await electron.localStorage.getCredentialByName('maxMessages', effectiveUserId);
+          const param = await electron.localStorage.getCredentialByName('contextHistoryRounds', effectiveUserId);
           if (param && param.type === 'param') {
             const parsed = parseInt(param.value, 10);
-            if (!isNaN(parsed) && parsed > 0) maxMessages = parsed;
+            if (!isNaN(parsed) && parsed > 0) contextHistoryRounds = parsed;
           }
         }
       } catch (error) {
-        console.warn('[AUTO-MODE] 读取 maxMessages 参数失败，使用默认值 15:', error);
+        console.warn('[AUTO-MODE] 读取 contextHistoryRounds 参数失败，使用默认值 5:', error);
       }
 
       // 🔥 提取特定 session 的上下文消息
@@ -275,112 +261,37 @@ export const useWorkspaceHandlers = (workspace: any) => {
           return timeA - timeB;
         });
 
-        // 🔥 转换为统一格式并去重
+        // 🔥 回合切分 + 窗口 + 渲染（与 call_memory 记忆回忆共用 RoundMemory 模块）：
+        // userquery（user 且无 sessionId 且无注入标记）为回合起点；保留最近 contextHistoryRounds 个回合（按值执行）。
+        // 三层降维（一层递减）：当前回合（最后一个）全量实时展示 → 相邻回合（倒数第二个）summarizer 全文 + 📋
+        // （防方案细节丢失，如待确认的 A/B/C 档定义只在 say_to_user 正文里）→ 更早回合 summarizer 截 20 字 + 📋；
+        // reactor 按 sessionId 折叠
+        const rounds = splitRounds(sortedMessages);
+        const windowedRounds = rounds.length > contextHistoryRounds ? rounds.slice(rounds.length - contextHistoryRounds) : rounds;
+        const flatLines = windowedRounds.flatMap((round, i) =>
+          renderRoundLines(round, {
+            currentRound: i === windowedRounds.length - 1,
+            fullSummarizer: i === windowedRounds.length - 2,
+            truncateCode: true,
+          })
+        );
+
+        // 🔥 全局时序排序 + 去重（键含 timestamp：截断后的骨架文本易碰撞）
+        flatLines.sort((a, b) => a.timestamp - b.timestamp);
         const seen = new Set<string>();
         const history: Array<{ role: string; content: string; sessionId?: string; apiRole?: string; timestamp?: number }> = [];
-
-        for (const msg of sortedMessages) {
-          const role = msg.role === "auto" ? "assistant" : "user";
-          const timestamp = typeof msg.timestamp === 'number' ? msg.timestamp : msg.timestamp?.getTime?.() || Date.now();
-
-          // 🔥 构建消息内容：合并 content 和 result
-          const contentStr = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
-          const resultStr = typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result || "");
-          
-          let fullContent = contentStr;
-          if (resultStr && resultStr !== 'null' && resultStr !== '""') {
-            if (contentStr && contentStr.trim()) {
-              fullContent = `${contentStr}\n\n[执行结果]: ${resultStr}`;
-            } else {
-              fullContent = resultStr;
-            }
-          }
-
-          // 🔥 截断代码块内部内容（保留首尾各 maxCodeLen/2 字符），避免长代码撑爆上下文窗口
-          fullContent = truncateCodeBlocks(fullContent);
-
-          // 创建唯一键进行去重
-          const key = `${role}:${fullContent.substring(0, 200)}`;
-          if (seen.has(key)) {
-            continue;
-          }
+        for (const line of flatLines) {
+          const key = `${line.role}:${line.timestamp}:${line.content.substring(0, 100)}`;
+          if (seen.has(key)) continue;
           seen.add(key);
-
-          history.push({
-            role,
-            content: fullContent,
-            timestamp,
-            sessionId: msg.sessionId,
-            apiRole: msg.apiRole,
-          });
+          history.push(line);
         }
 
-        // 🔥 先折叠 session 消息，再应用滑动窗口
-        // 这样 Reactor 的 20 条消息算 1 条，不会被窗口截断
-        const sessionGroups = new Map<string, typeof history>();
-        const nonSessionMessages: typeof history = [];
+        // 🔥 监控：回合窗口当前值 + 历史体积（每轮 summarizer 刷新一次）
+        const historyChars = history.reduce((s, l) => s + l.content.length, 0);
+        console.log(`[HISTORY] contextHistoryRounds=${contextHistoryRounds} 总回合=${rounds.length} 保留=${windowedRounds.length} 历史条数=${history.length} 体积=${(historyChars / 1024).toFixed(1)}KB (~${Math.round(historyChars / 3)} tokens)`);
 
-        for (const msg of history) {
-          if (msg.sessionId) {
-            if (!sessionGroups.has(msg.sessionId)) {
-              sessionGroups.set(msg.sessionId, []);
-            }
-            sessionGroups.get(msg.sessionId)!.push(msg);
-          } else {
-            nonSessionMessages.push(msg);
-          }
-        }
-
-        // 🔥 折叠 session 消息
-        const foldedHistory: typeof history = [...nonSessionMessages];
-
-        for (const [sessionId, messages] of sessionGroups) {
-          if (messages.length === 0) continue;
-
-          const firstMsg = messages[0];
-          const lastMsg = messages[messages.length - 1];
-
-          // 计算持续时间
-          let durationText = '';
-          if (firstMsg.timestamp && lastMsg.timestamp) {
-            const durationMs = lastMsg.timestamp - firstMsg.timestamp;
-            const seconds = Math.floor(durationMs / 1000);
-            const minutes = Math.floor(seconds / 60);
-            if (minutes > 0) {
-              durationText = `${minutes}m ${seconds % 60}s`;
-            } else {
-              durationText = `${seconds}s`;
-            }
-          }
-
-          // 获取最后一条消息的内容摘要
-          const lastContent = lastMsg.content || '';
-          const summary = lastContent.slice(0, 50) + (lastContent.length > 50 ? '...' : '');
-
-          // 构建折叠后的消息
-          foldedHistory.push({
-            role: 'assistant', // session 消息统一显示为 assistant
-            content: `[Reactor · ${messages.length}条 · ${durationText}] ${summary}`,
-            sessionId: sessionId,
-            apiRole: 'reactor',
-            timestamp: lastMsg.timestamp,
-          });
-        }
-
-        // 按时间排序
-        foldedHistory.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-
-        // 🔥 滑动窗口：折叠后再截断，每个 Reactor session 算 1 条
-        // maxMessages 从外部 param 读取（默认 15）
-        const windowedHistory = foldedHistory.slice(-maxMessages);
-
-        return windowedHistory.map(msg => ({
-          role: msg.role,
-          content: msg.content,
-          sessionId: msg.sessionId,
-          apiRole: msg.apiRole,
-          timestamp: msg.timestamp,
-        }));
+        return history;
       };
 
       const conversationHistory = await extractConversationHistory();
@@ -415,13 +326,16 @@ export const useWorkspaceHandlers = (workspace: any) => {
 
   const handleSendMessage = async (
     content: string,
-    files: FileAttachment[] = []
+    files: FileAttachment[] = [],
+    opts?: { source?: string } // 🔥 来源标签（离线指挥桥传 'email'，ChatUI 缺省不传）
   ) => {
+    const userSource = opts?.source;
     const summaryHandler = workspace.summaryHandler;
-    
-    if (summaryHandler?.hasPendingInteraction?.()) {      
+
+    if (summaryHandler?.hasPendingInteraction?.()) {
       const sessionId = summaryHandler.getPendingInteractionSessionId?.();
       const userMessage = MessageFactory.createUserMessage(content, files);
+      if (userSource) userMessage.source = userSource;
       
       if (sessionId) {
         (userMessage as any).sessionId = sessionId;
@@ -474,6 +388,7 @@ export const useWorkspaceHandlers = (workspace: any) => {
           isInjectMessage: true,
           isPending: true,
         });
+        if (userSource) userInjectMessage.source = userSource;
         workspace.setMessages((prev: any[]) => [...prev, userInjectMessage]);
 
         MessagePersistence.saveMessageAsync(conversationId, userInjectMessage);
@@ -527,6 +442,7 @@ export const useWorkspaceHandlers = (workspace: any) => {
       }
 
       const userMessage = MessageFactory.createUserMessage(finalContent, validFileAttachments);
+      if (userSource) userMessage.source = userSource;
       workspace.setMessages((prev: any[]) => [...prev, userMessage]);
 
       if (workspace.userId && conversationId) {

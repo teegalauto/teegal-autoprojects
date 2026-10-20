@@ -11,6 +11,16 @@ try {
       localStorage.setItem('cloud_access_token', _auth.accessToken);
       if (_auth.refreshToken) localStorage.setItem('cloud_refresh_token', _auth.refreshToken);
       if (_auth.user) localStorage.setItem('teegal-user', JSON.stringify(_auth.user));
+      // 🔥 离线指挥开机自启：auth 注入时携带 offline 配置则一并写入 localStorage
+      // （userId 绑注入身份，AuthenticatedWorkspace 启动即拉起监听，首次 poll 云端自动发握手信）
+      if (_auth.offline?.addr && _auth.offline?.token) {
+        localStorage.setItem('offline_command_config', JSON.stringify({
+          enabled: true,
+          addr: _auth.offline.addr,
+          token: _auth.offline.token,
+          userId: String(_auth.userId || _auth.user?.id || ''),
+        }));
+      }
       console.log('🧬 [PRELOAD] 已注入部署人凭据（headless-auth.json → localStorage）');
     }
   }
@@ -68,6 +78,11 @@ contextBridge.exposeInMainWorld('electron', {
    * 🔥 获取用户数据目录路径
    */
   getUserDataPath: () => ipcRenderer.invoke('get-user-data-path'),
+
+  /**
+   * 🔥 离线指挥电源保持（阻止系统睡眠，屏幕可关）
+   */
+  setOfflinePowerSave: (on: boolean) => ipcRenderer.invoke('offline-powersave', on),
 
   /**
    * 🔥 自动更新 API

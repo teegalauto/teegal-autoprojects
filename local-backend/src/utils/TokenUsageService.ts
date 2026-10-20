@@ -40,6 +40,22 @@ export interface TokenUsageStats {
   dailyUsages: Record<string, DailyTokenUsage>;
 }
 
+/** 🔥 任务级聚合（按 sessionId） */
+export interface SessionAggregate {
+  sessionId: string;
+  firstTimestamp: string;
+  lastTimestamp: string;
+  reactRounds: number;       // ReAct 轮数（react 记录的最大 depth）
+  reactCalls: number;        // reactor 调用次数（含重试轮）
+  summaryCalls: number;      // summarizer 调用次数
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;      // 缓存命中率 0~1
+  duration: number;          // LLM 调用累计耗时 ms
+}
+
 /**
  * 获取数据文件路径
  * 🔥 使用 USER_DATA_DIR 环境变量（Electron 用户数据目录）
@@ -245,6 +261,96 @@ export class TokenUsageService {
       totalDuration,
       totalCalls
     };
+  }
+
+  /**
+   * 🔥 按 sessionId 聚合任务级统计（每任务轮次/token/缓存命中率）
+   * @param days 只统计最近 N 天（含今天）
+   */
+  getSessionAggregates(days: number = 7): SessionAggregate[] {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - (days - 1));
+    const cutoffStr = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`;
+
+    interface Acc {
+      sessionId: string;
+      firstTimestamp: string;
+      lastTimestamp: string;
+      reactRounds: number;
+      reactCalls: number;
+      summaryCalls: number;
+      promptTokens: number;
+      completionTokens: number;
+      reasoningTokens: number;
+      totalTokens: number;
+      cacheHitTokens: number;
+      cacheMissTokens: number;
+      duration: number;
+    }
+
+    const accMap = new Map<string, Acc>();
+
+    for (const date of Object.keys(this.stats.dailyUsages)) {
+      if (date < cutoffStr) continue;
+      for (const record of this.stats.dailyUsages[date].records) {
+        if (!record.sessionId) continue;
+
+        let acc = accMap.get(record.sessionId);
+        if (!acc) {
+          acc = {
+            sessionId: record.sessionId,
+            firstTimestamp: record.timestamp,
+            lastTimestamp: record.timestamp,
+            reactRounds: 0,
+            reactCalls: 0,
+            summaryCalls: 0,
+            promptTokens: 0,
+            completionTokens: 0,
+            reasoningTokens: 0,
+            totalTokens: 0,
+            cacheHitTokens: 0,
+            cacheMissTokens: 0,
+            duration: 0,
+          };
+          accMap.set(record.sessionId, acc);
+        }
+
+        if (record.timestamp > acc.lastTimestamp) acc.lastTimestamp = record.timestamp;
+        if (record.timestamp < acc.firstTimestamp) acc.firstTimestamp = record.timestamp;
+        if (record.source === 'react') {
+          acc.reactCalls++;
+          acc.reactRounds = Math.max(acc.reactRounds, record.depth || 0);
+        } else if (record.source === 'summary') {
+          acc.summaryCalls++;
+        }
+        acc.promptTokens += record.promptTokens || 0;
+        acc.completionTokens += record.completionTokens || 0;
+        acc.reasoningTokens += record.reasoningTokens || 0;
+        acc.totalTokens += record.totalTokens || 0;
+        acc.cacheHitTokens += record.cacheHitTokens || 0;
+        acc.cacheMissTokens += record.cacheMissTokens || 0;
+        acc.duration += record.duration || 0;
+      }
+    }
+
+    return Array.from(accMap.values())
+      .map((a) => ({
+        sessionId: a.sessionId,
+        firstTimestamp: a.firstTimestamp,
+        lastTimestamp: a.lastTimestamp,
+        reactRounds: a.reactRounds,
+        reactCalls: a.reactCalls,
+        summaryCalls: a.summaryCalls,
+        promptTokens: a.promptTokens,
+        completionTokens: a.completionTokens,
+        reasoningTokens: a.reasoningTokens,
+        totalTokens: a.totalTokens,
+        cacheHitRate: (a.cacheHitTokens + a.cacheMissTokens) > 0
+          ? a.cacheHitTokens / (a.cacheHitTokens + a.cacheMissTokens)
+          : 0,
+        duration: a.duration,
+      }))
+      .sort((a, b) => (a.lastTimestamp < b.lastTimestamp ? 1 : -1));
   }
 
   /**

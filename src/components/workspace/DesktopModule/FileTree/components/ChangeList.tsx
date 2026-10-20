@@ -13,43 +13,7 @@ import { FileText, Loader2, History, RotateCcw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '@/hooks/use-toast';
 import { FileHistory } from '../types';
-import { getHistoryContent, getCurrentFileContent, commitFiles, saveFile, deleteFile, listCheckpointTimeline, restoreToCheckpoint } from '../utils';
-
-/**
- * LCS diff 统计
- */
-function computeDiffStats(oldCode: string, newCode: string): { added: number; deleted: number } {
-  // 🔥 标准化行尾符：CRLF→LF，去除行尾空白，避免行尾差异导致整文件重写
-  const normalizeLine = (line: string) => line.replace(/\r$/, '').trimEnd();
-  const oldLines = oldCode.split('\n').map(normalizeLine);
-  const newLines = newCode.split('\n').map(normalizeLine);
-  const m = oldLines.length;
-  const n = newLines.length;
-
-  const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (oldLines[i - 1] === newLines[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
-    }
-  }
-
-  let added = 0, deleted = 0;
-  let i = m, j = n;
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
-      i--; j--;
-    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-      added++; j--;
-    } else {
-      deleted++; i--;
-    }
-  }
-  return { added, deleted };
-}
+import { getHistoryContent, getCurrentFileContent, commitFiles, saveFile, deleteFile, listCheckpointTimeline, restoreToCheckpoint, computeDiffStats } from '../utils';
 
 // ─── ChangeList 组件 ───
 
@@ -79,9 +43,17 @@ export function ChangeList({ appId, changes, onRefresh, onViewDiff, selectedFile
   diffStatsRef.current = diffStats;
   // 🔥 递增计数器，用于在文件内容变更时强制触发重算
   const [revision, setRevision] = useState(0);
+  // 🔥 防重跑：changes 数组每次 loadFileTree 都是新身份（内容常相同），
+  // 按内容签名去重，避免 identity 变化取消在途计算导致全部文件重读重算
+  const changesKeyRef = React.useRef('');
+  const runIdRef = React.useRef(0);
 
   // 增量计算 diff 统计：新出现的文件 + dirty 文件
   useEffect(() => {
+    const key = `${changes.map(fh => fh.fileName).sort().join('|')}#${revision}`;
+    if (key === changesKeyRef.current) return;
+    changesKeyRef.current = key;
+
     if (changes.length === 0) {
       setDiffStats({});
       dirtyRef.current.clear();
@@ -106,34 +78,33 @@ export function ChangeList({ appId, changes, onRefresh, onViewDiff, selectedFile
     const toCompute = [...dirtyRef.current];
     if (toCompute.length === 0) return;
 
-    let cancelled = false;
+    const myRun = ++runIdRef.current;
     (async () => {
       const newStats: Record<string, { added: number; deleted: number }> = {};
       for (const fileName of toCompute) {
-        if (cancelled) return;
+        if (runIdRef.current !== myRun) return; // 被更新的运行取代（非取消丢弃：文件留在 dirty，新运行会重算）
         try {
           const oldCode = await getHistoryContent(appId, fileName);
           const newCode = await getCurrentFileContent(appId, fileName);
-          newStats[fileName] = computeDiffStats(oldCode ?? '', newCode ?? '');
+          // 🔥 computeDiffStats 永远有值（超护栏自动降级多重集统计），徽标不再留空
+          const stats = computeDiffStats(oldCode ?? '', newCode ?? '');
+          if (stats) newStats[fileName] = stats;
         } catch {
-          newStats[fileName] = { added: 0, deleted: 0 };
+          // 读取失败不计入，下次内容变更再试
         }
       }
-      if (!cancelled) {
-        // 🔥 算完的文件从 dirty 中移除
-        dirtyRef.current = new Set([...dirtyRef.current].filter(f => !(f in newStats)));
-        setDiffStats(prev => {
-          const next = { ...prev };
-          // 🔥 移除已不存在的文件
-          for (const name of Object.keys(next)) {
-            if (!currentNames.has(name)) delete next[name];
-          }
-          return { ...next, ...newStats };
-        });
-      }
+      if (runIdRef.current !== myRun) return;
+      // 🔥 算完的文件从 dirty 中移除
+      dirtyRef.current = new Set([...dirtyRef.current].filter(f => !(f in newStats)));
+      setDiffStats(prev => {
+        const next = { ...prev };
+        // 🔥 移除已不存在的文件
+        for (const name of Object.keys(next)) {
+          if (!currentNames.has(name)) delete next[name];
+        }
+        return { ...next, ...newStats };
+      });
     })();
-
-    return () => { cancelled = true; };
   }, [changes, appId, revision]);
 
   // 🔥 checkpoint 时间线（git log，新→旧）；changes 变化（含接受/回滚后刷新）时重载

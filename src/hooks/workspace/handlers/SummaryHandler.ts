@@ -320,30 +320,22 @@ export class SummaryHandler {
     };
   }
 
-  private parseSayToUser(sayToUser: string): { isInteraction: boolean; message: string; memory?: string } {
+  private parseSayToUser(sayToUser: string): { isInteraction: boolean; message: string } {
     if (!sayToUser) {
       return { isInteraction: false, message: '' };
     }
 
     const trimmed = sayToUser.trim();
-    
-    // 🔥 解析 memory++
-    const memoryMatch = trimmed.match(/memory\+\+\s*(.+?)(?=memory\+\+|$)/);
-    const memory = memoryMatch ? memoryMatch[1].trim() : undefined;
-    
-    // 移除所有 memory++ 部分
-    let cleanedMessage = trimmed.replace(/memory\+\+\s*.+?(?=memory\+\+|$)/g, '').trim();
-    
-    // 解析 interaction++（可以在消息开头或结尾）
-    if (cleanedMessage.startsWith('interaction++') || cleanedMessage.endsWith('interaction++')) {
+
+    // 🔥 解析 interaction++（可以在消息开头或结尾）
+    if (trimmed.startsWith('interaction++') || trimmed.endsWith('interaction++')) {
       return {
         isInteraction: true,
-        message: cleanedMessage.replace(/^interaction\+\+\s*|\s*interaction\+\+$/g, '').trim(),
-        memory,
+        message: trimmed.replace(/^interaction\+\+\s*|\s*interaction\+\+$/g, '').trim(),
       };
     }
 
-    return { isInteraction: false, message: cleanedMessage, memory };
+    return { isInteraction: false, message: trimmed };
   }
 
   getPendingInteractionSessionId(): string | undefined {
@@ -1101,7 +1093,9 @@ export class SummaryHandler {
         apiRole: 'summarizer',
         content: '',
         result: parsedResult.message,
-        memory: parsedResult.memory,
+        // 🔥 本轮 writeNotes 落 Message 表 memory 字段（reactor 每轮笔记不落库，只有 summary 的有总结性）；
+        //    最后一条 summary 消息的 memory = 最终交差笔记，配合 userQuery 即强上下文
+        memory: summaryResult.writeNotes,
         status: 'completed',
         iconText: i18n.t('workspace.chatMessages.analysisComplete'),
       });

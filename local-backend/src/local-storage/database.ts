@@ -437,6 +437,20 @@ export class LocalDatabase {
       );
     `);
 
+    // 🔥 项目记忆表（任务完成时的 ReAct 过程笔记，按项目归属存档；接手项目先读档案快速建立熟悉度）
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS project_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        user_query TEXT NOT NULL DEFAULT '',
+        write_note TEXT NOT NULL DEFAULT '',
+        conversation_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project ON project_memory(project_id, created_at);
+    `);
+
     // 🔥 创建 dse_files 表（数据环境文件记录）
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS dse_files (

@@ -9,24 +9,20 @@ import { executeRunGpuTrainTool } from '@/utils/apptool/RunGpuTrainTool';
 import { executeCheckCreditsTool } from '@/utils/apptool/CheckCreditsTool';
 import { executeTeeGalUseGuideTool } from '@/utils/apptool/TeeGalUseGuideTool';
 import { executeSshInstanceTool } from '@/utils/systemtools/sshInstance';
+import { executeSshRemoteTool } from '@/utils/systemtools/sshRemote';
 import {
   executeListProjectFilesTool,
   executeReadProjectFileTool,
   executeSaveProjectFileTool,
   executeEditProjectFileTool,
   executeDeleteProjectFileTool,
-  executeListTrainTasksTool,
-  executeGetTrainTaskDetailTool,
   executeStopGpuTrainTool,
   executeUpsertProjectTool,
   executeUpdateTrainTaskRemarkTool,
 } from '@/utils/apptool/TrainProjectFileTools';
 import { listGpuTypes } from '@/utils/apptool/ListGpuTypesTool';
-import {
-  executeRunDevTool,
-  executeListExecutionLogsTool,
-  executeGetLogDetailTool,
-} from '@/utils/apptool/LocalExecutionTools';
+import { executeRunDevTool } from '@/utils/apptool/LocalExecutionTools';
+import { executeListTasksTool, executeGetTaskDetailTool } from '@/utils/apptool/TaskHistoryTools';
 import { executeListCloudFilesTool } from '@/utils/apptool/DSETools';
 import { executeUploadFileToOsSTool } from '@/utils/apptool/UploadFileToOsSTool';
 import { executeCallMemoryTool } from '@/utils/auto/context/CallMemoryTool';
@@ -205,12 +201,12 @@ export class ToolHandler {
       return executeDeleteProjectFileTool(step, sessionId, { userId: this.userId });
     });
     
-    // 🔥 新增：训练任务历史工具
-    this.registerTool("list_train_tasks", async (step: AutoStep, sessionId: string) => {
-      return executeListTrainTasksTool(step, sessionId, { userId: this.userId });
+    // 🔥 任务历史工具（合并版：云端训练 train + 本地执行 localrun 双源，见 TaskHistoryTools）
+    this.registerTool("list_tasks", async (step: AutoStep, sessionId: string) => {
+      return executeListTasksTool(step, sessionId, { userId: this.userId });
     });
-    this.registerTool("get_train_task_detail", async (step: AutoStep, sessionId: string) => {
-      return executeGetTrainTaskDetailTool(step, sessionId, { userId: this.userId });
+    this.registerTool("get_task_detail", async (step: AutoStep, sessionId: string) => {
+      return executeGetTaskDetailTool(step, sessionId, { userId: this.userId });
     });
     this.registerTool("stop_gpu_train", async (step: AutoStep, sessionId: string) => {
       return executeStopGpuTrainTool(step, sessionId, { userId: this.userId });
@@ -233,12 +229,6 @@ export class ToolHandler {
     this.registerTool("run_project_onlocal", async (step: AutoStep, sessionId: string) => {
       return executeRunDevTool(step, sessionId, { userId: this.userId });
     });
-    this.registerTool("list_localrun_logs", async (step: AutoStep, sessionId: string) => {
-      return executeListExecutionLogsTool(step, sessionId, { userId: this.userId });
-    });
-    this.registerTool("get_localrun_logdetail", async (step: AutoStep, sessionId: string) => {
-      return executeGetLogDetailTool(step, sessionId, { userId: this.userId });
-    });
 
     // 🔥 数据环境工具
     this.registerTool("list_cloud_files", async (step: AutoStep, sessionId: string) => {
@@ -260,7 +250,10 @@ export class ToolHandler {
 
     // 🔥 SSH 实例租赁：开机云端 CPU 实例（公钥免密注入）→ userpc_shell ssh 操作 → close 关机结算
     this.registerTool("ssh_instance", (step, sessionId, onProgress) => executeSshInstanceTool(step, sessionId, onProgress, { userId: this.userId }));
-    this.registerTool("userpc_run_python", (step, sessionId, onProgress) => executeRunPythonTool(step, sessionId, onProgress));
+    // 🔥 实例直连执行/写文件（Node spawn ssh argv 数组，免本地 shell 转义；userpc_shell+ssh 转义失败时的补充）
+    this.registerTool("ssh_remote", (step, sessionId, onProgress) => executeSshRemoteTool(step, sessionId, onProgress, { userId: this.userId }));
+    // 🔥 传入 userId，支持 credentialName 参数注入环境变量（与 userpc_shell 同通道）
+    this.registerTool("userpc_run_python", (step, sessionId, onProgress) => executeRunPythonTool(step, sessionId, onProgress, { userId: this.userId }));
     this.registerTool("get_account_info", (step, sessionId) => executeGetAccountInfoTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId }));
     // 🔥 云端运行项目（GPU 训练 + CPU 普通计算，instanceType 显式区分）
     this.registerTool("run_project_oncloud", (step, _sessionId) => executeRunGpuTrainTool(step, this.sessionId || '', { userId: this.userId, conversationId: this.conversationId, sessionId: this.sessionId }));

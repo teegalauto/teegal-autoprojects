@@ -70,9 +70,7 @@ export interface EnvironmentContext {
       name: string;
       type: string;
     }>;
-  }>;
-  /** 记忆列表（来自 memory++） */
-  memories?: string[];
+  }>
 }
 
 /**
@@ -97,8 +95,6 @@ export interface InjectionStrategy {
   includeKnowledgeBase: boolean;
   /** 🔥 是否注入重要对象引用（appId, fileId 等） */
   includeImportantObjects: boolean;
-  /** 🔥 是否注入记忆（memory++） */
-  includeMemories: boolean;
 }
 
 /**

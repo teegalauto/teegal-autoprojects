@@ -21,7 +21,7 @@ interface ListCredentialsContext {
 
 // 🔥 数值参数的范围约束（与凭据管理 UI 的 PARAM_RANGES 保持一致）
 const PARAM_RANGES: Record<string, { min: number; max: number }> = {
-  maxMessages: { min: 5, max: 30 },
+  contextHistoryRounds: { min: 5, max: 30 },
   clearWindow: { min: 3, max: 15 },
   maxHistoryChars: { min: 20000, max: 200000 },
 };

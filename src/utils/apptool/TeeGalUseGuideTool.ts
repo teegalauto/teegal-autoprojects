@@ -81,8 +81,14 @@ async function getProjectRoot(): Promise<string | null> {
       return null;
     }
 
+    // 🔥 Windows → PowerShell 扫描；macOS/Linux → find（bash 通道），验证 src/utils 存在防误中同名目录
+    const isWin = (window as any).electron?.platform === 'win32';
+    const command = isWin
+      ? `Get-ChildItem -Path $env:USERPROFILE -Directory -Recurse -Depth 3 -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(teegal|bbone-tagalong)$' -and (Test-Path "$($_.FullName)\\src\\utils") } | Select-Object -First 1 -ExpandProperty FullName`
+      : `find ~ -maxdepth 4 -type d \\( -name teegal -o -name bbone-tagalong \\) 2>/dev/null | while read d; do [ -d "$d/src/utils" ] && echo "$d" && break; done`;
+
     const result = await (window as any).electron.systemCommand({
-      command: `Get-ChildItem -Path $env:USERPROFILE -Directory -Recurse -Depth 3 -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(teegal|bbone-tagalong)$' -and (Test-Path "$($_.FullName)\\src\\utils") } | Select-Object -First 1 -ExpandProperty FullName`,
+      command,
       timeout: 20,
     });
 

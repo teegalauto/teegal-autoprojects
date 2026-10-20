@@ -345,10 +345,13 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
           scrollbarColor: '#d1d5db transparent',
         }}
       >
-        {/* 🔥 始终使用 justify-start（从顶部排列），避免跷跷板效应 */}
-        <div 
+        {/* 🔥 始终使用 justify-start（从顶部排列），避免跷跷板效应
+            ⚠️ 禁止加 min-h-full：它会让 content.scrollHeight 恒 ≥ 容器高，
+            checkContentHeight 永远判定"已填满"，初始不满屏自动补载机制失效
+            （两行内容+大片空白+滚动条拖不动的根因） */}
+        <div
           ref={contentRef}
-          className="p-4 space-y-1 min-h-full flex flex-col justify-start"
+          className="p-4 space-y-1 flex flex-col justify-start"
         >
           {messages.length === 0 ? (
             <div className="flex items-center justify-center" style={{ height: 'calc(100vh - 200px)' }}>

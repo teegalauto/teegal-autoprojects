@@ -3,7 +3,7 @@ import { Message, FileAttachment } from "../types/ChatTypes";
 import FileGrid from "../common/FileGrid";
 import LinkText from '../common/LinkText';
 import { performance } from "@/utils/logger";
-import { Copy, Check } from "lucide-react";
+import { Copy, Check, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 interface UserMessageBubbleProps {
@@ -11,6 +11,11 @@ interface UserMessageBubbleProps {
   onFileView?: (file: FileAttachment) => void;
   onFileDownload?: (file: FileAttachment) => void;
 }
+
+// 🔥 来源标签 → 时间戳旁的来源图标（未列出的来源不显示；未来 IM 渠道在此加图标）
+const SOURCE_META: Record<string, { Icon: React.FC<{ className?: string }>; label: string }> = {
+  email: { Icon: Mail, label: "来自离线邮件指挥" },
+};
 
 // 格式化时间戳 - 显示更友好的时间格式
 const formatTimestamp = (timestamp: Date): string => {
@@ -131,7 +136,7 @@ const UserMessageBubble: React.FC<UserMessageBubbleProps> = React.memo(({ messag
           )}
         </div>
         
-        {/* 时间戳和复制按钮 */}
+        {/* 时间戳、复制按钮、来源图标 */}
         <div className="flex items-center justify-end gap-2 mt-1 px-1">
           <span className="text-xs text-gray-400">
             {message.timestamp ? formatTimestamp(message.timestamp) : ''}
@@ -147,6 +152,16 @@ const UserMessageBubble: React.FC<UserMessageBubbleProps> = React.memo(({ messag
               <Copy className="h-3 w-3" />
             )}
           </button>
+          {(() => {
+            const meta = message.source ? SOURCE_META[message.source] : undefined;
+            if (!meta) return null;
+            // title 挂在外层 span（HTML 原生 tooltip，不依赖 SVG 属性）
+            return (
+              <span title={meta.label} className="inline-flex text-emerald-500">
+                <meta.Icon className="h-3.5 w-3.5" />
+              </span>
+            );
+          })()}
         </div>
       </div>
     </div>

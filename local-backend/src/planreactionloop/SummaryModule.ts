@@ -8,11 +8,16 @@
 
 import { llmService, LLMConfig, LLMMessage, ContentPart } from '../utils/LLMService';
 import { SummaryProtocols } from './protocols';
-import { safeJSONParse, unescapeJSONString } from './utils/JSONParser';
+import { safeJSONParse, unescapeJSONString, findBalancedEnd, extractJSONObjects, normalizeToolAliases, salvageToolsFromText } from './utils/JSONParser';
 import { tokenUsageService } from '../utils/TokenUsageService';
 // 🔥 视觉模型注册表：前后端唯一维护点在 shared/visionModels.ts
 // （旧 MULTIMODAL_MODEL_PREFIXES/EXACT 与前端两套表已合并，消除双维护）
 import { detectVisionByModelId as isMultimodalModel, isVideoCapableModel } from '../shared/visionModels';
+
+// 🔥 session 动作白名单（与 SummaryProtocols tools 语法一致）：意图闸门的边界条件——
+// 原文含白名单名但结构化解析失败才抢救；连名都没有 = LLM 本来就没派活，该丢就丢
+const SESSION_ACTION_NAMES = ['sessioncreate', 'getContext', 'killsession', 'check_update'];
+const SESSION_ACTION_RE = new RegExp(SESSION_ACTION_NAMES.join('|'));
 
 /**
  * 🔥 从 userQuery 部分提取用户主动上传的图片 URL，构建多模态消息
@@ -396,9 +401,13 @@ export class SummaryModule {
       // 明确告知"直接回答"，否则任务规划者人设会让模型照样 sessioncreate 派活去"分析"视频
       // （实测：视频 token 已进上下文，但模型仍按规划者惯性派活，2026-08 方舟对照实验证实）
       const hasMediaAttached = Array.isArray(multimodalContent) && multimodalContent.some(p => p.type === 'image_url' || p.type === 'video_url');
-      const finalSystemPrompt = hasMediaAttached
+      // 🔥 当前时间注入（精确到分，东八区）：放 systemPrompt 尾部——固定前缀照常缓存命中，动态只占末尾几个 token；
+      // 让模型有时效感（写搜索词用真实日期、判断内容新旧），不再凭训练记忆猜年份
+      const nowCn = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 16).replace('T', ' ');
+      const timeSuffix = `\n\n[当前时间] ${nowCn}（东八区）`;
+      const finalSystemPrompt = (hasMediaAttached
         ? `${systemPrompt}\n\n【重要】用户上传的图片/视频内容已直接附带在用户消息中，你可以直接看到它们的全部内容。当用户询问这些媒体的内容时，必须直接在 say_to_user 中给出完整回答，禁止创建 session 或调用任何工具去分析这些已附带的媒体。`
-        : systemPrompt;
+        : systemPrompt) + timeSuffix;
 
       // 🔥 调试日志已移除（Reactor 侧已有详细日志）
 
@@ -483,29 +492,28 @@ export class SummaryModule {
           extractedSayToUser = unescapeJSONString(sayToUserMatch[1]);
         }
 
-        // 🔥 提取 tools（正则匹配数组内容）
-        const toolsMatch = content.match(/"tools"\s*:\s*\[([\s\S]*?)\]\s*[,}]/);
-        if (toolsMatch && toolsMatch[1]) {
-          try {
-            // 尝试解析数组
-            const arrayStr = `[${toolsMatch[1]}]`;
-            const parsedTools = safeJSONParse(arrayStr);
-            if (Array.isArray(parsedTools)) {
-              extractedTools = parsedTools
-                .filter((item: any) => item && typeof item.name === 'string')
-                .map((item: any) => ({
-                  name: item.name,
-                  parameters: item.parameters || {},
-                }));
-            }
-          } catch {
-            // 如果数组解析失败，逐个提取 tool 对象
-            const objMatches = toolsMatch[1].match(/\{[^}]*"name"\s*:\s*"[^"]*"[^}]*\}/g);
-            if (objMatches) {
-              extractedTools = objMatches.map((s: string) => {
-                try { return JSON.parse(s); } catch { return null; }
-              }).filter(Boolean) as SummaryTool[];
-            }
+        // 🔥 提取 tools：定位 "tools" 后的数组起点，字符串感知平衡扫描取整个数组
+        // （旧 lazy 正则遇 task 值含 "],` 会把数组切半；旧逐对象正则 [^}]* 遇嵌套
+        //   parameters 也截断。平衡扫描 + safeJSONParse 全修复管线双保险）
+        const toolsKeyIdx = content.indexOf('"tools"');
+        if (toolsKeyIdx >= 0) {
+          const arrStart = content.indexOf('[', toolsKeyIdx);
+          const arrEnd = arrStart >= 0 ? findBalancedEnd(content, arrStart) : -1;
+          const sliceStart = arrStart >= 0 ? arrStart : toolsKeyIdx;
+          const sliceEnd = arrEnd >= 0 ? arrEnd + 1 : content.length;
+          const parsedTools = safeJSONParse(content.slice(sliceStart, sliceEnd));
+          if (Array.isArray(parsedTools)) {
+            // 🔥 key 漂移归一（params/arguments→parameters、tool→name），防静默空任务
+            extractedTools = parsedTools
+              .map(normalizeToolAliases)
+              .filter((t): t is SummaryTool => t !== null);
+          }
+          // 数组整体解析失败：平衡提取各对象逐个抢救（宁可缺失不可错误）
+          if (!extractedTools?.length) {
+            const objs = extractJSONObjects(content.slice(sliceStart, sliceEnd));
+            extractedTools = objs
+              .map(normalizeToolAliases)
+              .filter((t): t is SummaryTool => t !== null);
           }
         }
 
@@ -543,7 +551,15 @@ export class SummaryModule {
       }
 
       // 🔥 兼容旧格式：如果 LLM 仍返回 sessionActions 字符串数组，转换为 tools
-      let tools = parsed.tools as SummaryTool[] | undefined;
+      let tools: SummaryTool[] | undefined;
+      const rawTools = parsed?.tools;
+      if (Array.isArray(rawTools)) {
+        // 🔥 主路径（JSON 解析成功）同样过 key 漂移归一：{name, params:{task}}
+        // 不归一会变成 parameters:{} → sessioncreate 空任务启动会话（比丢失更糟）
+        tools = rawTools
+          .map(normalizeToolAliases)
+          .filter((t): t is SummaryTool => t !== null);
+      }
       if (!tools && parsed.sessionActions) {
         const rawActions = Array.isArray(parsed.sessionActions) ? parsed.sessionActions
           : typeof parsed.sessionActions === 'string' ? [parsed.sessionActions]
@@ -565,6 +581,21 @@ export class SummaryModule {
         }).filter(Boolean) as SummaryTool[];
         if (tools.length) {
           console.log('🔄 [SummaryModule] 旧格式 sessionActions 已转换为 tools:', tools);
+        }
+      }
+
+      // 🔥 意图闸门：原文含 session 动作名但 tools 没解析出来 = 回传/解析层问题
+      // （key 漂移、括号边界碎裂等）→ 最后抢救；原文连动作名都没有 = LLM 本来
+      // 就没派活，tools=undefined 合法，不浪费修复（该丢就丢，底线不破坏）
+      if (!tools?.length && SESSION_ACTION_RE.test(content)) {
+        const salvaged = salvageToolsFromText(content, SESSION_ACTION_NAMES);
+        // 宁缺毋滥：sessioncreate 无 task = 意图不完整，空任务会话比丢任务更糟
+        const usable = salvaged?.filter(t => t.name !== 'sessioncreate' || t.parameters.task);
+        if (usable?.length) {
+          console.warn('🔧 [SummaryModule] 意图推断抢救成功（JSON 碎裂但 action 意图明确）:', usable.map(t => t.name).join(', '));
+          tools = usable as SummaryTool[];
+        } else {
+          console.error('❌ [SummaryModule] 检测到 session 意图但抢救失败，sessioncreate 可能丢失:', content.substring(0, 300));
         }
       }
 

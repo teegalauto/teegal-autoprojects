@@ -21,7 +21,8 @@ import { getGatherToolsSummary, getExecutionToolNames, getExecutionToolsWithPara
 import { UserInjectMessageManager } from './UserInjectMessageManager';
 import { knowledgeBaseService } from '../knowledge/KnowledgeBaseService';
 import { importantObjectTracker } from '../context/ImportantObjectTracker';
-import { messageStorage } from '@/services/storage/MessageStorage';
+import { getBackendUrl } from '@/config/env';
+import { sshListActive } from '@/utils/systemtools/sshInstance';
 
 /**
  * 环境构建器配置
@@ -137,35 +138,7 @@ export class EnvironmentBuilder {
       context.userInjectMessages = UserInjectMessageManager.consumeMessages(options.conversationId);
     }
 
-    // 5. 获取 memory++ 记忆
-    if (options.conversationId) {
-      context.memories = await this.getMemories(options.conversationId);
-    }
-
     return context;
-  }
-
-  /**
-   * 🔥 获取最近的 memory++ 记忆
-   */
-  private async getMemories(conversationId: string): Promise<string[]> {
-    try {
-      const messages = await messageStorage.getByConversationId(conversationId);
-      const memories: string[] = [];
-
-      // 从最近的消息中提取 memory（最多取最近 5 条）
-      for (const msg of messages.reverse()) {
-        if (memories.length >= 5) break;
-        if (msg.memory) {
-          memories.push(msg.memory);
-        }
-      }
-
-      return memories.reverse(); // 按时间顺序排列
-    } catch (error) {
-      console.error('[EnvironmentBuilder] 获取 memories 失败:', error);
-      return [];
-    }
   }
 
   /**
@@ -247,9 +220,31 @@ export class EnvironmentBuilder {
       dynamicSections.push(this.buildUserInjectMessagesSection(context.userInjectMessages));
     }
 
-    // 7. 重要对象引用（动态 - 对象可能增长）
+    // 7. 重要对象引用（动态 - 对象可能增长；执行轮附带活跃实例快照，项目条目直接带归属实例，免调 ssh_instance 查询省一轮）
     if (strategy.includeImportantObjects && options.conversationId) {
-      const importantObjectsText = importantObjectTracker.getFormattedObjects(options.conversationId);
+      let activeInstances: any[] = [];
+      if (strategy.includeExecutionTools) {
+        try {
+          const r = await sshListActive(undefined, { sync: false });
+          if (r.ok) activeInstances = r.instances;
+        } catch { /* 查询失败不影响重要对象段 */ }
+      }
+      // 🔥 内容根提示（穿透子目录名）：LLM 直接写对 read/push 相对路径前缀，免跑一轮文件树确认
+      // （git clone 套层项目的内容根是 apps/{id}/xxx/，相对路径须带 xxx/ 前缀）
+      let rootHints: Map<string, string> | undefined;
+      const hintTargets = importantObjectTracker.getConversationObjects(options.conversationId)
+        .filter((o: any) => o.type === 'app')
+        .slice(0, 3);
+      if (hintTargets.length > 0) {
+        const entries = await Promise.all(hintTargets.map(async (p: any) => {
+          const { getProjectRootHint } = await import('@/utils/apptool/AppPathHelper');
+          const hint = await getProjectRootHint(p.id);
+          return hint ? [p.id, hint] as [string, string] : null;
+        }));
+        const valid = entries.filter(Boolean) as [string, string][];
+        if (valid.length > 0) rootHints = new Map(valid);
+      }
+      const importantObjectsText = importantObjectTracker.getFormattedObjects(options.conversationId, activeInstances, rootHints);
       if (importantObjectsText) {
         dynamicSections.push(importantObjectsText);
       }
@@ -264,11 +259,6 @@ export class EnvironmentBuilder {
       }
     }
 
-    // 9. 记忆（动态 - 记忆可能增长）
-    if (strategy.includeMemories && context.memories && context.memories.length > 0) {
-      dynamicSections.push(this.buildMemoriesSection(context.memories));
-    }
-
     return {
       staticText: staticSections.filter(s => s.length > 0).join('\n\n'),
       dynamicText: dynamicSections.filter(s => s.length > 0).join('\n\n'),
@@ -276,20 +266,7 @@ export class EnvironmentBuilder {
   }
 
   /**
-   * 🔥 构建记忆段落
-   */
-  private buildMemoriesSection(memories: string[]): string {
-    const lines = memories.map((memory, index) => `${index + 1}. ${memory}`);
-    return `## 待办记忆
-以下是你之前记录的需要后续处理的事项：
-
-${lines.join('\n')}
-
-⚠️ 注意：如果上述事项已经处理或不再需要，请忽略。如果到时间了需要提醒用户，请在回复中使用 memory++ 继续记录。`;
-  }
-
-  /**
-   * 🔥 构建知识库段落
+   * 构建知识库段落
    */
   private buildKnowledgeBaseSection(knowledgeText: string): string {
     return `## 相关知识库
@@ -353,7 +330,7 @@ ${knowledgeText}`;
       return `${roleText}${marker}: ${entry.content}`;
     });
 
-    return `## 对话历史（最后一条是最新对话）\n${lines.join('\n')}\n\n💡 提示：📍关注这个标注下的信息是否实现了用户的需求`;
+    return `## 对话历史（时间升序，末尾即当前任务的执行过程）\n${lines.join('\n')}\n💡 📍标注的是当前任务的userquery，其后到末尾都是它的执行过程，检查该需求是否已实现`;
   }
 
 
@@ -400,17 +377,49 @@ ${knowledgeText}`;
       const electron = (window as any).electron;
       if (electron?.getUserDataPath) {
         const userDataPath = await electron.getUserDataPath();
-        outputPath = `${userDataPath}\\files\\output`;
+        // 🔥 分隔符按平台选：硬编码 \ 会让 macOS/Linux 拼出 /Users/...\files\output 混种路径，
+        // LLM 按这个提示保存文件必然存错位置
+        const sep = electron.platform === 'win32' ? '\\' : '/';
+        outputPath = `${userDataPath}${sep}files${sep}output`;
       }
     } catch (e) {
       // 如果获取失败，使用默认提示
     }
-    
-    const pathHint = outputPath 
-      ? `- 文件保存路径: ${outputPath}\\filename.png`
-      : `- 注意: 保存文件请用Windows路径如 C:\\output\\file.png`;
-    
-    return `## 用户环境\n${envInfo}\n${pathHint}`;
+
+    const isWin = (window as any).electron?.platform === 'win32';
+    const pathHint = outputPath
+      ? `- 文件保存路径: ${outputPath}${isWin ? '\\' : '/'}filename.png`
+      : (isWin
+        ? `- 注意: 保存文件请用Windows路径如 C:\\output\\file.png`
+        : `- 注意: 保存文件请用绝对路径如 /tmp/output/file.png`);
+
+    // 云端产物交付提醒：仅当检测到运行中的云端实例时注入（本地任务不出现，避免误导与 token 浪费）
+    const cloudHint = await this.getCloudDeliverHint();
+
+    const sections = [`## 用户环境`, envInfo, pathHint];
+    if (cloudHint) sections.push(cloudHint);
+    return sections.join('\n');
+  }
+
+  /**
+   * 云端产物交付提醒（两种链路，提示各自成立）：
+   * - Linux 客户端只出现在云端镜像上（邮件指挥链路）：agent 就跑在云端机上，产物在本机磁盘，
+   *   uploadfiletooss 直读本机文件上传即可——无需探测，平台即判定
+   * - 其余平台检测到运行中的云端实例（客户端 SSH 指挥链路）：只提醒别把成果留在云端机，不指定回传方式
+   */
+  private async getCloudDeliverHint(): Promise<string> {
+    if (/Linux/i.test(navigator.platform || '')) {
+      return '- 云端电脑提醒: 你正运行在云端电脑上，产物文件就在本机磁盘。完成后用 uploadfiletooss 上传本机文件拿到 URL 交付用户，不要把成果只留在云端机上（机器销毁后数据即销毁）';
+    }
+    try {
+      const resp = await fetch(`${getBackendUrl()}/api/rental/resources?userId=`, { signal: AbortSignal.timeout(2000) });
+      const data: any = await resp.json().catch(() => null);
+      const running = (data?.resources || []).some((r: any) => r?.status === 'running');
+      if (!running) return '';
+      return '- 云端电脑提醒: 检测到云端电脑运行中，若任务在其上执行，最终产物不要只留在云端机上，完成后回传交付给用户';
+    } catch {
+      return '';
+    }
   }
 
   /**

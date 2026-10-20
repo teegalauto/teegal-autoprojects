@@ -170,53 +170,51 @@ export function getAllToolIds(): number[] {
  * 🔥 核心工具注册表 - 供 Reaction 架构动态选择
  */
 export const AVAILABLE_TOOLS: ToolDefinition[] = [
-  { id: 3, name: "web_search", displayName: "智能搜索", tokens: ["gather", "execution"], params: "query" },
-  { id: 9, name: "web_url_reader", displayName: "网页/图片/视频阅读", tokens: ["gather", "execution"], params: "url, instruction?(阅读媒体内容时的关注指令)" },
-  { id: 14, name: "run_project_oncloud", displayName: "云端运行项目代码", tokens: ["gather", "execution"], params: "projectId, instanceType(S5.*=CPU，GN*/ecs.*=GPU), wait?(默认true，false=稍后用户自己看结果)" },
-  { id: 19, name: "list_projects", displayName: "列出项目", tokens: ["gather", "execution"], params: "" },
-  { id: 21, name: "userpc_shell", displayName: "执行shell命令", tokens: ["gather", "execution"], params: "command, credentialName?" },
-  { id: 25, name: "userpc_run_python", displayName: "运行Python脚本", tokens: ["gather", "execution"], params: "code" },
-  { id: 26, name: "get_account_info", displayName: "获取账户信息", tokens: ["gather", "execution"], params: "" },
-  { id: 28, name: "call_memory", displayName: "回忆记忆", tokens: ["gather", "execution"], params: "query" },
+  // 🔥 信息获取类
+  { id: 1, name: "web_search", displayName: "智能搜索", tokens: ["gather", "execution"], params: "query" },
+  { id: 2, name: "web_url_reader", displayName: "网页/图片/视频阅读", tokens: ["gather", "execution"], params: "url, instruction(媒体URL必传:想了解什么,如\"描述这张图\";普通网页可省)" },
+  { id: 3, name: "list_projects", displayName: "列出项目", tokens: ["gather", "execution"], params: "" },
+  { id: 4, name: "get_account_info", displayName: "获取账户信息", tokens: ["gather", "execution"], params: "" },
   // 🔥 check_user_credits 已合并到 get_account_info（一次调用返回账户信息+积分余额）
-  { id: 32, name: "use_guide", displayName: "查阅使用指南", tokens: ["gather", "execution"], params: "query" },
+  { id: 5, name: "call_memory", displayName: "回忆记忆", tokens: ["gather", "execution"], params: "query | projectId+query?" },
+  { id: 6, name: "use_guide", displayName: "查阅使用指南", tokens: ["gather", "execution"], params: "query" },
 
   // 🔥 项目文件操作工具
-  { id: 34, name: "list_project_files", displayName: "列出项目文件树", tokens: ["gather", "execution"], params: "projectId, mode?(默认tree=文件树+depth | overview=README/配置/入口线索 | search=按query搜文件名+文件内容grep)" },
-  { id: 35, name: "read_project_file", displayName: "读取项目文件", tokens: ["gather", "execution"], params: "projectId, filePath, pattern?, offset?, limit?" },
-  { id: 36, name: "save_project_file", displayName: "保存项目文件", tokens: ["gather", "execution"], params: "projectId, filePath, content" },
-  { id: 47, name: "edit_project_file", displayName: "编辑项目文件", tokens: ["gather", "execution"], params: "projectId, filePath, edits[{oldText,newText}]" },
-  { id: 37, name: "delete_project_file", displayName: "删除项目文件", tokens: ["gather", "execution"], params: "projectId, filePath" },
-  
-  // 🔥 新增：训练任务历史工具
-  { id: 38, name: "list_train_tasks", displayName: "列出训练任务", tokens: ["gather", "execution"], params: "projectId" },
-  { id: 39, name: "get_train_task_detail", displayName: "获取训练任务详情", tokens: ["gather", "execution"], params: "taskId" },
-  { id: 40, name: "stop_gpu_train", displayName: "停止GPU训练", tokens: ["gather", "execution"], params: "taskId" },
-  { id: 41, name: "update_train_task_remark", displayName: "更新训练备注", tokens: ["gather", "execution"], params: "taskId, remark" },
-  
-  // 🔥 云端实例类型查询（GPU 卡型 + CPU 普通计算档位全量）
-  { id: 42, name: "list_instance_types", displayName: "查询云端实例类型列表", tokens: ["gather", "execution"], params: "" },
+  { id: 7, name: "list_project_files", displayName: "列出项目文件树", tokens: ["gather", "execution"], params: "projectId, mode?(tree=文件树+depth | search=query搜文件名+内容 | skeleton=全项目定义索引+行号,改码前先看)" },
+  { id: 8, name: "read_project_file", displayName: "读取项目文件", tokens: ["gather", "execution"], params: "projectId, filePath | files[](批量), pattern?(支持a|b|c或数组; 附结构地图+行号), offset?, limit?(定点; 结果带续读坐标)" },
+  { id: 9, name: "save_project_file", displayName: "保存项目文件", tokens: ["gather", "execution"], params: "projectId, filePath, content" },
+  { id: 10, name: "edit_project_file", displayName: "编辑项目文件", tokens: ["gather", "execution"], params: "projectId, edits[{filePath,oldText,newText}](每项必带filePath)" },
+  { id: 11, name: "delete_project_file", displayName: "删除项目文件", tokens: ["gather", "execution"], params: "projectId, filePath" },
 
-  // 🔥 创建/更新项目元信息（不带 projectId=创建；带 projectId=更新 name/description，让 LLM 维护项目自述）
-  { id: 41, name: "upsert_project", displayName: "创建/更新项目", tokens: ["gather", "execution"], params: "name, description, projectId?(传入则为更新模式)" },
+  // 🔥 代码执行工具（local=本地 / cloud=云端）
+  { id: 12, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(只传=自动探测入口执行整个项目), mainFile?(指定入口，须已存在), code?(临时脚本，探路请用userpc_shell)" },
+  { id: 13, name: "run_project_oncloud", displayName: "云端运行项目代码", tokens: ["gather", "execution"], params: "projectId, instanceType(S5.*=CPU，GN*/ecs.*=GPU), wait?(默认true，false=稍后用户自己看结果)" },
+  { id: 14, name: "userpc_shell", displayName: "执行shell命令", tokens: ["gather", "execution"], params: "command, credentialName?" },
+  { id: 15, name: "userpc_run_python", displayName: "运行Python脚本", tokens: ["gather", "execution"], params: "code" },
 
-  // 🔥 本地代码执行工具（run_project_onlocal 强调在本地执行，区别于 train_project 云端训练）
-  { id: 43, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(只传=自动探测入口执行整个项目), mainFile?(指定入口), code?(临时脚本，探路请用userpc_shell)" },
-  { id: 44, name: "list_localrun_logs", displayName: "列出本地执行日志", tokens: ["gather", "execution"], params: "projectId" },
-  { id: 45, name: "get_localrun_logdetail", displayName: "获取本地执行日志详情", tokens: ["gather", "execution"], params: "logId" },
+  // 🔥 任务历史工具（合并版：云端训练 train + 本地执行 localrun 双源，见 TaskHistoryTools）
+  { id: 16, name: "list_tasks", displayName: "列出任务/日志", tokens: ["gather", "execution"], params: "projectId, type?(train=云端训练|localrun=本地执行|缺省=两源合并), morePage?(如'11-20')" },
+  { id: 17, name: "get_task_detail", displayName: "获取任务/日志详情", tokens: ["gather", "execution"], params: "taskId(双源自动命中:先查训练任务再查本地执行日志,回执带来源标签)" },
+  { id: 18, name: "stop_gpu_train", displayName: "停止GPU训练", tokens: ["gather", "execution"], params: "taskId" },
+  { id: 19, name: "update_train_task_remark", displayName: "更新训练备注", tokens: ["gather", "execution"], params: "taskId, remark" },
 
-  // 🔥 数据环境工具
-  { id: 46, name: "list_cloud_files", displayName: "查询云端文件列表", tokens: ["gather", "execution"], params: "" },
-
-  // 🔥 凭据管理工具（LLM 只能看到凭据名称，看不到明文值；param 型参数可写）
-  { id: 48, name: "list_credentials", displayName: "查询凭据/设置参数", tokens: ["gather", "execution"], params: "action?(list=查凭据与参数; set=改参数,传name+value,仅限param型)" },
-
-  // 🔥 文件上传工具（从扩展工具迁移为内置工具）
-  { id: 49, name: "uploadfiletooss", displayName: "上传文件到云端", tokens: ["gather", "execution"], params: "localPath（或任意包含本地文件路径的参数）" },
-
+  // 🔥 云端资源（实例类型 / 常驻实例 / 云端文件）
+  { id: 20, name: "list_instance_types", displayName: "查询云端实例类型列表", tokens: ["gather", "execution"], params: "" },
+  { id: 21, name: "list_cloud_files", displayName: "查询云端文件列表", tokens: ["gather", "execution"], params: "" },
   // 🔥 常驻实例租赁：开机云端实例（带公钥免密）→ userpc_shell 直接 ssh 操作 → close 关机结算
   // projectId 可选：登记项目归属（list 可看出"项目专属机"，跨项目不复用）
-  { id: 50, name: "ssh_instance", displayName: "常驻实例操作", tokens: ["execution"], params: "action?(默认activate: activate开机/close关机/list列表/add绑定自有机器), instanceType?(activate必传,如S5.MEDIUM4), instanceId?(close必传/activate复用指定实例), projectId?(登记归属,短id/完整id), host/username/password?(add必传,用户自有服务器), port?(add可选,默认22)" },
+  { id: 22, name: "ssh_instance", displayName: "常驻实例操作", tokens: ["execution"], params: "action?(默认activate: activate开机/close关机/list列表/add绑定自有机器/register登记预览域名), instanceType?(activate必传,如S5.MEDIUM4), instanceId?(close必传/activate复用指定实例), projectId?(登记归属,短id/完整id), host/username/password?(add必传,用户自有服务器), host+port?(register必传,已部署web服务的机子IP与端口,换官方HTTPS预览域名), port?(add可选,默认22)" },
+
+  // 🔥 项目与账户管理
+  // 创建/更新项目元信息（不带 projectId=创建；带 projectId=更新 name/description，让 LLM 维护项目自述）
+  { id: 23, name: "upsert_project", displayName: "创建/更新项目", tokens: ["gather", "execution"], params: "name, description, projectId?(传入则为更新模式)" },
+  // 🔥 凭据管理工具（LLM 只能看到凭据名称，看不到明文值；param 型参数可写）
+  { id: 24, name: "list_credentials", displayName: "查询凭据/设置参数", tokens: ["gather", "execution"], params: "action?(list=查凭据与参数; set=改参数,传name+value,仅限param型)" },
+
+  // 🔥 文件上传工具（从扩展工具迁移为内置工具）
+  { id: 25, name: "uploadfiletooss", displayName: "上传文件到云端", tokens: ["gather", "execution"], params: "localPath（或任意包含本地文件路径的参数）" },
+  // 🔥 实例直连：执行命令 / 写文件 / 推文件（Node spawn 免转义；细节报错自解释，完整用法见 use_guide）
+  { id: 26, name: "ssh_remote", displayName: "实例直连执行", tokens: ["execution"], params: "instanceId, command | remotePath+content | filePath 或 filePaths[](批量) 或 localPath + remotePath, timeout?" },
 ];
 
 // 🔥 扩展工具存储（动态添加）

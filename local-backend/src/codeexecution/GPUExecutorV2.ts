@@ -867,7 +867,7 @@ export class GPUExecutor {
               return {
                 type: 'image/png',
                 url: url,
-                title: chartFilename,
+                title: url ? chartFilename : `${chartFilename}（云端未上传该文件）`,
                 name: chartFilename
               };
             }

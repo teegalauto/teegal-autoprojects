@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Copy, Check, Terminal, Loader2, Square } from 'lucide-react';
+import { Copy, Check, Terminal, Loader2, Square, ChevronDown, ChevronRight } from 'lucide-react';
 
 interface TerminalOutputData {
   type: 'terminal';
@@ -44,7 +44,8 @@ interface TerminalOutputViewProps {
 
 export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, callId }) => {
   const [copied, setCopied] = useState(false);
-  const [isExpanded, setIsExpanded] = useState(true);
+  // 🔥 默认收起：完整终端输出看的人少，收起态在标题栏保留一条实时摘要（最后一行非空输出）
+  const [isExpanded, setIsExpanded] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevOutputsLengthRef = useRef(0);
 
@@ -65,6 +66,17 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
   const displayOutputs = outputs.slice(-MAX_DISPLAY_LINES);
   const hasMore = outputs.length > MAX_DISPLAY_LINES;
   const isStreaming = status === 'streaming';
+
+  // 🔥 收起态摘要：error 优先，否则从尾部找最后一条非空输出（与 SessionMessageGroup 摘要同风格）——
+  //    流式时随 result 推送实时刷新，让用户不展开也能瞄到终端在干什么
+  const collapsedSummary = (() => {
+    if (error) return `错误: ${error}`;
+    for (let i = outputs.length - 1; i >= 0; i--) {
+      const line = (outputs[i] || '').trim();
+      if (line) return line;
+    }
+    return '';
+  })();
 
   const handleCopy = async () => {
     const textToCopy = outputs.join('\n');
@@ -95,13 +107,24 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
         className="bg-gray-800 px-3 py-2 flex items-center justify-between border-b border-gray-700 cursor-pointer"
         onClick={() => setIsExpanded(!isExpanded)}
       >
-        <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-gray-400" />
-          <span className="text-gray-300 font-semibold">终端输出</span>
+        <div className="flex items-center gap-2 min-w-0">
+          {isExpanded ? (
+            <ChevronDown className="w-4 h-4 text-gray-500 shrink-0" />
+          ) : (
+            <ChevronRight className="w-4 h-4 text-gray-500 shrink-0" />
+          )}
+          <Terminal className="w-4 h-4 text-gray-400 shrink-0" />
+          <span className="text-gray-300 font-semibold whitespace-nowrap">终端输出</span>
           {isStreaming && (
-            <Loader2 className="w-3 h-3 text-blue-400 animate-spin ml-1" />
+            <Loader2 className="w-3 h-3 text-blue-400 animate-spin ml-1 shrink-0" />
           )}
         </div>
+        {/* 🔥 收起态摘要：占据剩余空间单行截断（流式实时刷新），展开时不显示避免与正文重复 */}
+        {!isExpanded && collapsedSummary && (
+          <span className="flex-1 min-w-0 truncate text-gray-500 ml-2 mr-2">
+            {collapsedSummary}
+          </span>
+        )}
         <div className="flex items-center gap-2">
           {executionTime && (
             <span className="text-gray-500">{(executionTime / 1000).toFixed(1)}s</span>

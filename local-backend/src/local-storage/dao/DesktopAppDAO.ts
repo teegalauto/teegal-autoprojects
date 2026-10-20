@@ -466,6 +466,177 @@ export class DesktopAppDAO {
       '# BootCode\n\n此项目存放 Teegal 开源源码。首次初始化时系统会自动从开源仓库拉取完整源码；若目录为空，说明拉取未完成，重启应用会自动重试。'
     );
   }
+
+  // ==========================================================================
+  // 🔥 项目记忆（project_memory）：任务完成时的 ReAct 过程笔记按项目存档
+  //    接手项目先读档案（call_memory 传 projectId）快速建立熟悉度，免重读全部代码
+  // ==========================================================================
+
+  /** 笔记预算：超出从头部丢最老轮次（早期结论通常已被后续笔记延续整合），丢时头部提示 */
+  private static readonly PROJECT_NOTE_BUDGET = 4000;
+
+  /** 时间衰减：半衰期 30 天（与客户端 CallMemoryTool 回合打分同手感） */
+  private static readonly PM_DECAY_LAMBDA = Math.log(2) / (30 * 24 * 3600 * 1000);
+
+  /**
+   * 项目 id 归一化：短 id / 任意 id 前缀查库解析为完整 UUID；解析失败按原样返回
+   * （写入与查询双端都过这里，短 id 存进去也能对上）
+   */
+  private normalizeProjectId(rawId: string): string {
+    if (!rawId) return rawId;
+    const lower = rawId.toLowerCase();
+    const exact = this.getById(rawId) || this.getById(lower);
+    if (exact) return exact.id;
+    const db = localDatabase.getDb();
+    const row = db.prepare(
+      `SELECT id FROM desktop_apps WHERE LOWER(id) LIKE ? AND user_id IS NOT NULL LIMIT 2`
+    ).get(`${lower.replace(/[%_]/g, '\\$&')}%`) as any;
+    // 命中多条（前缀歧义）时无法确定，按原样返回由调用方决定
+    if (Array.isArray(row)) return rawId;
+    return row?.id || rawId;
+  }
+
+  /**
+   * 保存一条项目记忆（每任务每项目一条；多项目任务由调用方按归属多次调用）
+   * writeNote 超预算从头部截断保尾部，头部提示已截断
+   */
+  saveProjectMemory(params: {
+    projectId: string;
+    userId: string;
+    userQuery: string;
+    writeNote: string;
+    conversationId?: string;
+  }): void {
+    const db = localDatabase.getDb();
+    let note = params.writeNote || '';
+    if (note.length > DesktopAppDAO.PROJECT_NOTE_BUDGET) {
+      note = `[笔记头部已截断，仅保留最近部分]\n${note.slice(-DesktopAppDAO.PROJECT_NOTE_BUDGET)}`;
+    }
+    db.prepare(`
+      INSERT INTO project_memory (project_id, user_id, user_query, write_note, conversation_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      this.normalizeProjectId(params.projectId),
+      params.userId,
+      (params.userQuery || '').slice(0, 4000),
+      note,
+      params.conversationId || null,
+      Date.now()
+    );
+  }
+
+  /**
+   * 查询项目记忆：
+   * - 无 query：时间倒序拉最近 limit 条（接手项目翻档案场景）
+   * - 有 query：user_query(权重4) + write_note(权重2) 子串打分 × 时间衰减，取 top limit（定向查场景）
+     数据量级为每项目几十条，内存扫描即可，无需 FTS
+   */
+  queryProjectMemory(params: {
+    userId: string;
+    projectId: string;
+    query?: string;
+    limit?: number;
+  }): Array<{ userQuery: string; writeNote: string; conversationId: string | null; createdAt: number; score?: number }> {
+    const db = localDatabase.getDb();
+    const pid = this.normalizeProjectId(params.projectId);
+    // 前缀兼容：完整 id 相等 或 以短 id 为前缀（存量短 id 数据）
+    const rows = db.prepare(`
+      SELECT user_query, write_note, conversation_id, created_at
+      FROM project_memory
+      WHERE user_id = ? AND (project_id = ? OR project_id LIKE ?)
+      ORDER BY created_at DESC
+      LIMIT 200
+    `).all(params.userId, pid, `${pid.replace(/[%_]/g, '\\$&')}%`) as any[];
+
+    if (rows.length === 0) return [];
+
+    const limit = Math.min(params.limit || 5, 20);
+    const q = (params.query || '').trim().toLowerCase();
+
+    // 🔥 "上次/最近"类查询快捷路径：语义就是要最近档案，直接时间倒序（打分反而绕远）
+    if (!q || /(上次|上一次|最近|之前怎么|前几次)/.test(q)) {
+      return rows.slice(0, limit).map(r => ({
+        userQuery: r.user_query,
+        writeNote: r.write_note,
+        conversationId: r.conversation_id,
+        createdAt: r.created_at,
+      }));
+    }
+
+    // 打分：分词逐词命中 Σ 权重×log(1+次数) × 时间衰减
+    // 🔥 整串匹配对中文必空手（"chat-agent上次部署方案细节"原样出现在档案里的概率为零），
+    // 必须切词：英文/数字词整体提取（信息量大权重高）+ 中文滑窗 bigram
+    const tokens = this.tokenizeQuery(q);
+    if (tokens.length === 0) {
+      return rows.slice(0, limit).map(r => ({
+        userQuery: r.user_query,
+        writeNote: r.write_note,
+        conversationId: r.conversation_id,
+        createdAt: r.created_at,
+      }));
+    }
+
+    const scored = rows.map(r => {
+      const uq = (r.user_query || '').toLowerCase();
+      const note = (r.write_note || '').toLowerCase();
+      let raw = 0;
+      for (const t of tokens) {
+        const weight = /^[a-z0-9]/.test(t) ? 4 : 1.5; // 英文词精确信息量大；中文 bigram 误命中率高权重低
+        const c = this.countOccurrences(uq, t) + this.countOccurrences(note, t);
+        if (c > 0) raw += weight * Math.log(1 + c);
+      }
+      const decay = Math.exp(-DesktopAppDAO.PM_DECAY_LAMBDA * Math.max(0, Date.now() - r.created_at));
+      return {
+        userQuery: r.user_query,
+        writeNote: r.write_note,
+        conversationId: r.conversation_id,
+        createdAt: r.created_at,
+        score: raw * decay,
+      };
+    }).filter(r => (r.score || 0) > 0);
+
+    // 🔥 零分兜底：关键词全没命中时退回时间倒序，绝不返回空（LLM 至少拿到最近档案可推断）
+    if (scored.length === 0) {
+      return rows.slice(0, limit).map(r => ({
+        userQuery: r.user_query,
+        writeNote: r.write_note,
+        conversationId: r.conversation_id,
+        createdAt: r.created_at,
+      }));
+    }
+
+    scored.sort((a, b) => (b.score || 0) - (a.score || 0));
+    return scored.slice(0, limit);
+  }
+
+  /**
+   * 🔥 查询分词：英文/数字词（≥2字符，含连字符/点，如 chat-agent、v2.1）整体提取；
+   * 中文段按 2 字滑窗切 bigram（中文无空格分隔，bigram 是无词典分词的最低配可用方案，
+   * 多 token 汇总分后真命中档案在多数 token 上都有分，排名自然靠前）
+   */
+  private tokenizeQuery(q: string): string[] {
+    const tokens = new Set<string>();
+    for (const w of q.match(/[a-z0-9][a-z0-9._-]*/gi) || []) {
+      if (w.length >= 2) tokens.add(w.toLowerCase());
+    }
+    // 剔除英文/数字/标点后的剩余中文段滑窗
+    for (const seg of q.split(/[a-z0-9\s\p{P}]+/iu)) {
+      if (!/[\u4e00-\u9fa5]/.test(seg)) continue;
+      for (let i = 0; i + 2 <= seg.length; i++) tokens.add(seg.slice(i, i + 2));
+    }
+    return [...tokens];
+  }
+
+  private countOccurrences(text: string, needle: string): number {
+    if (!text || !needle) return 0;
+    let count = 0;
+    let pos = text.indexOf(needle);
+    while (pos !== -1) {
+      count++;
+      pos = text.indexOf(needle, pos + needle.length);
+    }
+    return count;
+  }
 }
 
 // 导出单例

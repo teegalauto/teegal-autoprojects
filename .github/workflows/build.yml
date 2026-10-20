@@ -33,6 +33,11 @@ jobs:
           cd local-backend/node_modules/better-sqlite3
           npx prebuild-install --runtime=electron --target=40.2.1 --arch=x64 --force
 
+      # 🔥 护栏：剥离 package.json 的 UTF-8 BOM（Teegal 写文件带 BOM，vite postcss 配置加载
+      # JSON.parse 会炸，曾致 v1.3.84/v1.3.85 双平台 CI 全挂）
+      - name: Strip BOM from package.json
+        run: node -e "const fs=require('fs');const f='package.json';const s=fs.readFileSync(f,'utf8');if(s.charCodeAt(0)===0xFEFF){fs.writeFileSync(f,s.slice(1));console.log('BOM stripped')}else{console.log('no BOM')}"
+
       - name: Build frontend
         run: npm run build
 
@@ -98,6 +103,9 @@ jobs:
           npx --yes node-gyp rebuild --runtime=electron --target=40.2.1 --dist-url=https://electronjs.org/headers
         # 🔥 不再 continue-on-error，构建失败应该报错而不是静默通过
 
+      - name: Strip BOM from package.json
+        run: node -e "const fs=require('fs');const f='package.json';const s=fs.readFileSync(f,'utf8');if(s.charCodeAt(0)===0xFEFF){fs.writeFileSync(f,s.slice(1));console.log('BOM stripped')}else{console.log('no BOM')}"
+
       - name: Build frontend
         run: npm run build
 
@@ -135,8 +143,70 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install local-backend dependencies
+        run: cd local-backend && npm ci
+
+      - name: Build better-sqlite3 for Electron (Linux)
+        run: |
+          cd local-backend/node_modules/better-sqlite3
+          npx prebuild-install --runtime=electron --target=40.2.1 --arch=x64 --force
+
+      - name: Strip BOM from package.json
+        run: node -e "const fs=require('fs');const f='package.json';const s=fs.readFileSync(f,'utf8');if(s.charCodeAt(0)===0xFEFF){fs.writeFileSync(f,s.slice(1));console.log('BOM stripped')}else{console.log('no BOM')}"
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build local-backend
+        run: cd local-backend && npm run build
+
+      - name: Build Electron
+        run: npm run electron:build
+
+      - name: Package Linux
+        run: npx electron-builder --linux --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # AppImage 跟随云端镜像（TEEGAL_HEADLESS 禁自动更新，版本以镜像为准）：
+      # 只上传 .AppImage 本体，latest-linux.yml 无用（云端机不检查更新）
+      - name: Upload to GitHub Release
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for i in 1 2 3 4 5; do
+            if gh release create "$TAG" release/*.AppImage --generate-notes --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            echo "create 第 $i 次失败（已存在或瞬时故障），尝试 upload..."
+            sleep 15
+            if gh release upload "$TAG" release/*.AppImage --clobber --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            echo "upload 第 $i 次失败，等待后重试..."
+            sleep 15
+          done
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   upload-to-oss:
-    needs: [build-windows, build-mac]
+    needs: [build-windows, build-mac, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:

@@ -32,6 +32,8 @@ export const ToolApiRoutes = {
     SEARCH: '/api/local/conversations/search',
     CONTEXT: '/api/local/conversations/memory/context',
     SESSION: '/api/local/conversations',
+    PROJECT_SAVE: '/api/local/desktop-apps/project-memory/save',
+    PROJECT_QUERY: '/api/local/desktop-apps/project-memory',
   },
 
   SEARCH_PROVIDER: {
@@ -165,6 +167,33 @@ export const ToolApiClient = {
       conversationId: string;
       sessionId: string;
     }) => toolRequest<any>(`${ToolApiRoutes.MEMORY.SESSION}/${params.conversationId}/messages/session?sessionId=${params.sessionId}`, {
+      method: 'GET',
+    }),
+
+    /** 🔥 保存项目记忆（ReAct 任务完成收尾时触发；多项目任务每个归属项目存一条） */
+    saveProjectMemory: (params: {
+      userId: string;
+      projectIds: string[];
+      userQuery: string;
+      writeNote: string;
+      conversationId?: string;
+    }) => toolRequest<any>(`${ToolApiRoutes.MEMORY.PROJECT_SAVE}`, {
+      body: {
+        user_id: params.userId,
+        project_ids: params.projectIds,
+        user_query: params.userQuery,
+        write_note: params.writeNote,
+        conversation_id: params.conversationId,
+      },
+    }),
+
+    /** 🔥 查询项目记忆：无 query 翻档案（时间倒序），有 query 打分定向查 */
+    queryProjectMemory: (params: {
+      userId: string;
+      projectId: string;
+      query?: string;
+      limit?: number;
+    }) => toolRequest<any>(`${ToolApiRoutes.MEMORY.PROJECT_QUERY}?user_id=${encodeURIComponent(params.userId)}&project_id=${encodeURIComponent(params.projectId)}${params.query ? `&query=${encodeURIComponent(params.query)}` : ''}&limit=${params.limit || 5}`, {
       method: 'GET',
     }),
   },

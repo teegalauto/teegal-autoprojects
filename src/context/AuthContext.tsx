@@ -5,6 +5,7 @@ import { toast } from 'sonner';
  type Session = any;
 import { ModelManager } from '@/utils/llm/ModelManager'; // 🔥 导入 ModelManager
 import { CloudAuthService } from '@/services/cloud/CloudAuthService'; // 🔥 云端认证服务
+import { offlineChannel, saveOfflineConfig } from '@/utils/auto/offline/offlineChannel'; // 🔥 离线指挥随登出停机
 
 // 🔥 认证模式：仅支持 'cloud'（home-web 云端认证）
 const AUTH_MODE = 'cloud' as const;
@@ -623,6 +624,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       // 🔥 清空模型管理器的用户态（模型列表/绑定配置/搜索源缓存），
       //    防止切换账号后残留上一用户的模型绑定关系
       ModelManager.setUserId(null);
+
+      // 🔥 离线指挥随登出停止并清除本地配置：换账号登录后开关回归"关"，
+      //    新账号重新开启才会走 register + 握手信（防沿用上一账号的通道收信执行）
+      offlineChannel.stop();
+      saveOfflineConfig(null);
 
       // 🔥 清除本地状态
       setUser(null);

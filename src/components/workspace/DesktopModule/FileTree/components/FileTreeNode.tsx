@@ -7,7 +7,7 @@
 
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronRight, ChevronDown, File, Folder, FolderOpen, FileCode, FileText, Trash2, Edit2, Copy, Check } from 'lucide-react';
+import { ChevronRight, ChevronDown, File, Folder, FolderOpen, FileCode, FileText, Trash2, Edit2, Copy } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { FileNode, FileHistory } from '../types';
 import { getFileIconColor, isCodeFile, deleteFile, renameFile } from '../utils';
@@ -64,15 +64,30 @@ export const FileTreeNode = React.memo(function FileTreeNode({
 
   // 🔥 完整路径 = node.path（电脑上的实际路径）
   const fullPath = node.path;
-  
-  // 🔥 相对路径（给 LLM 用）
-  const relativePath = getRelativePath(node.path);
-  
+
+  // 🔥 相对路径（给 LLM 用）：优先用 useFileTree 按 basePath 算好的 node.relativePath
+  //（对导入项目 code_path 同样正确）；正则提取仅作兜底，且只对默认 apps/{appId} 路径有效
+  const relativePath = node.relativePath || getRelativePath(node.path);
+
+  // 🔥 变更匹配候选：git 仓库根 = getAppCodeDir（主进程不做渲染端的单层目录穿透），
+  // clone 套层项目下 changes.fileName 会带套层目录前缀，与 relativePath 差一层；
+  // 两个候选任一命中即算变更（导入项目走 relativePath，套层项目走正则提取）
+  const relCandidates = Array.from(new Set([relativePath, getRelativePath(node.path)].filter(Boolean)));
+
   // 🔥 检查当前文件是否有未接受的修改（相对 HEAD 有变更）
-  const hasChanges = !isDir && changes.some(h => {
-    // 🔥 使用相对路径匹配
-    return h.fileName === relativePath;
-  });
+  const changeItem = !isDir ? changes.find(h => relCandidates.includes(h.fileName)) : undefined;
+  // 🔥 目录传播：子孙文件有未接受修改时，目录名也标黄（对齐 VSCode 文件夹变色），
+  //    每层目录节点独立判断，黄色逐级向上归属
+  const dirHasChanges = isDir &&
+    relCandidates.some(rel => changes.some(h => h.fileName.startsWith(`${rel}/`)));
+  const hasChanges = !!changeItem || dirHasChanges;
+
+  // 🔥 按变更类型着色（对齐主流 IDE：新文件绿、修改黄、删除红；目录含变更统一黄）
+  const changeColorClass = dirHasChanges ? 'text-amber-500 font-medium' :
+    !changeItem ? '' :
+    changeItem.changeType === 'added' ? 'text-green-600 font-medium' :
+    changeItem.changeType === 'deleted' ? 'text-red-500 line-through' :
+    'text-amber-500 font-medium';
 
   const [showContextMenu, setShowContextMenu] = useState(false);
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
@@ -114,9 +129,11 @@ export const FileTreeNode = React.memo(function FileTreeNode({
 
   const handleClick = () => {
     if (isRenaming) return;
-    
+
     if (isDir) {
+      // 🔥 点击目录：折叠/展开 + 选中（目录也能作为新建文件/文件夹的落点）
       onToggle();
+      onSelect(node);
     } else {
       onSelect(node);
     }
@@ -221,37 +238,6 @@ export const FileTreeNode = React.memo(function FileTreeNode({
     }
   };
 
-  // 🔥 复制完整信息（包含 appId 和相对路径，给 LLM 用）
-  const handleCopyFullInfo = async () => {
-    setShowContextMenu(false);
-
-    const fullInfo = `projectId: ${appId.substring(0, 8)}\nfilePath: ${relativePath}`;
-
-    try {
-      await navigator.clipboard.writeText(fullInfo);
-      toast({
-        title: t('workspace.desktopModule.fileTree.copiedFullInfo'),
-        description: t('workspace.desktopModule.fileTree.copiedProjectFile'),
-        duration: 2000,
-      });
-    } catch (error) {
-      const textArea = document.createElement('textarea');
-      textArea.value = fullInfo;
-      textArea.style.position = 'fixed';
-      textArea.style.left = '-9999px';
-      document.body.appendChild(textArea);
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-
-      toast({
-        title: t('workspace.desktopModule.fileTree.copiedFullInfo'),
-        description: t('workspace.desktopModule.fileTree.copiedProjectFile'),
-        duration: 2000,
-      });
-    }
-  };
-
   const handleRenameSubmit = async () => {
     if (!newName.trim() || newName === node.name) {
       setIsRenaming(false);
@@ -259,7 +245,11 @@ export const FileTreeNode = React.memo(function FileTreeNode({
       return;
     }
 
-    const result = await renameFile(appId, node.name, newName.trim());
+    // 🔥 用 relativePath + 原父目录拼接：嵌套节点的裸 name 会让重命名错到根目录
+    const rel = node.relativePath || node.name;
+    const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+    const target = parent ? `${parent}/${newName.trim()}` : newName.trim();
+    const result = await renameFile(appId, rel, target);
     if (result.success) {
       onRefresh();
     } else {
@@ -354,9 +344,9 @@ export const FileTreeNode = React.memo(function FileTreeNode({
             onClick={(e) => e.stopPropagation()}
           />
         ) : (
-          <span 
-            className={`text-xs truncate flex-1 ${hasChanges && !isDir ? 'text-green-600 font-medium' : ''}`}
-            title={hasChanges && !isDir ? t('workspace.desktopModule.fileTree.hasHistoryVersion') : undefined}
+          <span
+            className={`text-xs truncate flex-1 ${changeColorClass}`}
+            title={hasChanges ? t('workspace.desktopModule.fileTree.hasHistoryVersion') : undefined}
           >
             {node.name}
           </span>
@@ -381,45 +371,32 @@ export const FileTreeNode = React.memo(function FileTreeNode({
             e.stopPropagation();
           }}
         >
-          {/* 🔥 复制路径选项 - 仅文件显示 */}
-          {!isDir && (
-            <>
-              <button
-                className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.preventDefault();
-                  handleCopyFullPath();
-                }}
-              >
-                <Copy className="w-3 h-3" />
-                {t('workspace.desktopModule.fileTree.copyFullPath')}
-              </button>
-              <button
-                className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.preventDefault();
-                  handleCopyRelativePath();
-                }}
-              >
-                <Copy className="w-3 h-3" />
-                {t('workspace.desktopModule.fileTree.copyRelativePath')}
-              </button>
-              <button
-                className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.preventDefault();
-                  handleCopyFullInfo();
-                }}
-              >
-                <Check className="w-3 h-3" />
-                {t('workspace.desktopModule.fileTree.copyFullInfo')}
-              </button>
-              <div className="border-t border-gray-100 my-1" />
-            </>
-          )}
+          {/* 🔥 复制路径选项 - 文件与目录均可用（目录的相对路径含多级前缀，如 b/c.py 场景复制 b） */}
+          <>
+            <button
+              className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
+              onClick={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                handleCopyFullPath();
+              }}
+            >
+              <Copy className="w-3 h-3" />
+              {t('workspace.desktopModule.fileTree.copyFullPath')}
+            </button>
+            <button
+              className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
+              onClick={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                handleCopyRelativePath();
+              }}
+            >
+              <Copy className="w-3 h-3" />
+              {t('workspace.desktopModule.fileTree.copyRelativePath')}
+            </button>
+            <div className="border-t border-gray-100 my-1" />
+          </>
           <button
             className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 w-full"
             onClick={(e) => {

@@ -13,17 +13,19 @@ interface SessionMessageGroupProps {
 }
 
 const getLastMessageSummary = (messages: MessageData[]): string => {
-  if (messages.length === 0) return '';
-  const lastMessage = messages[messages.length - 1];
-  // 🔥 根据 apiRole 决定取 content 还是 result
-  // summarizer 优先取 result，reactor 优先取 content
-  let content = '';
-  if (lastMessage.apiRole === 'summarizer') {
-    content = lastMessage.result || lastMessage.content || '';
-  } else {
-    content = lastMessage.content || lastMessage.result || '';
+  // 🔥 从后往前找第一条有内容的消息：reactor 多工具轮中只有首个工具挂推理文案（content），
+  // 同轮其余 callId 的消息 content 为空串——直接取最后一条会经常拿到空摘要
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    // 🔥 根据 apiRole 决定取 content 还是 result
+    // summarizer 优先取 result，reactor 优先取 content
+    const content = (m.apiRole === 'summarizer' ? m.result || m.content : m.content || m.result) || '';
+    const trimmed = content.trim();
+    if (trimmed) {
+      return trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : '');
+    }
   }
-  return content.slice(0, 50) + (content.length > 50 ? '...' : '');
+  return '';
 };
 
 /**

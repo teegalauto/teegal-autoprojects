@@ -237,8 +237,8 @@ export const DesktopAppCard = memo(({ app, index, hasResident, onAppUpdated, onA
           )}
           {index !== undefined && (
             <div
-              className={`absolute top-0 left-0 z-10 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium transition-colors ${
-                hasResident ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : 'bg-gray-200 text-gray-600'
+              className={`absolute top-1.5 left-1.5 z-10 w-6 h-6 rounded-md flex items-center justify-center text-xs font-medium transition-colors ${
+                hasResident ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : 'bg-gray-200/90 text-gray-600'
               }`}
               title={hasResident ? '该项目有常驻实例运行中' : undefined}
             >

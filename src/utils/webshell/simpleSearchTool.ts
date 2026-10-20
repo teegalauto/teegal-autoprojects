@@ -36,7 +36,7 @@ export async function executeSimpleSearchTool(
 
     const request: SimpleSearchRequest = {
       query: params.query || step.description || '',
-      maxResults: params.maxResults || 5,
+      maxResults: params.maxResults || 10, // DeepSeek 主源按次计费与条数无关，count 提到 10 白赚信息量
       userId,
       conversationId,
     };

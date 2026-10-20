@@ -56,15 +56,15 @@ const PLATFORM_CREDENTIALS: Array<{ name: string; description: string; provider:
 
 // 🔥 系统默认参数：首次打开时自动创建，让用户知道这些参数存在且可调
 const DEFAULT_PARAMS: Array<{ name: string; value: string; description: string }> = [
-  { name: 'maxMessages', value: '15', description: '对话滑动窗口大小（调高总token会增，历史背景更清晰）' },
-  { name: 'clearWindow', value: '6', description: 'subagent完整记忆窗口（调高总token数和缓存命中都会提高，合适值可以完成超长任务）' },
+  { name: 'contextHistoryRounds', value: '5', description: '对话历史窗口的回合数：一个回合=一条用户指令+其引发的全部消息，按值执行（历史回合降维，当前回合全量，调高总token会增）。实测5回合上游缓存命中60%-80%' },
+  { name: 'clearWindow', value: '5', description: 'subagent历史归档批次：每攒N条溢出折叠一批为摘要（N越大缓存命中越高、历史峰值约2N条）' },
   { name: 'maxHistoryChars', value: '60000', description: '执行历史体积预算（字符，超出时自动压缩记忆窗口并提示模型缩小读取范围）' },
   { name: 'updateSourceUrl', value: '', description: '自定义更新源 URL（留空=官方源；填入 GitHub releases URL 可自主迭代，如 https://github.com/USER/REPO/releases/latest/download/）' },
 ];
 
 // 🔥 数值参数的范围约束（正整数）：输入时强制取整，保存时校验范围
 const PARAM_RANGES: Record<string, { min: number; max: number }> = {
-  maxMessages: { min: 5, max: 30 },
+  contextHistoryRounds: { min: 5, max: 30 },
   clearWindow: { min: 3, max: 15 },
   maxHistoryChars: { min: 20000, max: 200000 },
 };
@@ -564,7 +564,7 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
                 id="cred-name"
                 value={form.env_var}
                 onChange={(e) => setForm({ ...form, env_var: e.target.value })}
-                placeholder={form.kind === 'env' ? '如 OPENAI_API_KEY、SSHPASS' : '如 maxMessages、clearWindow'}
+                placeholder={form.kind === 'env' ? '如 OPENAI_API_KEY、SSHPASS' : '如 contextHistoryRounds、clearWindow'}
                 className="h-8 text-sm font-mono"
               />
               <p className="text-xs text-muted-foreground">

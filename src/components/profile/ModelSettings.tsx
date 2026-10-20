@@ -38,6 +38,9 @@ import { Input } from '@/components/ui/input';
 
 import { TokenUsageStats } from './TokenUsageStats';
 
+// 🔥 搜索已切官方 hosted 通道（登录即用，服务端聚合 zhipu/tavily/arxiv），不再向用户开放自定义搜索源配置
+const SEARCH_TAB_ENABLED = false;
+
 interface ModelSettingsProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -754,7 +757,7 @@ export const ModelSettings: React.FC<ModelSettingsProps> = ({
         </DialogHeader>
 
           <Tabs defaultValue={defaultTab} className="flex-1 overflow-hidden flex flex-col">
-            <TabsList className="grid grid-cols-3 w-full">
+            <TabsList className="grid grid-cols-2 w-full">
               <TabsTrigger value="custom" className="flex items-center gap-2 data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=active]:font-semibold">
                 <Settings2 className="h-4 w-4" />
                 {t('profile.modelSettings.tabMyModels')}
@@ -763,10 +766,12 @@ export const ModelSettings: React.FC<ModelSettingsProps> = ({
                 <Link2 className="h-4 w-4" />
                 {t('profile.modelSettings.tabBindings')}
               </TabsTrigger>
-              <TabsTrigger value="search" className="flex items-center gap-2 data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=active]:font-semibold">
-                <Search className="h-4 w-4" />
-                {t('profile.modelSettings.tabSearch')}
-              </TabsTrigger>
+              {SEARCH_TAB_ENABLED && (
+                <TabsTrigger value="search" className="flex items-center gap-2 data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=active]:font-semibold">
+                  <Search className="h-4 w-4" />
+                  {t('profile.modelSettings.tabSearch')}
+                </TabsTrigger>
+              )}
             </TabsList>
 
             <div className="flex-1 overflow-y-auto mt-4 pr-2">
@@ -778,9 +783,11 @@ export const ModelSettings: React.FC<ModelSettingsProps> = ({
                 {renderCustomModelsList()}
               </TabsContent>
 
-              <TabsContent value="search" className="space-y-4 m-0">
-                {renderSearchProvidersList()}
-              </TabsContent>
+              {SEARCH_TAB_ENABLED && (
+                <TabsContent value="search" className="space-y-4 m-0">
+                  {renderSearchProvidersList()}
+                </TabsContent>
+              )}
             </div>
           </Tabs>
 

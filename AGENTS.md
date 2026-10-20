@@ -1,6 +1,8 @@
-# AGENTS.md — base-bootcode 项目 Git 与发布约定
+# AGENTS.md — Teegal 系统源码 Git 与发布约定
 
-本目录是 Teegal 系统自身的完整源码（自举项目）。本文档约束 Agent 在本目录内的 git 操作与版本发布流程。
+本目录是 Teegal 系统自身的完整源码。本文档约束开发环境编码 Agent 在本目录内的 git 操作与版本发布流程。
+
+> 注：base-bootcode「自动 clone 系统源码到用户项目列表」机制已撤下（恢复入口：ChatHeader.tsx 启动 effect 内一行解注）。本文件不随产品进入用户侧，仅约束本仓库的开发工作。
 
 ## 仓库拓扑
 

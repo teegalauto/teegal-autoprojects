@@ -25,6 +25,7 @@ export interface FileHistory {
   fileName: string;        // 文件名，如 main.py
   filePath: string;        // files 目录下的完整路径
   version: FileVersion;    // 上一个 commit 版本
+  changeType?: 'added' | 'modified' | 'deleted';  // 🔥 相对 HEAD 的变更类型（added=新文件绿、modified=修改黄、deleted=删除红）
 }
 
 /**

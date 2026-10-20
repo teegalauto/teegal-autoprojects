@@ -8,7 +8,7 @@
  */
 
 import React, { useState } from 'react';
-import { Loader2, AlertCircle, RefreshCw, Plus, FileText, FolderOpen, FolderInput, X } from 'lucide-react';
+import { Loader2, AlertCircle, RefreshCw, Plus, FileText, FolderOpen, FolderInput, FolderPlus, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { CloneButton } from './components/CloneButton';
@@ -16,7 +16,7 @@ import { FileTreeNode } from './components/FileTreeNode';
 import { ChangeList } from './components/ChangeList';
 import { useFileTree } from './hooks/useFileTree';
 import { FileNode, FileHistory } from './types';
-import { createFile, saveFile, deleteFile, renameFile, getHistoryContent } from './utils';
+import { createFile, createFolder, saveFile, deleteFile, renameFile, getHistoryContent, formatSize } from './utils';
 import { getAppBasePath, getCodePath, setCodePathVerified, getUserDataPath } from '@/utils/apptool/AppPathHelper';
 import { useToast } from '@/hooks/use-toast';
 
@@ -26,7 +26,7 @@ export { FileTreeNode } from './components/FileTreeNode';
 export { ChangeList } from './components/ChangeList';
 export { useFileTree, clearFileTreeCache } from './hooks/useFileTree';
 export { useGitClone } from './hooks/useGitClone';
-export { createFile, saveFile, deleteFile, renameFile, getHistoryContent, getCurrentFileContent } from './utils';
+export { createFile, createFolder, saveFile, deleteFile, renameFile, getHistoryContent, getCurrentFileContent } from './utils';
 
 // 🔥 类型导出
 export type { FileNode, FileHistory, FileOperationResult } from './types';
@@ -58,7 +58,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
 
   const [selectedPath, setSelectedPath] = useState<string>('');
   const [selectedChange, setSelectedChange] = useState<string | null>(null);
-  const [showNewFileInput, setShowNewFileInput] = useState(false);
+  const [newInputMode, setNewInputMode] = useState<'file' | 'folder' | null>(null);
   const [newFileName, setNewFileName] = useState('main.py');
   const [importedPath, setImportedPath] = useState<string | null>(null);
 
@@ -81,12 +81,15 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
 
   const handleFileSelect = (node: FileNode) => {
     setSelectedPath(node.path);
+    // 🔥 目录选中仅作为新建文件/文件夹的落点，不触发编辑器打开
+    if (node.type === 'directory') return;
     setSelectedChange(null); // 🔥 点击当前文件 → 清空变更记录选中
     onFileSelect?.(node);
   };
 
   const handleCloneSuccess = () => {
-    refresh();
+    // 🔥 整个 repo 刚落盘：变更列表强刷（一批 added 需立即入列）
+    refresh({ forceChanges: true });
   };
 
   // 🔥 导入本地项目文件夹（跨平台：Windows/macOS 的 openDirectory 对话框）
@@ -155,17 +158,50 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
     }
   };
 
-  const handleCreateFile = async () => {
+  // 🔥 解析新建目标目录：选中目录 → 该目录；选中文件 → 其父目录；无选中 → 根目录
+  const resolveTargetDir = (): string => {
+    if (!selectedPath) return '';
+    const find = (nodes: FileNode[]): FileNode | null => {
+      for (const n of nodes) {
+        if (n.path === selectedPath) return n;
+        if (n.children) {
+          const r = find(n.children);
+          if (r) return r;
+        }
+      }
+      return null;
+    };
+    const found = find(files);
+    if (!found) return '';
+    if (found.type === 'directory') return found.relativePath || found.name;
+    const parts = (found.relativePath || found.name).split('/');
+    parts.pop();
+    return parts.join('/');
+  };
+
+  const handleCreateNew = async () => {
     if (!newFileName.trim()) return;
 
-    const result = await createFile(appId, newFileName.trim());
+    const dir = resolveTargetDir();
+    const targetName = dir ? `${dir}/${newFileName.trim()}` : newFileName.trim();
+
+    const result = newInputMode === 'folder'
+      ? await createFolder(appId, targetName)
+      : await createFile(appId, targetName);
+
     if (result.success) {
-      console.log('[FileTree] 创建文件成功:', newFileName);
-      setNewFileName('main.py');
-      setShowNewFileInput(false);
-      refresh();
+      console.log('[FileTree] 创建成功:', targetName, newInputMode === 'folder' ? '(目录)' : '(文件)');
+      setNewFileName(newInputMode === 'folder' ? '' : 'main.py');
+      setNewInputMode(null);
+      // 🔥 落点目录未展开时自动展开，让用户立刻看到新建结果（新建=新变更，强刷列表）
+      if (dir && !isDirExpanded(dir)) {
+        await refresh({ forceChanges: true });
+        toggleDir(dir);
+      } else {
+        await refresh({ forceChanges: true });
+      }
     } else {
-      console.error('[FileTree] 创建文件失败:', result.error);
+      console.error('[FileTree] 创建失败:', result.error);
     }
   };
 
@@ -189,7 +225,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
           variant="outline"
           size="sm"
           className="w-full h-7"
-          onClick={refresh}
+          onClick={() => refresh()}
         >
           <RefreshCw className="w-3 h-3 mr-1" />
           {t('workspace.desktopModule.fileTree.retry')}
@@ -221,10 +257,22 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
               variant="ghost"
               size="sm"
               className="h-5 px-1"
-              onClick={() => setShowNewFileInput(!showNewFileInput)}
+              onClick={() => setNewInputMode(newInputMode === 'file' ? null : 'file')}
               title={t('workspace.desktopModule.fileTree.newFile')}
             >
               <Plus className="w-3 h-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 px-1"
+              onClick={() => {
+                setNewFileName('');
+                setNewInputMode(newInputMode === 'folder' ? null : 'folder');
+              }}
+              title={t('workspace.desktopModule.fileTree.newFolder')}
+            >
+              <FolderPlus className="w-3 h-3" />
             </Button>
           </div>
         </div>
@@ -246,27 +294,31 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
           </div>
         )}
 
-        {/* 新建文件输入框 */}
-        {showNewFileInput && (
+        {/* 新建文件/文件夹输入框 */}
+        {newInputMode && (
           <div className="flex items-center gap-1 mb-2 px-1">
-            <FileText className="w-3 h-3 text-gray-400" />
+            {newInputMode === 'folder'
+              ? <FolderPlus className="w-3 h-3 text-gray-400" />
+              : <FileText className="w-3 h-3 text-gray-400" />}
             <input
               type="text"
               value={newFileName}
               onChange={(e) => setNewFileName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') handleCreateFile();
-                if (e.key === 'Escape') setShowNewFileInput(false);
+                if (e.key === 'Enter') handleCreateNew();
+                if (e.key === 'Escape') setNewInputMode(null);
               }}
               className="flex-1 text-xs bg-transparent border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 focus:outline-none focus:border-blue-500"
-              placeholder={t('workspace.desktopModule.fileTree.fileNamePlaceholder')}
+              placeholder={newInputMode === 'folder'
+                ? t('workspace.desktopModule.fileTree.folderNamePlaceholder')
+                : t('workspace.desktopModule.fileTree.fileNamePlaceholder')}
               autoFocus
             />
             <Button
               variant="ghost"
               size="sm"
               className="h-5 px-1"
-              onClick={handleCreateFile}
+              onClick={handleCreateNew}
             >
               <Plus className="w-3 h-3" />
             </Button>
@@ -348,7 +400,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
 
   const [selectedPath, setSelectedPath] = useState<string>('');
   const [selectedChange, setSelectedChange] = useState<string | null>(null);
-  const [showNewFileInput, setShowNewFileInput] = useState(false);
+  const [newInputMode, setNewInputMode] = useState<'file' | 'folder' | null>(null);
   const [newFileName, setNewFileName] = useState('main.py');
   const [importedPath, setImportedPath] = useState<string | null>(null);
   const hasAutoSelected = React.useRef(false); // 🔥 防止重复自动选择
@@ -440,6 +492,18 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
     setSelectedPath(node.path);
     setSelectedChange(null); // 🔥 点击当前文件 → 清空变更记录选中
     if (node.type === 'file') {
+      // 🔥 超大文件不读内容（保命层）：读入几十 MB 的二进制/日志会把渲染进程卡死——
+      // 选中高亮 + 提示即可，内容置空；不支持的类型（.pt 等）由上层渲染兜底提示页
+      const MAX_PREVIEW_SIZE = 2 * 1024 * 1024; // 2MB
+      if (node.size && node.size > MAX_PREVIEW_SIZE) {
+        onFileSelect(node.path, '');
+        toast({
+          title: t('workspace.desktopModule.fileTree.fileTooLargeTitle'),
+          description: t('workspace.desktopModule.fileTree.fileTooLargeDesc', { size: formatSize(node.size) }),
+          variant: 'destructive',
+        });
+        return;
+      }
       // 🔥 读取文件内容
       try {
         const electron = (window as any).electron;
@@ -511,17 +575,50 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
     }
   };
 
-  const handleCreateFile = async () => {
+  // 🔥 解析新建目标目录：选中目录 → 该目录；选中文件 → 其父目录；无选中 → 根目录
+  const resolveTargetDir = (): string => {
+    if (!selectedPath) return '';
+    const find = (nodes: FileNode[]): FileNode | null => {
+      for (const n of nodes) {
+        if (n.path === selectedPath) return n;
+        if (n.children) {
+          const r = find(n.children);
+          if (r) return r;
+        }
+      }
+      return null;
+    };
+    const found = find(files);
+    if (!found) return '';
+    if (found.type === 'directory') return found.relativePath || found.name;
+    const parts = (found.relativePath || found.name).split('/');
+    parts.pop();
+    return parts.join('/');
+  };
+
+  const handleCreateNew = async () => {
     if (!newFileName.trim()) return;
 
-    const result = await createFile(appId, newFileName.trim());
+    const dir = resolveTargetDir();
+    const targetName = dir ? `${dir}/${newFileName.trim()}` : newFileName.trim();
+
+    const result = newInputMode === 'folder'
+      ? await createFolder(appId, targetName)
+      : await createFile(appId, targetName);
+
     if (result.success) {
-      console.log('[FileTree] 创建文件成功:', newFileName);
-      setNewFileName('main.py');
-      setShowNewFileInput(false);
-      refresh();
+      console.log('[FileTree] 创建成功:', targetName, newInputMode === 'folder' ? '(目录)' : '(文件)');
+      setNewFileName(newInputMode === 'folder' ? '' : 'main.py');
+      setNewInputMode(null);
+      // 🔥 落点目录未展开时自动展开，让用户立刻看到新建结果（新建=新变更，强刷列表）
+      if (dir && !isDirExpanded(dir)) {
+        await refresh({ forceChanges: true });
+        toggleDir(dir);
+      } else {
+        await refresh({ forceChanges: true });
+      }
     } else {
-      console.error('[FileTree] 创建文件失败:', result.error);
+      console.error('[FileTree] 创建失败:', result.error);
     }
   };
 
@@ -545,7 +642,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
           variant="outline"
           size="sm"
           className="w-full h-7"
-          onClick={refresh}
+          onClick={() => refresh()}
         >
           <RefreshCw className="w-3 h-3 mr-1" />
           {t('workspace.desktopModule.fileTree.retry')}
@@ -586,10 +683,22 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
               variant="ghost"
               size="sm"
               className="h-5 px-1"
-              onClick={() => setShowNewFileInput(!showNewFileInput)}
+              onClick={() => setNewInputMode(newInputMode === 'file' ? null : 'file')}
               title={t('workspace.desktopModule.fileTree.newFile')}
             >
               <Plus className="w-3 h-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 px-1"
+              onClick={() => {
+                setNewFileName('');
+                setNewInputMode(newInputMode === 'folder' ? null : 'folder');
+              }}
+              title={t('workspace.desktopModule.fileTree.newFolder')}
+            >
+              <FolderPlus className="w-3 h-3" />
             </Button>
           </div>
         </div>
@@ -611,27 +720,31 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
           </div>
         )}
 
-        {/* 新建文件输入框 */}
-        {showNewFileInput && (
+        {/* 新建文件/文件夹输入框 */}
+        {newInputMode && (
           <div className="flex items-center gap-1 mb-2 px-1">
-            <FileText className="w-3 h-3 text-gray-400" />
+            {newInputMode === 'folder'
+              ? <FolderPlus className="w-3 h-3 text-gray-400" />
+              : <FileText className="w-3 h-3 text-gray-400" />}
             <input
               type="text"
               value={newFileName}
               onChange={(e) => setNewFileName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') handleCreateFile();
-                if (e.key === 'Escape') setShowNewFileInput(false);
+                if (e.key === 'Enter') handleCreateNew();
+                if (e.key === 'Escape') setNewInputMode(null);
               }}
               className="flex-1 text-xs bg-transparent border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 focus:outline-none focus:border-blue-500"
-              placeholder={t('workspace.desktopModule.fileTree.fileNamePlaceholder')}
+              placeholder={newInputMode === 'folder'
+                ? t('workspace.desktopModule.fileTree.folderNamePlaceholder')
+                : t('workspace.desktopModule.fileTree.fileNamePlaceholder')}
               autoFocus
             />
             <Button
               variant="ghost"
               size="sm"
               className="h-5 px-1"
-              onClick={handleCreateFile}
+              onClick={handleCreateNew}
             >
               <Plus className="w-3 h-3" />
             </Button>

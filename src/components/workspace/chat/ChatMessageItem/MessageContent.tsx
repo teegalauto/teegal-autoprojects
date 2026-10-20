@@ -159,7 +159,9 @@ const fixOrphanedBlockMath = (text: string): string => {
 // 1. 保护代码块/行内代码/块级公式 $$..$$/已转义 \$
 // 2. 相邻配对单 $...$
 // 3. 校验内容是否真像行内公式（isLikelyInlineMath）
-// 4. 不像 → 该 $ 转义为 \$（remark-math 不再配对，原样显示）
+// 4. 不像 → 该 $ 转义为 \$（remark-math 不再配对，原样显示）；
+//    🔥 例外：内容是纯数字（$8$、$1.5$）→ 剥掉 $ 显示数字本身——LLM 习惯性用 $ 包数字，
+//    转义显示会残留 "$8$"，用户不想看到任何 $ 符号
 const isLikelyInlineMath = (content: string): boolean => {
   const trimmed = content.trim();
   if (!trimmed || trimmed.length > 120) return false;
@@ -208,6 +210,7 @@ const fixOrphanedInlineMath = (text: string): string => {
 
   // 相邻配对 + 校验；通过则跳过一对，不通过则转义该 $（防止与远处配对吞文本）
   const escapeSet = new Set<number>();
+  const stripSet = new Set<number>(); // 🔥 纯数字包裹对：两个 $ 都直接删除
   let i = 0;
   while (i < positions.length) {
     const j = i + 1;
@@ -218,17 +221,24 @@ const fixOrphanedInlineMath = (text: string): string => {
     const content = result.substring(positions[i] + 1, positions[j]);
     if (isLikelyInlineMath(content)) {
       i = j + 1;
+    } else if (/^\d+(?:\.\d+)?$/.test(content.trim())) {
+      // 🔥 $8$ 纯数字包裹：剥离两个 $，显示数字本身
+      stripSet.add(i);
+      stripSet.add(j);
+      i = j + 1;
     } else {
       escapeSet.add(i);
       i++;
     }
   }
 
-  // 从后往前转义，避免位置偏移
+  // 从后往前处理，避免位置偏移
   let output = result;
   for (let k = positions.length - 1; k >= 0; k--) {
-    if (escapeSet.has(k)) {
-      const pos = positions[k];
+    const pos = positions[k];
+    if (stripSet.has(k)) {
+      output = output.substring(0, pos) + output.substring(pos + 1);
+    } else if (escapeSet.has(k)) {
       output = output.substring(0, pos) + '\\$' + output.substring(pos + 1);
     }
   }
@@ -438,6 +448,38 @@ const downgradeInlineDisplayMath = (text: string): string => {
   return result;
 };
 
+// 🔥 清除 LLM 自主输出的装饰性分隔线：━━━━━、═══、——— 等纯装饰字符行
+// LLM 常用 box-drawing 字符做「终端风」小节装饰（━━━\n【❌ 标题】\n━━━），
+// Markdown 没有横幅语法，整行渲染为字面文字，视觉突兀。纯装饰行直接删除，
+// 标题行（【...】带括号和 emoji）保留，突出效果由内容本身承担。
+// 只处理非 ASCII 装饰字符（U+2500-U+257F box drawing、—―）；ASCII 的 ---/===
+// 是合法 markdown 语法（分隔线/setext 标题），交给 remark 处理。
+const stripDecorativeSeparators = (text: string): string => {
+  if (!/[\u2500-\u257F—―]/.test(text)) return text;
+
+  const placeholders: string[] = [];
+  let phId = 0;
+  const protect = (content: string): string => {
+    placeholders.push(content);
+    return `\x00DS${phId++}\x00`;
+  };
+
+  // 代码块/行内代码里的 ━━ 是终端输出原貌，不能动
+  let result = text
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/`[^`]+`/g, protect);
+
+  result = result
+    .split('\n')
+    .filter((line) => !/^\s*[\u2500-\u257F—―]{3,}\s*$/.test(line))
+    .join('\n');
+
+  result = result.replace(/\x00DS(\d+)\x00/g, (_, idx) => {
+    return placeholders[parseInt(idx)];
+  });
+  return result;
+};
+
 // 🔥 统一的消息文本预处理管道（content 和 result 共用，保证行为一致）
 const preprocessMessageText = (text: string): string => {
   return preprocessNumericRanges(
@@ -447,7 +489,7 @@ const preprocessMessageText = (text: string): string => {
           preprocessBareMath(
             preprocessLatexFormulas(
               preprocessMarkdownTables(
-                preprocessUrls(text)
+                preprocessUrls(stripDecorativeSeparators(text))
               )
             )
           )
@@ -591,6 +633,17 @@ const preprocessMarkdownTables = (text: string): string => {
     }
 
     if (rows.length < 2) { i++; continue; }
+
+    // 🔥 表头错位修复：LLM 写对比表常把左上角空表头放行尾（| A | B | |），
+    // 数据行却是「维度名 | A值 | B值」正确对齐 → 渲染后首列表头被 A 占用、末列表头空白，
+    // 用户对照数据会搞蒙。判定：表头尾部空 + 首列非空 + 数据行确实占满全部列 → 空位旋转到行首
+    const header = rows[0];
+    const tailEmpty = header[header.length - 1] === '';
+    const dataUsesAllCols = rows.slice(1).some(r => r[r.length - 1] !== '');
+    if (tailEmpty && header[0] !== '' && dataUsesAllCols) {
+      header.pop();
+      header.unshift('');
+    }
 
     // 重建表格：空行 + header + separator + data + 空行
     const separator = '|' + Array(cols).fill('---').join('|') + '|';

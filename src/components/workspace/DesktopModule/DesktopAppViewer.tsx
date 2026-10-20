@@ -10,6 +10,7 @@ import {
   PdfViewer, isPdfFile,
   OfficeViewer, isOfficeFile,
   AudioViewer, isAudioFile,
+  UnsupportedViewer, isUnsupportedPreviewFile,
 } from './viewers';
 import { LegacyFileTree, saveFile, getHistoryContent, getCurrentFileContent } from './FileTree/index';
 import { Button } from '@/components/ui/button';
@@ -25,7 +26,7 @@ import { trainingTaskStorage } from '@/services/storage';
 import { getBackendUrl } from '@/config/api';
 import { appDatabaseService } from '@/utils/apptool/AppDatabaseService';
 import GPUSelectorDialog from './GPUSelectorDialog';
-import SSHSelectorDialog, { SshSpecOption } from './SSHSelectorDialog';
+import SSHSelectorDialog, { SshSpecOption, prepaidTotalPrice } from './SSHSelectorDialog';
 import { sshOpenInstance } from '@/utils/systemtools/sshInstance';
 import { isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { ECSWebSocketManager } from '@/utils/workspace/ECSWebSocketManager';
@@ -733,16 +734,17 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
     setPreviewContent('');
     
     try {
-      const codeContent = getCodeContent(codeRef.current);
+      // 🔥 云端训练/运行以整个项目为单位（appId → 拉全项目 zip + 入口探测），不传编辑器内容——
+      // 与 run_project_oncloud 工具同链路同契约；项目文件以已保存为准，改了代码先保存再跑
       const taskId = crypto.randomUUID();
 
       const executeWithGpu = async (gpuOption: any) => {
         setIsRunning(true);
         setIsGpuTaskRunning(true);
-        setGpuTaskStatus('pending'); 
+        setGpuTaskStatus('pending');
 
         try {
-          console.log(`🚀 [FRONTEND] 发起 GPU 执行: ${gpuOption.provider} - ${gpuOption.instanceType}, TaskId: ${taskId}`);
+          console.log(`🚀 [FRONTEND] 发起 GPU 执行: ${gpuOption.provider} - ${gpuOption.instanceType}, TaskId: ${taskId}, 模式: 整个项目`);
           setTimeout(() => historyListRef.current?.refresh(), 2000);
 
           const result = await appExecutionService.execute({
@@ -751,7 +753,6 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
             isGpu: true,
             gpuInstanceType: gpuOption.instanceType,
             gpuProvider: gpuOption.provider,
-            code: codeContent,
             config: appConfig,
           });
           
@@ -801,16 +802,16 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
 
   // 🔥 SSHRun：开机常驻实例（长期租赁，区别于 Train/Run 跑完即销毁）
   // 只做触点：核心逻辑统一走 sshOpenInstance（与 LLM ssh_instance 工具同一条链路）
-  const handleSshBoot = async (spec: SshSpecOption) => {
+  const handleSshBoot = async (spec: SshSpecOption, months?: number) => {
     setShowSshSelector(false);
     if (isSshBooting) return;
     setIsSshBooting(true);
     try {
-      const r = await sshOpenInstance({ instanceType: spec.instanceType, projectId: appId, userId });
+      const r = await sshOpenInstance({ instanceType: spec.instanceType, projectId: appId, userId, months });
       if (r.ok && r.instance) {
         toast({
           title: r.sshReady === false ? '云端实例已开机（免密探测未通过，稍等 1-2 分钟）' : '云端常驻实例已就绪',
-          description: `IP: ${r.instance.public_ip}（${r.instance.instance_type}）。上传文件与运行交给 agent 编排即可，用完记得关机。`,
+          description: `IP: ${r.instance.public_ip}（${r.instance.instance_type}）。${months ? `${months} 个月长租已预付 ${prepaidTotalPrice(spec.pricePerHour, months, spec.instanceType).toFixed(2)} 积分，到期自动关机。` : '上传文件与运行交给 agent 编排即可，用完记得关机。'}`,
         });
         refreshResidentIndicator();
       } else {
@@ -904,6 +905,16 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
 
     // 🔥 图片/视频等二进制文件跳过文本内容处理，由专用 Viewer 自行读取
     if (isImageFile(relativePath) || isVideoFile(relativePath)) {
+      setIsEditorExpanded(true);
+      setIsPreviewExpanded(false);
+      return;
+    }
+
+    // 🔥 不可渲染类型（模型权重/压缩包/二进制等，如 best.pt）→ 兜底提示页，绝不把内容读入编辑器
+    // （大文件一旦读入 Monaco 会卡死渲染进程；"不能死机"是底线）
+    if (isUnsupportedPreviewFile(relativePath)) {
+      handleCodeChange('');
+      setPreviousCode('');
       setIsEditorExpanded(true);
       setIsPreviewExpanded(false);
       return;
@@ -1193,6 +1204,8 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
                   filePath={selectedFilePath}
                   fileName={currentFileName}
                 />
+              ) : isUnsupportedPreviewFile(currentFileName) ? (
+                <UnsupportedViewer fileName={currentFileName} />
               ) : (
               <CodeEditor
                 currentCode={code}
@@ -1366,6 +1379,7 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
             setShowRechargeDialog(true);
           }}
           userId={userId}
+          onBalanceChanged={refreshBalance}
         />
 
         {/* 🔥 充值弹窗 - 移到条件块外，全屏时也能显示 */}

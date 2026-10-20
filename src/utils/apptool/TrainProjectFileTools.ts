@@ -10,8 +10,7 @@
  * - delete_project_file: 删除文件
  *
  * 🔥 训练任务工具：
- * - list_train_tasks: 列出训练任务
- * - get_train_task_detail: 获取训练任务详情
+ * - list_train_tasks / get_train_task_detail: 已合并入 TaskHistoryTools（list_tasks / get_task_detail，本文件执行器仍保留供分发）
  * - stop_gpu_train: 停止 GPU 训练
  * - upsert_project: 创建/更新项目（不带 projectId=创建；带 projectId=更新 name/description）
  */
@@ -23,6 +22,7 @@ import { desktopAppEventService } from '@/services/events/DesktopAppEventService
 import { v4 as uuidv4 } from 'uuid';
 import { getUserDataPath, getAppBasePath, getAppHistoryPath, getCodePath } from './AppPathHelper';
 import { resolveProjectId } from './ProjectIdResolver';
+import { DOC_PARSE_EXTS, BINARY_TRAP_EXTS, parseDocFile, docReadError } from './docParser';
 
 // ============================================================================
 // 🔥 更新 app 的 updatedAt（touch 活跃度），使经常使用的项目排在列表前面
@@ -304,6 +304,175 @@ function getLanguage(ext: string): string {
 }
 
 // ============================================================================
+// 🔥 文件骨架（活地图）
+// ============================================================================
+
+const OUTLINE_MAX_DEFS = 60;      // 最多列出的顶层定义数（超出省略，防大文件骨架膨胀）
+const OUTLINE_LINE_MAX_CHARS = 80; // 单条签名截断长度
+
+// 🔥 顶层定义识别正则（单文件骨架 与 项目符号索引 skeleton 共用）
+const OUTLINE_DEF_PATTERNS: Record<string, RegExp[]> = {
+  py: [
+    /^(async\s+def|def|class)\s+\w/,   // 顶层定义（无缩进，类方法不进骨架保持小）
+    /^if\s+__name__/,
+  ],
+  ts: [
+    /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*\w/,
+    /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+\w/,
+    /^(?:export\s+)?(?:interface|enum)\s+\w/,
+    /^(?:export\s+)?type\s+\w+\s*=/,
+    /^(?:export\s+)?const\s+\w+[^=\n]*=\s*(?:async\s+)?(?:function\b|\()/, // 箭头函数/组件形态
+  ],
+  go: [
+    /^func\s+(?:\([^)]*\)\s*)?\w/,
+    /^type\s+\w+\s+(?:struct|interface)\b/,
+  ],
+};
+OUTLINE_DEF_PATTERNS.tsx = OUTLINE_DEF_PATTERNS.ts;
+OUTLINE_DEF_PATTERNS.jsx = OUTLINE_DEF_PATTERNS.js;
+const OUTLINE_CODE_EXTS = Object.keys(OUTLINE_DEF_PATTERNS);
+
+/**
+ * 抓顶层定义行（行号+签名原文）。扩展名不认识返回 null（调用方不附骨架）；
+ * 认识但抓不到定义返回空 defs（totalLines 仍有效，项目索引场景只列文件名）。
+ */
+function extractDefs(
+  content: string,
+  ext: string,
+  maxChars = OUTLINE_LINE_MAX_CHARS
+): { defs: string[]; totalLines: number } | null {
+  const patterns = OUTLINE_DEF_PATTERNS[ext.toLowerCase()];
+  if (!patterns) return null;
+
+  const lines = content.split('\n');
+  const defs: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (patterns.some((re) => re.test(line))) {
+      const text = line.length > maxChars ? line.slice(0, maxChars) + '…' : line;
+      defs.push(`${i + 1} ${text.trim()}`);
+    }
+  }
+  return { defs, totalLines: lines.length };
+}
+
+/**
+ * 抓顶层定义行（行号+签名原文），LLM 一次掌握文件全局，省"读完→觉得不够→再读"的往返轮次。
+ * 保守策略：按扩展名选正则，语言不认识或抓不到 → 返回空串（不附），宁可缺失不可错误。
+ * 附挂时机：pattern 命中 / pattern 未命中报错 / 整读截断（整读到位时内容全有，不附）。
+ */
+function buildFileOutline(content: string, ext: string): string {
+  const extracted = extractDefs(content, ext);
+  if (!extracted || extracted.defs.length === 0) return ''; // 语言不认识或抓不到 → 不附
+
+  const lines = content.split('\n');
+
+  // imports 区间：头部最后一行 import 的行号（集中头部，只扫前 200 行）
+  const importRe = /^(?:import\b|from\s+\S+\s+import\b|const\s+\w+\s*=\s*require\(|using\s+\w+)/;
+  let lastImport = 0;
+  for (let i = 0; i < lines.length && i < 200; i++) {
+    if (importRe.test(lines[i])) lastImport = i + 1;
+  }
+
+  const parts: string[] = [`🗺 文件结构（共 ${lines.length} 行）:`];
+  if (lastImport > 0) parts.push(`  1-${lastImport} imports`);
+  parts.push(...extracted.defs.slice(0, OUTLINE_MAX_DEFS).map((d) => `  ${d}`));
+  if (extracted.defs.length > OUTLINE_MAX_DEFS) {
+    parts.push(`  …（其余 ${extracted.defs.length - OUTLINE_MAX_DEFS} 个定义省略，可按行号 offset 读取）`);
+  }
+  return parts.join('\n');
+}
+
+// ============================================================================
+// 🔥 项目符号索引（skeleton 模式）：整项目骨架，每代码文件一行
+// ============================================================================
+
+const SKELETON_MAX_FILES = 300;             // 最多索引的代码文件数（超出提示缩小范围）
+const SKELETON_MAX_FILE_CHARS = 200 * 1024; // 单文件超此大小跳过（数据/生成文件）
+const SKELETON_DEF_MAX_CHARS = 40;          // 项目级签名截短（比单文件骨架 80 更紧）
+const SKELETON_MAX_MESSAGE = 12000;         // 输出预算：与 read_project_file 整读上限对齐（单回执过大会叠加并行调用撑爆 prompt，60KB+ 会触发网关 502）
+
+/**
+ * 遍历文件树收集代码文件，分批并发读取后抓顶层定义，每文件压成一行：
+ *   supervised.py (412行): 18 class TrainConfig | 48 def load_data
+ * 行号可直接用于 read_project_file 的 offset/pattern 精读。
+ * 实时现算（本地文件+正则，毫秒~百毫秒级），不做缓存——文件一改缓存即脏，失效逻辑不划算。
+ */
+async function buildProjectSkeleton(files: FileNode[], filesDir: string): Promise<string> {
+  const electron = (window as any).electron;
+
+  // 先序遍历收集代码文件（树序=目录组织），顺带统计非代码文件。
+  // ext 缺失时从文件名兜底推断
+  const codeFiles: FileNode[] = [];
+  let nonCodeCount = 0;
+  const collect = (nodes: FileNode[]) => {
+    for (const node of nodes) {
+      if (node.type === 'file') {
+        const ext = (node.ext || node.name.split('.').pop() || '').toLowerCase();
+        if (OUTLINE_CODE_EXTS.includes(ext)) codeFiles.push(node);
+        else nonCodeCount++;
+      } else if (node.children) {
+        collect(node.children);
+      }
+    }
+  };
+  collect(files);
+
+  const truncatedFiles = codeFiles.length > SKELETON_MAX_FILES;
+  const workList = codeFiles.slice(0, SKELETON_MAX_FILES);
+
+  const rows: string[] = [];
+  let totalDefs = 0;
+  let totalLines = 0;
+  let skippedBig = 0;
+  let failed = 0;
+
+  // 分批并发读（每批 50）
+  const CHUNK = 50;
+  for (let i = 0; i < workList.length; i += CHUNK) {
+    const batch = workList.slice(i, i + CHUNK);
+    const results = await Promise.all(batch.map(async (node) => {
+      try {
+        const fullPath = `${filesDir}\\${node.relativePath.replace(/\//g, '\\')}`;
+        const r = await electron.userpcFile.read(fullPath);
+        return r?.success ? (r.data?.content || '') : null;
+      } catch {
+        return null;
+      }
+    }));
+    for (let j = 0; j < batch.length; j++) {
+      const node = batch[j];
+      const content = results[j];
+      if (content === null) { failed++; continue; }
+      if (content.length > SKELETON_MAX_FILE_CHARS) { skippedBig++; continue; }
+      const ext = (node.ext || node.name.split('.').pop() || '').toLowerCase();
+      const extracted = extractDefs(content, ext, SKELETON_DEF_MAX_CHARS);
+      if (!extracted) continue; // 理论不可达（collect 已按扩展名筛），防御性跳过
+      totalLines += extracted.totalLines;
+      if (extracted.defs.length === 0) {
+        rows.push(`  ${node.relativePath} (${extracted.totalLines}行)`); // 无顶层定义：只列名+行数
+      } else {
+        totalDefs += extracted.defs.length;
+        rows.push(`  ${node.relativePath} (${extracted.totalLines}行): ${extracted.defs.join(' | ')}`);
+      }
+    }
+  }
+
+  const parts: string[] = [`🗺 项目符号索引（代码文件 ${codeFiles.length} 个 / 定义 ${totalDefs} 个 / 共 ${totalLines} 行）:`];
+  parts.push(...rows);
+  if (nonCodeCount > 0) parts.push(`—— 另有 ${nonCodeCount} 个非代码文件，用 tree 模式查看 ——`);
+  if (failed > 0) parts.push(`—— ${failed} 个文件读取失败已跳过 ——`);
+  if (skippedBig > 0) parts.push(`—— 跳过 ${skippedBig} 个超大文件（>200KB）——`);
+  if (truncatedFiles) parts.push(`⚠️ 代码文件过多，仅索引前 ${SKELETON_MAX_FILES} 个，建议用 depth 缩小范围或对子目录单独调用`);
+
+  let message = parts.join('\n');
+  if (message.length > SKELETON_MAX_MESSAGE) {
+    message = message.slice(0, SKELETON_MAX_MESSAGE) + '\n⚠️ 索引过长已截断，建议用 depth 缩小范围或对子目录单独调用';
+  }
+  return message;
+}
+
+// ============================================================================
 // 工具实现
 // ============================================================================
 
@@ -487,79 +656,6 @@ async function searchFileContents(files: FileNode[], query: string): Promise<str
 }
 
 /**
- * 🔥 overview 模式：构建项目线索文件概览（README + 关键配置 + 入口候选 + 探索策略）
- * 让 LLM 一次调用就理解项目是干啥的、入口在哪，无需逐层遍历文件树
- */
-async function buildProjectOverview(files: FileNode[], fileCount: number): Promise<string> {
-  const electron = (window as any).electron;
-  const parts: string[] = [];
-
-  // 🔥 递归收集所有文件节点（带相对路径）
-  const allNodes: { node: FileNode; relPath: string }[] = [];
-  const collect = (nodes: FileNode[], parentRel: string) => {
-    for (const node of nodes) {
-      const rel = parentRel ? `${parentRel}/${node.name}` : node.name;
-      if (node.type === 'file') allNodes.push({ node, relPath: rel });
-      if (node.children) collect(node.children, rel);
-    }
-  };
-  collect(files, '');
-
-  // 🔥 关键线索文件优先级：README > 依赖配置 > 入口候选
-  const readmeEntry = allNodes.find(n => /^readme/i.test(n.node.name));
-  const CONFIG_FILES = ['package.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'go.mod', 'Cargo.toml', 'environment.yml', 'pom.xml'];
-  const configEntries = allNodes.filter(n => CONFIG_FILES.includes(n.node.name.toLowerCase()));
-  const ENTRY_PATTERNS = ['main.py', 'app.py', 'run.py', 'server.py', 'manage.py', 'index.js', 'index.ts', 'app.js', 'app.ts', 'main.ts', 'cli.py'];
-  const entryEntries = allNodes.filter(n => ENTRY_PATTERNS.includes(n.node.name.toLowerCase()));
-
-  parts.push(`项目共 ${fileCount} 个文件。关键线索：`);
-
-  // 🔥 读文件辅助（读取失败静默跳过，不阻塞概览）
-  const readFileSafe = async (absPath: string, maxLen: number): Promise<string | null> => {
-    try {
-      const r = await electron?.userpcFile?.read?.(absPath);
-      if (r?.success && r?.data?.content) return r.data.content.slice(0, maxLen);
-    } catch (e) { /* ignore */ }
-    return null;
-  };
-
-  // 1. README 摘要（过滤 badge/图片行）
-  if (readmeEntry) {
-    const content = await readFileSafe(readmeEntry.node.path, 4000);
-    if (content) {
-      const summary = content
-        .split('\n')
-        .filter((l: string) => !l.trim().startsWith('![') && !l.trim().startsWith('<img'))
-        .slice(0, 40)
-        .join('\n')
-        .slice(0, 1200);
-      parts.push(`\n## ${readmeEntry.node.name}（摘要）\n${summary}`);
-    }
-  }
-
-  // 2. 依赖配置（截断展示，package.json 的 scripts/dependencies 最关键）
-  for (const cfg of configEntries.slice(0, 3)) {
-    const content = await readFileSafe(cfg.node.path, 1500);
-    if (content) {
-      parts.push(`\n## ${cfg.relPath}\n${content}`);
-    }
-  }
-
-  // 3. 入口候选
-  if (entryEntries.length > 0) {
-    parts.push(`\n## 入口文件候选\n${entryEntries.map(e => `- ${e.relPath}`).join('\n')}`);
-  }
-
-  // 4. 探索策略
-  parts.push(`\n## 推荐探索策略
-1) 已知项目性质后，用 mode='search' 按关键词定位具体实现文件（返回同级+上级上下文）
-2) 用 read_project_file 的 pattern 参数在单文件内搜索关键类/函数
-3) 需要整体结构时再用 mode='tree'（depth 建议从 2 开始）`);
-
-  return parts.join('\n');
-}
-
-/**
  * 列出训练项目的文件树
  * 
  * @param step - AutoStep
@@ -627,19 +723,20 @@ export async function executeListProjectFilesTool(
     };
     const fileCount = countFiles(files);
 
-    // 🔥 阅读模式分发：tree（默认，纯文件树）/ overview（关键线索文件）/ search（按文件名搜索+局部上下文）
+    // 🔥 阅读模式分发：tree（默认，纯文件树）/ search（按文件名搜索+局部上下文）/ skeleton（项目符号索引）
     // 容错：只传了 query 没传 mode 时，自动按 search 处理（传什么参数就是什么模式）
     let mode = String(params?.mode || (params?.query ? 'search' : 'tree')).toLowerCase();
-    if (mode !== 'tree' && mode !== 'overview' && mode !== 'search') {
-      mode = params?.query ? 'search' : 'tree'; // 未知 mode 值兜底
+    if (mode !== 'tree' && mode !== 'search' && mode !== 'skeleton') {
+      mode = params?.query ? 'search' : 'tree'; // 未知 mode 值兜底（含历史 overview，归默认 tree）
     }
     const query = params?.query ? String(params.query).trim() : '';
 
-    if (mode === 'overview') {
-      const overviewMessage = await buildProjectOverview(files, fileCount);
+    if (mode === 'skeleton') {
+      console.log(`[LIST-FILES] 项目符号索引: ${fileCount} 个文件（含非代码）`);
+      const skeletonMessage = await buildProjectSkeleton(files, filesDir);
       return {
         success: true,
-        data: { type: 'overview', appId: fullAppId, fileCount, message: overviewMessage },
+        data: { type: 'skeleton', appId: fullAppId, fileCount, message: skeletonMessage },
       };
     }
 
@@ -709,7 +806,7 @@ export async function executeListProjectFilesTool(
 
     // 🔥 大项目指引：指向其他阅读模式，避免 LLM 逐层遍历文件树
     if (fileCount > 30) {
-      treeMessage += `\n\n💡 这是大项目（${fileCount}个文件）。建议：mode='overview' 看关键线索文件（README/配置/入口）；mode='search', query='关键词' 按文件名搜索定位。`;
+      treeMessage += `\n\n💡 这是大项目（${fileCount}个文件）。建议：mode='skeleton' 看全项目定义索引；mode='search', query='关键词' 按文件名/内容搜索定位。`;
     }
 
     // 🔥 不再返回扁平路径数组 files[]
@@ -765,8 +862,15 @@ export async function executeReadProjectFileTool(
   let filePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
   console.log(`[READ-FILE] 🔍 提取 filePath: ${filePath}`);
 
-  // 🔥 提取可选的搜索参数
-  const pattern = params?.pattern || params?.search || params?.query;
+  // 🔥 提取可选的搜索参数：字符串=单个（正则语义，可写 a|b|c）；数组=多关键词（逐个转义后拼 OR 正则）
+  const patternRaw = params?.pattern || params?.search || params?.query;
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = Array.isArray(patternRaw)
+    ? patternRaw
+        .filter((k: any) => typeof k === 'string' && k.trim())
+        .map((k: string) => escapeRegExp(k.trim()))
+        .join('|')
+    : patternRaw;
   if (pattern) {
     console.log(`[READ-FILE] 🔍 提取 pattern: ${pattern}`);
   }
@@ -819,6 +923,52 @@ export async function executeReadProjectFileTool(
   }
   const fullAppId = resolved.id;
   console.log(`[READ-FILE] 🔍 解析后完整 projectId: ${fullAppId}`);
+
+  // 🔥 批量读取：params.files 数组一次读多个文件（训练项目典型"几个 py 文件"从 N 轮并 1 轮）。
+  // 每文件默认前 60 行（≈2500 字符，防 N 文件叠加撑爆单轮），超限自带续读坐标可定点补读；
+  // LLM 显式传了 limit 则尊重传入值
+  const filesRaw = params?.files || params?.filePaths || params?.file_list;
+  if (Array.isArray(filesRaw) && filesRaw.length > 0) {
+    const files = filesRaw.filter((f: any) => typeof f === 'string' && f.trim()).slice(0, 5);
+    if (files.length === 0) {
+      return { success: false, error: "files 数组为空。用法: read_project_file(projectId='xxx', files=['train.py','config.py'])" };
+    }
+    const parts: string[] = [];
+    const errors: string[] = [];
+    // 🔥 剥掉批量参数再递归单文件：files 残留会让递归调用再次命中批量分支 → 无限自我调用永不返回
+    const { files: _f, filePaths: _fp, file_list: _fl, ...restParams } = params;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i].trim();
+      const single = await executeReadProjectFileTool(
+        { ...step, toolParams: { ...restParams, filePath: f, offset: params?.offset, limit: params?.limit || 60 } } as AutoStep,
+        _planId,
+        context
+      );
+      if (single.success) {
+        parts.push(`=== 文件 ${i + 1}/${files.length}: ${f}${single.data?.lineInfo || ''} ===\n${single.data?.content || ''}`);
+      } else {
+        errors.push(`- ${f}: ${single.error}`);
+      }
+    }
+    const okCount = parts.length;
+    const summary = `📂 批量读取 ${files.length} 个文件：成功 ${okCount}，失败 ${files.length - okCount}${errors.length ? `\n${errors.join('\n')}` : ''}\n\n${parts.join('\n\n')}`;
+    return {
+      success: okCount > 0,
+      ...(okCount > 0 ? {
+        data: {
+          type: 'fileContent',
+          appId: fullAppId,
+          filePath: files.join(', '),
+          content: summary,
+          language: 'text' as const,
+          size: summary.length,
+          lineInfo: `（批量 ${okCount}/${files.length} 个文件，每文件默认前 60 行，未读完的部分按各文件续读坐标补读）`,
+          message: `批量读取 ${okCount}/${files.length} 个文件成功`,
+        },
+      } : {}),
+      error: okCount > 0 ? undefined : `全部读取失败:\n${errors.join('\n')}`,
+    };
+  }
 
   if (!filePath) {
     console.warn(`[READ-FILE] ❌ 失败原因: 缺少 filePath 参数`);
@@ -875,6 +1025,47 @@ export async function executeReadProjectFileTool(
     const ext = filePath.split('.').pop() || 'txt';
     const language = getLanguage(ext);
 
+    // 🔥 文档分流：主进程对二进制返回 base64——不分流时 LLM 收到的是 12000 字符纯噪音。
+    // docx/xlsx/xls/pdf 提取文本后返回；其余二进制明确报错+指引（图片/zip 不硬读）
+    if (result.data?.encoding === 'base64') {
+      const extLower = ext.toLowerCase();
+      if (DOC_PARSE_EXTS.includes(extLower)) {
+        const parsed = await parseDocFile(content, extLower);
+        if (parsed) {
+          // 回执预算与 read 整读上限对齐（解析层的 60KB/500行/50页是提取预算，这里统一收口）
+          let text = parsed.text;
+          let note = parsed.note;
+          if (text.length > 12000) {
+            text = `${text.slice(0, 12000)}\n...[已截断，原文 ${parsed.text.length} 字符]`;
+            note += '（内容已截断）';
+          }
+          console.log(`[READ-FILE] 文档提取: ${filePath}, ${text.length} 字符`);
+          return {
+            success: true,
+            data: {
+              type: 'fileContent',
+              appId: fullAppId,
+              filePath,
+              content: `${note}\n\n${text}`,
+              language: 'text',
+              size: text.length,
+              totalSize: parsed.text.length,
+              lineInfo: `（${note}）`,
+              message: `读取文档 "${filePath}" 成功（已提取文本）`,
+            },
+          };
+        }
+        // 解析失败 → 落到下面的二进制报错（宁可缺失不可错误）
+      }
+      // 解析失败或不支持 → 分层指引（docReadError 按类型给最短处理路径）
+      return { success: false, error: docReadError(extLower) };
+    }
+
+    // 🔥 高危二进制（主进程 base64 名单外）：utf-8 硬读是纯乱码，显式拦截
+    if (BINARY_TRAP_EXTS.includes(ext.toLowerCase())) {
+      return { success: false, error: docReadError(ext.toLowerCase()) };
+    }
+
     // 🔥 按 pattern/offset/limit 截取内容
     let displayContent = content;
     let lineInfo = '';
@@ -882,6 +1073,7 @@ export async function executeReadProjectFileTool(
     // 🔥 优先使用 pattern 搜索
     if (pattern) {
       const lines = content.split('\n');
+      const outline = buildFileOutline(content, ext);
 
       try {
         const regex = new RegExp(pattern, 'i'); // 不区分大小写
@@ -897,25 +1089,28 @@ export async function executeReadProjectFileTool(
         }
 
         if (matchIndices.length === 0) {
+          // 🔥 未命中：附上文件结构地图，LLM 可看着地图换关键词重试（省一轮盲猜）
           return {
             success: false,
-            error: `未找到匹配内容: pattern="${pattern}"`,
+            error: `未找到匹配内容: pattern="${pattern}"${outline ? `\n\n${outline}\n\n💡 可看着结构换关键词重试；也可传数组一次带多个关键词` : ''}`,
           };
         }
 
-        const contextLines = limit || 20; // 默认每个匹配取 20 行（从匹配行开始往后）
+        const contextLines = limit || 20; // 每个匹配往后取的行数
+        const BEFORE_LINES = 3; // 命中行往前固定带 3 行（函数签名/赋值上下文常在命中行之前）
         const MAX_TOTAL_LINES = 1000; // 🔥 搜索结果总行数预算：命中密集时自动收缩每处上下文，防止覆盖整个大文件
 
         // 🔥 将命中区间合并（重叠/相邻的区间合为一段，消除相邻命中导致的重复内容）
         const mergeRanges = (indices: number[], ctx: number): Array<[number, number]> => {
           const merged: Array<[number, number]> = [];
           for (const idx of indices) {
+            const start = Math.max(0, idx - BEFORE_LINES);
             const end = Math.min(lines.length, idx + ctx);
             const last = merged[merged.length - 1];
-            if (last && idx <= last[1]) {
+            if (last && start <= last[1]) {
               last[1] = Math.max(last[1], end); // 与上一段重叠/相邻，扩展
             } else {
-              merged.push([idx, end]);
+              merged.push([start, end]);
             }
           }
           return merged;
@@ -931,14 +1126,16 @@ export async function executeReadProjectFileTool(
           mergedRanges = mergeRanges(matchIndices, ctx);
         }
 
+        // 🔥 每行带行号前缀，LLM 可直接引用精确行号，省"专门拿行号"的整轮读取
         const results = mergedRanges.map(([start, end]) =>
-          `--- 第 ${start + 1}-${end} 行 ---\n${lines.slice(start, end).join('\n')}`
+          `--- 第 ${start + 1}-${end} 行 ---\n${lines.slice(start, end).map((l, i) => `${start + i + 1}→${l}`).join('\n')}`
         );
 
-        displayContent = results.join('\n\n');
-        lineInfo = `（搜索 "${pattern}" 匹配 ${matchIndices.length} 处，合并为 ${mergedRanges.length} 段，每处取 ${ctx} 行上下文，共 ${totalLinesOf(mergedRanges)} 行）`;
+        const body = results.join('\n\n');
+        displayContent = outline ? `${outline}\n\n${body}` : body;
+        lineInfo = `（搜索 "${pattern}" 匹配 ${matchIndices.length} 处，合并为 ${mergedRanges.length} 段，每处带前${BEFORE_LINES}后${ctx}行，行号已标注${outline ? '，附文件结构地图' : ''}，共 ${totalLinesOf(mergedRanges)} 行）`;
 
-        console.log(`[READ-FILE] 搜索匹配: "${pattern}" 匹配 ${matchIndices.length} 处，合并为 ${mergedRanges.length} 段，每处取 ${ctx} 行`);
+        console.log(`[READ-FILE] 搜索匹配: "${pattern}" 匹配 ${matchIndices.length} 处，合并为 ${mergedRanges.length} 段，每处带前${BEFORE_LINES}后${ctx}行${outline ? '（附骨架）' : ''}`);
       } catch (e) {
         return {
           success: false,
@@ -953,12 +1150,34 @@ export async function executeReadProjectFileTool(
       const lineCount = limit || 50; // 默认 50 行
 
       const selectedLines = lines.slice(startLine, startLine + lineCount);
-      displayContent = selectedLines.join('\n');
+      // 🔥 每行带行号前缀（与 pattern 命中段格式一致），LLM 可直接引用精确行号
+      displayContent = selectedLines.map((l, i) => `${startLine + i + 1}→${l}`).join('\n');
 
       const endLine = Math.min(lines.length, startLine + lineCount);
-      lineInfo = `（第 ${startLine + 1}-${endLine} 行，共 ${lines.length} 行）`;
+      // 🔥 续读游标：LLM 不用自己算下一页从哪开始（忘了算就得从头读，白费一轮）
+      lineInfo = `（第 ${startLine + 1}-${endLine} 行，共 ${lines.length} 行${endLine < lines.length ? `。续读: offset=${endLine + 1}` : '，已到文件末尾'}）`;
 
       console.log(`[READ-FILE] 按行号截取: ${startLine + 1}-${endLine} 行`);
+    }
+    // 🔥 整读上限：无 pattern/offset/limit 的默认整读限制单文件返回量。
+    // 单轮并行整读几个大文件会瞬间撑爆上下文（60KB+ prompt 会触发上游网关 60s 超时 502）。
+    // 截断到整行 + 提示续读：中小文件仍一读到位（省轮次），大文件自动降级为精读
+    else {
+      const MAX_FULL_READ_CHARS = 12000;
+      if (content.length > MAX_FULL_READ_CHARS) {
+        let cut = content.slice(0, MAX_FULL_READ_CHARS);
+        const lastNl = cut.lastIndexOf('\n');
+        if (lastNl > 0) cut = cut.slice(0, lastNl); // 截到整行，保持行完整性
+        const totalLines = content.split('\n').length;
+        const keptLines = cut.split('\n').length;
+        const outline = buildFileOutline(content, ext);
+        displayContent = outline ? `${outline}\n\n${cut}` : cut; // 🔥 附骨架：LLM 知道未返回的后半段有什么
+        lineInfo = `（全文共 ${content.length} 字符/${totalLines} 行，超整读上限，已返回前 ${keptLines} 行${outline ? '，附文件结构地图' : ''}。续读：offset=${keptLines + 1}；精读：用 pattern 搜关键类/函数定义）`;
+        console.log(`[READ-FILE] 整读截断: ${filePath} ${content.length} → ${cut.length} 字符${outline ? '（附骨架）' : ''}`);
+      } else {
+        // 🔥 已读标签：明确告知已完整读取，防 LLM 拿不准而整轮重读
+        lineInfo = `（全文共 ${content.length} 字符/${content.split('\n').length} 行，已完整读取，无需续读）`;
+      }
     }
 
     console.log(`[READ-FILE] 读取成功: ${filePath}${lineInfo}, 大小: ${displayContent.length} 字符`);
@@ -974,7 +1193,7 @@ export async function executeReadProjectFileTool(
         size: displayContent.length,
         totalSize: content.length,
         lineInfo,
-        message: `读取文件 "${filePath}"${lineInfo} 成功，共 ${displayContent.length} 字符`,
+        message: `读取文件 "${filePath}" 成功`,
       },
     };
   } catch (error) {
@@ -1316,6 +1535,277 @@ export async function executeDeleteProjectFileTool(
  * 也可以单个编辑:
  *   edit_project_file(projectId='xxx', filePath='main.py', oldText='lr=0.001', newText='lr=0.0001')
  */
+/**
+ * 🔥 edit 失败时在文件中找最接近 oldText 的片段（按行窗口 + 压缩空白前缀相似度）
+ * 让 LLM 一次拿到「正确原文 + 行号」，避免 失败→再read→再edit 的 3 轮重试
+ */
+function suggestSimilarSnippet(
+  content: string,
+  oldText: string
+): { lineStart: number; lineEnd: number; snippet: string } | null {
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const compress = (t: string) => t.replace(/\s+/g, ' ').trim();
+  const target = compress(oldText);
+  if (!target) return null;
+  const probe = target.slice(0, 60); // 比较用前 60 字符
+  const oldLineCount = oldText.replace(/\r\n/g, '\n').split('\n').length;
+  const winSize = Math.min(Math.max(oldLineCount, 1), 30);
+
+  let best: { idx: number; score: number } | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const cw = compress(lines.slice(i, i + winSize).join('\n'));
+    let score = 0;
+    for (let len = Math.min(probe.length, cw.length); len >= 15; len--) {
+      if (cw.includes(probe.slice(0, len))) {
+        score = len;
+        break;
+      }
+    }
+    if (score > 0 && (!best || score > best.score)) best = { idx: i, score };
+  }
+  if (!best || best.score < 15) return null;
+
+  const snippet = lines.slice(best.idx, best.idx + winSize).join('\n');
+  return {
+    lineStart: best.idx + 1,
+    lineEnd: Math.min(lines.length, best.idx + winSize),
+    snippet: snippet.length > 400 ? snippet.slice(0, 400) + '\n...' : snippet,
+  };
+}
+
+/**
+ * 对单个文件应用一组 edits：读 → 逐个应用（精确/规范化/模糊三层匹配）→ 保存
+ * 供 edit_project_file 使用：跨文件批量时按文件分组调用
+ */
+async function applyEditsToSingleFile(
+  fullAppId: string,
+  filePath: string,
+  fileEdits: Array<{ oldText: string; newText: string }>,
+  context?: { userId?: string; conversationId?: string }
+): Promise<{ success: boolean; message: string; applied: number; failed: number }> {
+  const electron = (window as any).electron;
+  const codePath = await getCodePath(fullAppId);
+  const normalizedPath = filePath.replace(/\//g, '\\');
+
+  // 1. 读取当前文件内容
+  const readResult = await electron.readAppCodeFile({ appId: fullAppId, fileName: normalizedPath, codePath: codePath || undefined });
+  if (!readResult?.success) {
+    return { success: false, message: `读取文件失败: ${readResult?.error || '文件不存在'}`, applied: 0, failed: fileEdits.length };
+  }
+
+  let content: string = readResult.content || '';
+  const appliedEdits: string[] = [];
+  const failedEdits: string[] = [];
+  // 🔥 记录每个成功 edit 的 diff 片段（用于返回值展示）
+  const diffParts: string[] = [];
+
+  // 🔥 diff 收缩到变化邻域：对齐 old/new 公共前缀/后缀行，只渲染变化行 ±2 行上下文。
+  // oldText/newText 是 LLM 自己刚发的内容，全量回显是纯重复；但执行历史里 params 被截断
+  // 到 100 字符，diff 是后续轮次回看"改了什么"的唯一载体——保留变化邻域即够，全文用 read
+  const shrinkDiff = (oldText: string, newText: string): string => {
+    const oldLines = oldText.replace(/\r\n/g, '\n').split('\n');
+    const newLines = newText.replace(/\r\n/g, '\n').split('\n');
+
+    let prefix = 0;
+    while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix++;
+    let suffix = 0;
+    while (
+      suffix < oldLines.length - prefix &&
+      suffix < newLines.length - prefix &&
+      oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+    ) suffix++;
+
+    if (prefix + suffix >= oldLines.length && prefix + suffix >= newLines.length) return ''; // 无实际变化
+
+    const CTX = 2;
+    const parts: string[] = [];
+    if (prefix > CTX) parts.push(`  …（前 ${prefix - CTX} 行未变）`);
+    for (let i = Math.max(0, prefix - CTX); i < prefix; i++) parts.push(`  ${oldLines[i]}`);
+    for (let i = prefix; i < oldLines.length - suffix; i++) parts.push(`- ${oldLines[i]}`);
+    for (let i = prefix; i < newLines.length - suffix; i++) parts.push(`+ ${newLines[i]}`);
+    const ctxEnd = Math.min(oldLines.length, oldLines.length - suffix + CTX);
+    for (let i = oldLines.length - suffix; i < ctxEnd; i++) parts.push(`  ${oldLines[i]}`);
+    if (suffix > CTX) parts.push(`  …（后 ${suffix - CTX} 行未变）`);
+    return parts.join('\n');
+  };
+
+  // 🔥 规范化空白符的匹配函数：忽略行尾空白和换行符差异
+  const normalizeForMatch = (text: string): string => {
+    return text.replace(/\r\n/g, '\n').replace(/\t/g, '  ');
+  };
+
+  // 2. 按顺序应用每个 edit
+  for (let i = 0; i < fileEdits.length; i++) {
+    let { oldText, newText } = fileEdits[i];
+
+    // 🔥 预清洗：LLM 把 read 回执的行号前缀（123→内容）逐字复制进 oldText——空白容错救不了
+    // 这种坑，会直接匹配失败→重读→重编。行首 `数字→` 在真实代码里概率极低，可安全检测剥离
+    const stripped = oldText.replace(/\r\n/g, '\n').split('\n').map(l => l.replace(/^\s*\d+→/, '')).join('\n');
+    const nonEmptyLines = stripped.split('\n').filter(l => l.trim());
+    if (stripped !== oldText && nonEmptyLines.length >= 2) {
+      const hitCount = oldText.replace(/\r\n/g, '\n').split('\n').filter(l => /^\s*\d+→/.test(l)).length;
+      if (hitCount / nonEmptyLines.length >= 0.6) oldText = stripped;
+    }
+
+    // 精确匹配
+    if (content.includes(oldText)) {
+      content = content.replace(oldText, newText);
+      appliedEdits.push(`编辑${i + 1}: 成功替换`);
+      diffParts.push(shrinkDiff(oldText, newText));
+      continue;
+    }
+
+    // 🔥 容错匹配：规范化空白符后再匹配
+    const normalizedContent = normalizeForMatch(content);
+    const normalizedOldText = normalizeForMatch(oldText);
+
+    if (normalizedContent.includes(normalizedOldText)) {
+      // 找到规范化匹配的位置，在原内容中定位并替换
+      const normStartIdx = normalizedContent.indexOf(normalizedOldText);
+      // 计算原始内容中对应的起止位置
+      let charCount = 0;
+      let origStartIdx = 0;
+      let origEndIdx = 0;
+      let found = false;
+
+      for (let ci = 0; ci < content.length; ci++) {
+        const normalizedChar = normalizeForMatch(content[ci]);
+        for (const ch of normalizedChar) {
+          if (charCount === normStartIdx) {
+            origStartIdx = ci;
+          }
+          charCount++;
+          if (charCount === normStartIdx + normalizedOldText.length) {
+            origEndIdx = ci + 1;
+            found = true;
+            break;
+          }
+        }
+        if (found) break;
+      }
+
+      if (found) {
+        content = content.substring(0, origStartIdx) + newText + content.substring(origEndIdx);
+        appliedEdits.push(`编辑${i + 1}: 成功替换（规范化匹配）`);
+        diffParts.push(shrinkDiff(oldText, newText));
+        continue;
+      }
+    }
+
+    // 🔥 最后尝试：模糊匹配（跳过空白符差异）
+    // 将 oldText 和 content 都压缩空白符后匹配
+    const compressWhitespace = (text: string): string => {
+      return text.replace(/\s+/g, ' ').trim();
+    };
+
+    const compressedContent = compressWhitespace(content);
+    const compressedOldText = compressWhitespace(oldText);
+
+    if (compressedContent.includes(compressedOldText)) {
+      // 模糊匹配成功，但无法精确定位，使用精确的 oldText 匹配结果
+      // 这种情况下，我们提示 LLM 提供更精确的 oldText
+      failedEdits.push(`编辑${i + 1}: 内容存在但空白符差异过大。请以 read_project_file 的原文逐字作为 oldText 重试`);
+      continue;
+    }
+
+    // 🔥 失败兜底：给出文件中最接近的片段 + 行号，让 LLM 下一次 edit 直接命中（省 3 轮重试）
+    const hint = suggestSimilarSnippet(content, oldText);
+    if (hint) {
+      failedEdits.push(
+        `编辑${i + 1}: 未找到精确匹配。文件第 ${hint.lineStart}-${hint.lineEnd} 行有最接近的内容：\n---\n${hint.snippet}\n---\n请逐字复制以上原文作为 oldText 重试（保留缩进，不要自行改写）`
+      );
+    } else {
+      failedEdits.push(`编辑${i + 1}: 未找到匹配的代码片段 (oldText前50字符: "${oldText.substring(0, 50)}...")。文件中无相似内容，请先 read_project_file 确认后再改`);
+    }
+  }
+
+  // 3. 如果有成功的编辑，保存文件
+  const hasChanges = appliedEdits.length > 0;
+
+  if (hasChanges) {
+    // 🔥 .json 自动 pretty-print（与 save_project_file 一致）
+    content = prettyPrintJsonIfNeeded(filePath, content);
+    const saveResult = await electron.saveAppCodeFile({ appId: fullAppId, fileName: normalizedPath, content, codePath: codePath || undefined });
+
+    if (!saveResult?.success) {
+      return { success: false, message: `编辑成功但保存失败: ${saveResult?.error || '未知错误'}`, applied: appliedEdits.length, failed: failedEdits.length };
+    }
+
+    console.log(`[EDIT-FILE] 编辑保存成功: ${filePath}, 成功${appliedEdits.length}项, 失败${failedEdits.length}项`);
+
+    // 🔥 热重载：编辑的是基础项目的 tools/ 文件时（典型：LLM 用 edit 更新已存在的 registry.json），
+    // 同步重新加载动态工具——之前此路径无钩子，是"工具注册了但不进 prompt"的根因
+    await triggerBaseToolReload(fullAppId, filePath, context?.userId);
+
+    // 🔥 发送事件通知 FileTree 刷新 + DesktopAppCard 显示修改图标
+    window.dispatchEvent(new CustomEvent('trainProjectFilesChanged', {
+      detail: { appId: fullAppId, filePath, action: 'save' }
+    }));
+
+    // 🔥 touch 活跃度
+    await touchAppUpdatedAt(fullAppId);
+  }
+
+  // 4. 构造结果
+  const resultParts: string[] = [];
+  if (appliedEdits.length > 0) {
+    resultParts.push(`✅ 成功 ${appliedEdits.length} 项:\n${appliedEdits.join('\n')}`);
+  }
+  if (failedEdits.length > 0) {
+    resultParts.push(`❌ 失败 ${failedEdits.length} 项:\n${failedEdits.join('\n')}`);
+  }
+
+  // 🔥 如果有成功的编辑，附带变化邻域 diff（markdown diff 代码块，前端可高亮渲染）。
+  // 收缩是按公共前缀/后缀对齐裁掉未变部分，变化区完整保留——不会诱发 LLM 重读确认
+  const diffText = diffParts.filter(Boolean).join('\n');
+  if (diffText.trim()) {
+    resultParts.push(`\`\`\`diff\n${diffText}\n\`\`\``);
+  }
+
+  return { success: hasChanges, message: resultParts.join('\n\n'), applied: appliedEdits.length, failed: failedEdits.length };
+}
+
+/**
+ * 🔥 从 edits 内容推断目标文件（顶层 filePath 缺省时的自动定位）。
+ * oldText 是 LLM 从 read 回执逐字复制的，全项目唯一包含它的文件即目标。
+ * 两级探针：精确全文匹配 → 最长单行 trim 匹配（缩进差异兜底）。
+ * 唯一命中返回 file；多命中/零命中返回 candidates/allFiles（调用方报错附清单，省一轮 list）。
+ */
+async function inferEditTargetFile(
+  baseDir: string,
+  edits: Array<{ oldText: string }>
+): Promise<{ file?: string; candidates: string[]; allFiles: string[] }> {
+  const electron = (window as any).electron;
+  const stripLineNo = (s: string) => s.replace(/\r\n/g, '\n').split('\n').map(l => l.replace(/^\s*\d+→/, '')).join('\n');
+  const exact = stripLineNo(edits[0]?.oldText || '');
+  const probeLine = exact.split('\n').map(l => l.trim()).filter(Boolean).sort((a, b) => b.length - a.length)[0] || '';
+
+  const nodes = await scanDirectory(baseDir);
+  const files: FileNode[] = [];
+  const walk = (list: FileNode[]) => { for (const n of list) { if (n.type === 'file') files.push(n); if (n.children?.length) walk(n.children); } };
+  walk(nodes);
+
+  const SKIP = new Set([...BINARY_TRAP_EXTS, ...DOC_PARSE_EXTS, 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'svg', 'mp4', 'webm', 'mov', 'mp3', 'wav', 'zip', 'rar', '7z', 'gz', 'tar', 'pdf']);
+  const exactHits: string[] = [];
+  const lineHits: string[] = [];
+  const allFiles: string[] = [];
+  for (const f of files) {
+    const rel = f.relativePath || f.path;
+    const ext = (f.ext || f.name.split('.').pop() || '').toLowerCase();
+    allFiles.push(rel);
+    if (SKIP.has(ext) || (f.size ?? 0) > 200 * 1024) continue;
+    try {
+      const r = await electron.userpcFile.read(`${baseDir}\\${rel.replace(/\//g, '\\')}`);
+      if (!r.success) continue;
+      const content: string = stripLineNo(r.data?.content || '');
+      if (exact && content.includes(exact)) { exactHits.push(rel); continue; }
+      if (probeLine && content.includes(probeLine)) lineHits.push(rel);
+    } catch { /* skip */ }
+  }
+  const candidates = exactHits.length ? exactHits : lineHits;
+  return { file: candidates.length === 1 ? candidates[0] : undefined, candidates, allFiles };
+}
+
 export async function executeEditProjectFileTool(
   step: AutoStep,
   _planId: string,
@@ -1326,8 +1816,9 @@ export async function executeEditProjectFileTool(
   // 🔥 提取 projectId
   const appId = extractAppId(params, step.appId);
 
-  // 提取 filePath
-  const filePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
+  // 提取 filePath（推荐写法：每项 edit 自带 filePath，显式无歧义。
+  // 顶层 filePath 仅作兼容兜底；全缺省时按 oldText 内容指纹自动定位）
+  let defaultFilePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
 
   if (!appId) {
     return {
@@ -1344,18 +1835,12 @@ export async function executeEditProjectFileTool(
   }
   const fullAppId = resolved.id;
 
-  if (!filePath) {
-    return {
-      success: false,
-      error: "缺少 filePath 参数。用法: edit_project_file(projectId='xxx', filePath='main.py', edits=[{oldText:'...', newText:'...'}])",
-    };
-  }
-
-  // 🔥 提取 edits：支持数组和单个 oldText/newText 两种形式
-  let edits: Array<{ oldText: string; newText: string }> = [];
+  // 🔥 提取 edits：支持数组和单个 oldText/newText 两种形式；每个 edit 可带 filePath（跨文件批量）
+  let edits: Array<{ filePath?: string; oldText: string; newText: string }> = [];
 
   if (Array.isArray(params?.edits)) {
     edits = params.edits.filter((e: any) => e.oldText && e.newText !== undefined).map((e: any) => ({
+      filePath: e.filePath || e.file_path || undefined,
       oldText: String(e.oldText),
       newText: String(e.newText),
     }));
@@ -1371,8 +1856,28 @@ export async function executeEditProjectFileTool(
     };
   }
 
+  const editsMissingFp = edits.filter((e: any) => !e.filePath);
+  if (!defaultFilePath && editsMissingFp.length > 0) {
+    // 🔥 顶层 filePath 必带（=默认文件，跨文件时内项覆盖）。LLM 偶发漏传时
+    // 按 oldText 内容指纹定位兜底（唯一命中即成功，不浪费轮次；失败报错附清单）
+    const baseDir = await getAppBasePath(fullAppId);
+    const inferred = await inferEditTargetFile(baseDir, editsMissingFp);
+    if (inferred.file) {
+      console.log(`[EDIT-FILE] 🔎 顶层 filePath 缺省，内容指纹定位: ${inferred.file}`);
+      defaultFilePath = inferred.file;
+    } else {
+      const hint = inferred.candidates.length > 1
+        ? `oldText 内容命中多个文件: ${inferred.candidates.join(', ')}`
+        : `oldText 未命中任何文件。项目文件: ${inferred.allFiles.slice(0, 30).join(', ')}${inferred.allFiles.length > 30 ? ` …等 ${inferred.allFiles.length} 个` : ''}`;
+      return {
+        success: false,
+        error: `edits 每项必须带 filePath（一个 edit 声明一个文件的修改）。无法自动定位：${hint}`,
+      };
+    }
+  }
+
   try {
-    console.log(`[EDIT-FILE] 编辑文件: appId=${fullAppId}, filePath=${filePath}, edits=${edits.length}`);
+    console.log(`[EDIT-FILE] 编辑文件: appId=${fullAppId}, filePath=${defaultFilePath || '(per-edit)'}, edits=${edits.length}`);
 
     const electron = (window as any).electron;
 
@@ -1383,159 +1888,44 @@ export async function executeEditProjectFileTool(
       };
     }
 
-    const codePath = await getCodePath(fullAppId);
-    const normalizedPath = filePath.replace(/\//g, '\\');
-
-    // 1. 读取当前文件内容
-    const readResult = await electron.readAppCodeFile({ appId: fullAppId, fileName: normalizedPath, codePath: codePath || undefined });
-    if (!readResult?.success) {
-      return {
-        success: false,
-        error: `读取文件失败: ${readResult?.error || '文件不存在'}`,
-      };
+    // 🔥 跨文件批量：每个 edit 可带 filePath（缺省用顶层 filePath），按文件分组后逐文件应用——
+    // 多文件多处修改 1 轮 1 工具完成，不再「1 文件 1 轮」
+    const groups = new Map<string, Array<{ oldText: string; newText: string }>>();
+    for (const e of edits) {
+      const fp = e.filePath || defaultFilePath;
+      if (!fp) continue; // 前置校验已兜底
+      const arr = groups.get(fp);
+      if (arr) arr.push({ oldText: e.oldText, newText: e.newText });
+      else groups.set(fp, [{ oldText: e.oldText, newText: e.newText }]);
     }
 
-    let content: string = readResult.content || '';
-    const appliedEdits: string[] = [];
-    const failedEdits: string[] = [];
-    // 🔥 记录每个成功 edit 的 diff 片段（用于返回值展示）
-    const diffParts: string[] = [];
+    const fileMessages: string[] = [];
+    let totalApplied = 0;
+    let totalFailed = 0;
+    let anySuccess = false;
 
-    // 🔥 将文本转为 diff 格式：每行加 -/+ 前缀
-    const toDiffLines = (text: string, prefix: '-' | '+'): string => {
-      return text.replace(/\r\n/g, '\n').split('\n').map(line => `${prefix} ${line}`).join('\n');
-    };
-
-    // 🔥 规范化空白符的匹配函数：忽略行尾空白和换行符差异
-    const normalizeForMatch = (text: string): string => {
-      return text.replace(/\r\n/g, '\n').replace(/\t/g, '  ');
-    };
-
-    // 2. 按顺序应用每个 edit
-    for (let i = 0; i < edits.length; i++) {
-      const { oldText, newText } = edits[i];
-
-      // 精确匹配
-      if (content.includes(oldText)) {
-        content = content.replace(oldText, newText);
-        appliedEdits.push(`编辑${i + 1}: 成功替换`);
-        diffParts.push(toDiffLines(oldText, '-') + '\n' + toDiffLines(newText, '+'));
-        continue;
-      }
-
-      // 🔥 容错匹配：规范化空白符后再匹配
-      const normalizedContent = normalizeForMatch(content);
-      const normalizedOldText = normalizeForMatch(oldText);
-
-      if (normalizedContent.includes(normalizedOldText)) {
-        // 找到规范化匹配的位置，在原内容中定位并替换
-        const normStartIdx = normalizedContent.indexOf(normalizedOldText);
-        // 计算原始内容中对应的起止位置
-        let charCount = 0;
-        let origStartIdx = 0;
-        let origEndIdx = 0;
-        let found = false;
-
-        for (let ci = 0; ci < content.length; ci++) {
-          const normalizedChar = normalizeForMatch(content[ci]);
-          for (const ch of normalizedChar) {
-            if (charCount === normStartIdx) {
-              origStartIdx = ci;
-            }
-            charCount++;
-            if (charCount === normStartIdx + normalizedOldText.length) {
-              origEndIdx = ci + 1;
-              found = true;
-              break;
-            }
-          }
-          if (found) break;
-        }
-
-        if (found) {
-          content = content.substring(0, origStartIdx) + newText + content.substring(origEndIdx);
-          appliedEdits.push(`编辑${i + 1}: 成功替换（规范化匹配）`);
-          diffParts.push(toDiffLines(oldText, '-') + '\n' + toDiffLines(newText, '+'));
-          continue;
-        }
-      }
-
-      // 🔥 最后尝试：模糊匹配（跳过空白符差异）
-      // 将 oldText 和 content 都压缩空白符后匹配
-      const compressWhitespace = (text: string): string => {
-        return text.replace(/\s+/g, ' ').trim();
-      };
-
-      const compressedContent = compressWhitespace(content);
-      const compressedOldText = compressWhitespace(oldText);
-
-      if (compressedContent.includes(compressedOldText)) {
-        // 模糊匹配成功，但无法精确定位，使用精确的 oldText 匹配结果
-        // 这种情况下，我们提示 LLM 提供更精确的 oldText
-        failedEdits.push(`编辑${i + 1}: 未找到精确匹配（空白符差异过大，请使用read_project_file后精确复制代码片段）`);
-        continue;
-      }
-
-      failedEdits.push(`编辑${i + 1}: 未找到匹配的代码片段 (oldText前50字符: "${oldText.substring(0, 50)}...")`);
+    for (const [fp, fileEdits] of groups) {
+      const r = await applyEditsToSingleFile(fullAppId, fp, fileEdits, context);
+      totalApplied += r.applied;
+      totalFailed += r.failed;
+      if (r.success) anySuccess = true;
+      fileMessages.push(`📁 ${fp}\n${r.message}`);
     }
 
-    // 3. 如果有成功的编辑，保存文件
-    const hasChanges = appliedEdits.length > 0;
-
-    if (hasChanges) {
-      // 🔥 .json 自动 pretty-print（与 save_project_file 一致）
-      content = prettyPrintJsonIfNeeded(filePath, content);
-      const saveResult = await electron.saveAppCodeFile({ appId: fullAppId, fileName: normalizedPath, content, codePath: codePath || undefined });
-
-      if (!saveResult?.success) {
-        return {
-          success: false,
-          error: `编辑成功但保存失败: ${saveResult?.error || '未知错误'}`,
-        };
-      }
-
-      console.log(`[EDIT-FILE] 编辑保存成功: ${filePath}, 成功${appliedEdits.length}项, 失败${failedEdits.length}项`);
-
-      // 🔥 热重载：编辑的是基础项目的 tools/ 文件时（典型：LLM 用 edit 更新已存在的 registry.json），
-      // 同步重新加载动态工具——之前此路径无钩子，是"工具注册了但不进 prompt"的根因
-      await triggerBaseToolReload(fullAppId, filePath, context?.userId);
-
-      // 🔥 发送事件通知 FileTree 刷新 + DesktopAppCard 显示修改图标
-      window.dispatchEvent(new CustomEvent('trainProjectFilesChanged', {
-        detail: { appId: fullAppId, filePath, action: 'save' }
-      }));
-    }
-
-    // 4. 构造结果
-    const resultParts: string[] = [];
-    if (appliedEdits.length > 0) {
-      resultParts.push(`✅ 成功 ${appliedEdits.length} 项:\n${appliedEdits.join('\n')}`);
-    }
-    if (failedEdits.length > 0) {
-      resultParts.push(`❌ 失败 ${failedEdits.length} 项:\n${failedEdits.join('\n')}`);
-    }
-
-    // 🔥 如果有成功的编辑，附带完整 diff（markdown diff 代码块，前端可高亮渲染）
-    // 不截断：截断会导致 LLM 重新读文件确认，反而浪费更多 token
-    if (diffParts.length > 0) {
-      const diffText = diffParts.join('\n');
-      resultParts.push(`\`\`\`diff\n${diffText}\n\`\`\``);
-    }
-
-    // 🔥 touch 活跃度
-    if (hasChanges) {
-      await touchAppUpdatedAt(fullAppId);
+    // 🔥 TS 改动自闭环提示：LLM 看到后可自行跑 tsc 并按报错自纠（Python 等直接运行即可，无需此提示）
+    if (anySuccess && [...groups.keys()].some((fp) => /\.(ts|tsx)$/i.test(fp))) {
+      fileMessages.push('💡 涉及 TS 文件：建议跑 npx tsc --noEmit 验证（可选，报错可自纠）');
     }
 
     return {
-      success: hasChanges,
+      success: anySuccess,
       data: {
         type: 'fileEdited',
         appId: fullAppId,
-        filePath,
-        appliedCount: appliedEdits.length,
-        failedCount: failedEdits.length,
-        message: resultParts.join('\n\n'),
+        filePath: defaultFilePath || [...groups.keys()][0] || '',
+        appliedCount: totalApplied,
+        failedCount: totalFailed,
+        message: fileMessages.join('\n\n'),
       },
     };
   } catch (error) {
@@ -1609,7 +1999,7 @@ export async function executeListTrainTasksTool(
   if (!appId) {
     return {
       success: false,
-      error: "缺少 appId/projectId 参数。用法: list_train_tasks(appId='xxx')",
+      error: "缺少 appId/projectId 参数。用法: list_tasks(appId='xxx')",
     };
   }
 
@@ -1672,9 +2062,9 @@ export async function executeListTrainTasksTool(
       taskSummary += `   创建时间: ${new Date(task.created_at).toLocaleString()}\n\n`;
     });
 
-    taskSummary += `\n💡 提示：使用 get_train_task_detail(taskId='完整的UUID') 获取任务详情`;
+    taskSummary += `\n💡 提示：使用 get_task_detail(taskId='完整的UUID') 获取任务详情`;
     if (totalCount > 10 && !morePage) {
-      taskSummary += `\n⚠️ 总共有 ${totalCount} 个任务，默认返回最近 10 个。如需查看更早任务，请使用 list_train_tasks(appId='${appId}', morePage='11-20')`;
+      taskSummary += `\n⚠️ 总共有 ${totalCount} 个任务，默认返回最近 10 个。如需查看更早任务，请使用 list_tasks(appId='${appId}', type='train', morePage='11-20')`;
     }
 
     return {
@@ -1875,7 +2265,7 @@ export async function executeStopGpuTrainTool(
   if (!taskId) {
     return {
       success: false,
-      error: "缺少 taskId 参数。用法: stop_gpu_train(taskId='xxx')。可以使用 list_train_tasks 先获取 taskId。",
+      error: "缺少 taskId 参数。用法: stop_gpu_train(taskId='xxx')。可以使用 list_tasks 先获取 taskId。",
     };
   }
 

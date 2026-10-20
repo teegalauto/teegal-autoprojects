@@ -134,6 +134,16 @@ const ErrorMessages = {
     ]
   }),
 
+  MEDIA_NEEDS_INSTRUCTION: (url: string): ErrorMessage => ({
+    title: '🖼️ 媒体链接需要阅读指令',
+    reason: `URL "${url}" 指向图片/视频/音频等媒体文件。不带 instruction 时只会原始下载字节流（JFIF/Exif 二进制乱码），无法理解画面内容`,
+    suggestion: '重新调用并带上 instruction 写明想了解什么，即可调用视觉模型真正"看图"',
+    examples: [
+      '{ "url": "https://...jpg", "instruction": "描述这张图片的内容" }',
+      '{ "url": "https://...mp4", "instruction": "视频里发生了什么" }'
+    ]
+  }),
+
   // 使用指南
   USAGE_GUIDE: (): ErrorMessage => ({
     title: '📖 URL Reader 使用指南',
@@ -276,8 +286,19 @@ export async function executeUrlReaderTool(
       };
     }
 
-    // 🔥 检查是否是 OSS 内容 URL（图片/视频除外——它们走后端视觉模型理解，不受此拦截）
+    // 🔥 媒体 URL（图片/视频/音频）必须带阅读指令：不传时后端只会原始下载字节流当文本吐回（乱码）。
+    // 这里提前拦截并指引 LLM 带上 instruction 走视觉模型，而不是让它拿到一堆二进制乱码再猜
     const isMediaUrl = /\.(jpg|jpeg|png|gif|webp|bmp|svg|mp4|webm|mov|avi|mkv|mp3|wav|ogg|m4a|flac|aac)(\?|&|#|$)/i.test(url);
+    if (isMediaUrl && !userQuery.trim()) {
+      const error = ErrorMessages.MEDIA_NEEDS_INSTRUCTION(url);
+      return {
+        success: false,
+        error: formatErrorMessage(error),
+        metadata: { toolName: 'url_reader', url },
+      };
+    }
+
+    // 🔥 检查是否是 OSS 内容 URL（图片/视频除外——它们走后端视觉模型理解，不受此拦截）
     if (isOssContentUrl(url) && !isMediaUrl) {
       const error: ErrorMessage = {
         title: '❌ 检测到 OSS 文件 URL',

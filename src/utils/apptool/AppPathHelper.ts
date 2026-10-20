@@ -107,6 +107,23 @@ export async function getAppDefaultPath(appId: string): Promise<string> {
 }
 
 /**
+ * 🔥 项目内容根提示：穿透后的内容根相对项目默认根的子目录名（如 'chat-agent'）
+ * - 无套层/外部 code_path 项目返回 ''（内容根即项目根）
+ * - 供环境注入（重要对象段）附带显示，LLM 不用跑一轮 list_project_files 就能写对
+ *   read/push 的相对路径前缀（git clone 套层场景的相对路径是 'chat-agent/src/api.ts' 而非 'src/api.ts'）
+ */
+export async function getProjectRootHint(appId: string): Promise<string> {
+  try {
+    if (await getCodePath(appId)) return '';
+    const base = await getAppDefaultPath(appId);
+    const root = await getAppBasePath(appId);
+    return root.slice(base.length).replace(/^[\\/]/, '').replace(/[\\/]+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 获取 App 的 history 目录路径（始终在默认路径下）
  */
 export async function getAppHistoryPath(appId: string): Promise<string> {

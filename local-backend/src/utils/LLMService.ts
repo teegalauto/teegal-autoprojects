@@ -62,6 +62,8 @@ export interface LLMRequest {
   temperature?: number;
   max_tokens?: number;
   response_format?: { type: 'json_object' };
+  /** 🔥 思考强度（'minimal'|'low'|'medium'|'high'）：按模型族映射注入（gpt-5/o系→reasoning_effort，qwen→enable_thinking），不支持的服务端忽略 */
+  reasoningEffort?: string;
 }
 
 export interface LLMResponse {
@@ -379,6 +381,68 @@ export class LLMService {
   }
 
   /**
+   * 🔥 思考强度控制：调用方只声明意图（effort: 'minimal'|'low'|'medium'|'high'），
+   * 这里按「参数族适配表」翻译成各家参数形状。新增模型族 = 往 EFFORT_FAMILIES 加一条适配器，不改调用方。
+   * - OpenAI o 系 / GPT-5 / DeepSeek：reasoning_effort（官方梯度参数）
+   * - Qwen3 系（OpenAI 兼容层）：enable_thinking 布尔开关
+   * - GLM-5.3：reasoning_effort（仅 low/high/max，无法关闭思考）；GLM-5.2：reasoning_effort（none 可关闭）；GLM-4.x：thinking.type 开关
+   * - Claude/Gemini 走 OpenAI 兼容层时由中转映射，不直接注入
+   * ⚠️ 只对确知支持思考控制的模型族注入——gpt-4o 等传未知参数会被官方 400
+   */
+  private static readonly EFFORT_FAMILIES: Array<{
+    match: (m: string) => boolean;
+    apply: (body: any, effort: string) => string;
+  }> = [
+    {
+      match: (m) => m.includes('gpt-5') || /^o\d/.test(m) || m.includes('deepseek'),
+      apply: (body, effort) => { body.reasoning_effort = effort; return `reasoning_effort=${effort}`; },
+    },
+    {
+      match: (m) => m.includes('qwen'),
+      apply: (body, effort) => { body.enable_thinking = effort !== 'low'; return `enable_thinking=${body.enable_thinking}`; },
+    },
+    {
+      // 🔥 GLM-5.3（含 flash）：仅支持 reasoning_effort 的 low/high/max 档（官网文档），
+      // 无法关闭思考；thinking.type 是 4.x 参数会被静默忽略 → 思考跑默认 max 档（实测单轮 2.6 万字符）
+      match: (m) => /glm-5\.3/.test(m),
+      apply: (body, effort) => {
+        const v = ['low', 'high', 'max'].includes(effort) ? effort : 'low';
+        body.reasoning_effort = v;
+        return `reasoning_effort=${v}（5.3 仅支持 low/high/max，无法关闭思考）`;
+      },
+    },
+    {
+      // 🔥 GLM-5.2：none/minimal 可放弃思考；low/medium 官方映射为 high，xhigh→max
+      match: (m) => /glm-5\.2/.test(m),
+      apply: (body, effort) => {
+        const v = (effort === 'low' || effort === 'minimal') ? 'none' : effort;
+        body.reasoning_effort = v;
+        return `reasoning_effort=${v}（5.2 none 关闭思考）`;
+      },
+    },
+    {
+      // GLM-4.x 及更早：thinking.type 开关（官方无梯度，low/minimal → disabled）
+      match: (m) => m.includes('glm'),
+      apply: (body, effort) => {
+        body.thinking = { type: (effort === 'low' || effort === 'minimal') ? 'disabled' : 'enabled' };
+        return `thinking.type=${body.thinking.type}`;
+      },
+    },
+  ];
+
+  private applyReasoningEffort(requestBody: any, model: string, effort: string): void {
+    const m = (model || '').toLowerCase();
+    for (const family of LLMService.EFFORT_FAMILIES) {
+      if (family.match(m)) {
+        const desc = family.apply(requestBody, effort);
+        console.log(`🔥 [LLM-SERVICE] 模型 ${model} 注入思考强度: ${desc}`);
+        return;
+      }
+    }
+    console.log(`🔥 [LLM-SERVICE] 模型 ${model} 未匹配思考强度参数族，跳过注入（effort=${effort}）`);
+  }
+
+  /**
    * OpenAI 兼容格式调用
    */
   private async callOpenAI(
@@ -420,6 +484,11 @@ export class LLMService {
         requestBody.response_format = request.response_format;
       } else if (this.isReasonerModel(config.model)) {
         console.log(`🔥 [LLM-SERVICE] 模型 ${config.model} 是 Reasoner 模型，不传递 response_format 参数`);
+      }
+
+      // 🔥 思考强度控制（按模型族注入；各家参数不统一，详见 applyReasoningEffort）
+      if (request.reasoningEffort) {
+        this.applyReasoningEffort(requestBody, config.model, request.reasoningEffort);
       }
 
       const headers: Record<string, string> = {
@@ -561,7 +630,17 @@ export class LLMService {
       }
       
       if (jsonMatch) {
-        cleanedContent = jsonMatch[1] || jsonMatch[0];
+        const candidate = jsonMatch[1] || jsonMatch[0];
+        // 🔥 只有候选是合法 JSON 才替换：max_tokens 截断时 lastBrace 可能落在
+        // tools 数组中间，替换会把后半段工具切丢，且 Summary 意图闸门看到的
+        // 已是切后内容（sessioncreate 连名都不剩）→ 闸门失去判断依据。
+        // 非法候选保留原文，交给下游 safeJSONParse（其 L4 层自带主体提取+修复管线）
+        try {
+          JSON.parse(candidate);
+          cleanedContent = candidate;
+        } catch {
+          // 候选非法（截断/括号碎裂）→ 保留 cleanedContent 原文
+        }
       }
 
       return { success: true, content: cleanedContent.trim(), reasoningContent: finalReasoningContent, usage: {

@@ -73,7 +73,8 @@ router.post('/round', async (req, res) => {
       sessionId: request.sessionId,
       roundNumber: result.roundNumber,
       toolCount: result.tools.length,
-      firstTool: result.tools[0]?.name || 'complete',
+      // 🔥 tools 为空时显示 '-'（曾误写 'complete'，让「解析失败无信号」看着像结束信号，误导排查）
+      firstTool: result.tools[0]?.name || '-',
     });
 
     res.json(result);

@@ -101,6 +101,9 @@ export function sortFileNodes(nodes: FileNode[]): FileNode[] {
  */
 const IGNORED_DIRS = new Set([
   'node_modules',
+  'release',      // 🔥 electron-builder 打包产物（resources.pak/app.asar.unpacked 等）
+  'tmp', 'temp', 'data', 'logs',
+  'dist-server', 'dist-electron',
   'history',
   '__pycache__',
   '.venv',
@@ -139,6 +142,129 @@ export function filterFileNodes(nodes: FileNode[]): FileNode[] {
 }
 
 /**
+ * 🔥 Diff 行切分（git numstat 语义，ChangeList 统计与 DiffViewer 渲染共用同一实现）：
+ * - 空内容 = 0 行（''.split('\n') 会产生幻影空行，导致新文件凭空多算一条 deleted）
+ * - 末尾换行符不产生额外行（'a\n' = 1 行；'a\n\n' = 2 行，末尾空行是真实行）
+ * - 剥 BOM（electron 写文件为 UTF-8 with BOM，两侧 BOM 不一致会导致首行误判为变更）
+ * - CRLF→LF、去行尾空白
+ */
+export function splitDiffLines(content: string): string[] {
+  if (!content) return [];
+  const lines = content.replace(/^\uFEFF/, '').split('\n').map(l => l.replace(/\r$/, '').trimEnd());
+  if (lines.length > 1 && lines[lines.length - 1] === '' && /\n$/.test(content)) {
+    lines.pop();
+  }
+  return lines;
+}
+
+/**
+ * 🔥 LCS diff 统计（共享实现：ChangeList 的 +N -N 与 DiffViewer 显示的统计同源，保证数字一致）
+ */
+/** 🔥 LCS 规模护栏：裁剪公共前后缀后剩余行列乘积超过此值放弃逐行 diff。
+ *  2500 万格 = 5000×5000，Int32Array 扁平矩阵峰值约 100MB 可承受
+ *  （1.3万行×1.3万行=1.7亿格 number[][] 曾直接撑爆渲染进程） */
+const DIFF_CELL_LIMIT = 25_000_000;
+
+export interface DiffLine {
+  type: 'added' | 'deleted' | 'unchanged';
+  oldLineNumber: number | null;
+  newLineNumber: number | null;
+  content: string;
+}
+
+/**
+ * 逐行 diff（LCS）：先裁剪公共前缀/后缀再算，规模超限返回 null（调用方降级处理，宁缺毋滥）
+ */
+export function computeDiffLines(oldCode: string, newCode: string): DiffLine[] | null {
+  const oldLines = splitDiffLines(oldCode);
+  const newLines = splitDiffLines(newCode);
+
+  // 🔥 裁剪公共前缀/后缀：常见编辑只动中间一小段，大幅缩小 LCS 规模
+  let start = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (start < minLen && oldLines[start] === newLines[start]) start++;
+  let endOld = oldLines.length, endNew = newLines.length;
+  while (endOld > start && endNew > start && oldLines[endOld - 1] === newLines[endNew - 1]) { endOld--; endNew--; }
+
+  const m = endOld - start;
+  const n = endNew - start;
+  if (m * n > DIFF_CELL_LIMIT) return null;
+
+  // 行内容 → 整数 id：内层循环每格从字符串比较降为数字比较（5000² 规模从秒级降到百毫秒级）
+  const ids = new Map<string, number>();
+  const toId = (l: string): number => {
+    let v = ids.get(l);
+    if (v === undefined) { v = ids.size + 1; ids.set(l, v); }
+    return v;
+  };
+  const a = oldLines.slice(start, endOld).map(toId);
+  const b = newLines.slice(start, endNew).map(toId);
+
+  // 扁平 Int32Array 矩阵（同规模 number[][] 嵌套数组内存约 3.5 倍）
+  const W = n + 1;
+  const dp = new Int32Array((m + 1) * W);
+  for (let i = 1; i <= m; i++) {
+    const row = i * W, prev = row - W;
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[row + j] = dp[prev + j - 1] + 1;
+      } else {
+        const up = dp[prev + j], left = dp[row + j - 1];
+        dp[row + j] = up >= left ? up : left;
+      }
+    }
+  }
+
+  // 回溯（倒序收集后 reverse）；行号映射回原文件（offset=start）
+  const tail: DiffLine[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+      tail.push({ type: 'unchanged', oldLineNumber: start + i, newLineNumber: start + j, content: oldLines[start + i - 1] });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i * W + j - 1] >= dp[(i - 1) * W + j])) {
+      tail.push({ type: 'added', oldLineNumber: null, newLineNumber: start + j, content: newLines[start + j - 1] });
+      j--;
+    } else {
+      tail.push({ type: 'deleted', oldLineNumber: start + i, newLineNumber: null, content: oldLines[start + i - 1] });
+      i--;
+    }
+  }
+  const head = oldLines.slice(0, start).map((content, idx) => ({
+    type: 'unchanged' as const, oldLineNumber: idx + 1, newLineNumber: idx + 1, content,
+  }));
+  const footOffset = start + m; // 旧文件后缀起点
+  const foot = oldLines.slice(endOld).map((content, idx) => ({
+    type: 'unchanged' as const, oldLineNumber: footOffset + idx + 1, newLineNumber: endNew + idx + 1, content,
+  }));
+  return [...head, ...tail.reverse(), ...foot];
+}
+
+/** +N -N 统计：永远有值——超 LCS 护栏时降级为行多重集对比（超大文件的徽标也有数，代价是整块移动的行不计入） */
+export function computeDiffStats(oldCode: string, newCode: string): { added: number; deleted: number } {
+  const diffLines = computeDiffLines(oldCode, newCode);
+  if (diffLines) {
+    let added = 0, deleted = 0;
+    for (const l of diffLines) {
+      if (l.type === 'added') added++;
+      else if (l.type === 'deleted') deleted++;
+    }
+    return { added, deleted };
+  }
+  // 降级：按行内容多重集匹配（O(n) 无矩阵），与 LCS 口径的差异只在"整块移动的行"上
+  const oldCount = new Map<string, number>();
+  for (const l of splitDiffLines(oldCode)) oldCount.set(l, (oldCount.get(l) ?? 0) + 1);
+  let added = 0, deleted = 0;
+  for (const l of splitDiffLines(newCode)) {
+    const c = oldCount.get(l) ?? 0;
+    if (c > 0) oldCount.set(l, c - 1);
+    else added++;
+  }
+  for (const c of oldCount.values()) deleted += c;
+  return { added, deleted };
+}
+
+/**
  * 🔥 新建文件
  * 跨平台：通过 Electron IPC API（app-code:save）
  */
@@ -174,6 +300,37 @@ export async function createFile(
 
   } catch (error: any) {
     console.error('[createFile] 创建失败:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * 🔥 新建文件夹
+ * 跨平台：通过 Electron IPC API（app-code:ensure-dir），支持嵌套路径（recursive mkdir）
+ */
+export async function createFolder(
+  appId: string,
+  dirPath: string,
+  codePath?: string
+): Promise<FileOperationResult> {
+  try {
+    const electron = (window as any).electron;
+
+    if (!electron?.ensureAppCodeDir) {
+      return { success: false, error: '非 Electron 环境' };
+    }
+
+    const cp = codePath ?? ((await getCodePath(appId)) || undefined);
+    const result = await electron.ensureAppCodeDir({ appId, dirPath, codePath: cp });
+    if (!result?.success) {
+      return { success: false, error: result?.error || '创建文件夹失败' };
+    }
+
+    console.log(`[createFolder] 已创建文件夹: ${dirPath}`);
+    return { success: true };
+
+  } catch (error: any) {
+    console.error('[createFolder] 创建文件夹失败:', error);
     return { success: false, error: error.message };
   }
 }

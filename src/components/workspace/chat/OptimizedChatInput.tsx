@@ -19,6 +19,8 @@ import { ModelManager } from "@/utils/llm/ModelManager";
 import { syncModelKeyCredentials } from "@/components/workspace/auth/modelKeySync";
 import { SimpleUserModel, isMediaGenerationModel, ModelCategoryIcon, getMediaGenerationKind } from "@/components/profile/CustomModelDialog";
 import { CodeBlockPreview, extractCodeBlockMarkers, CodeBlockData } from "./CodeBlockPreview";
+import OfflineStatusBadge from "./OfflineStatusBadge";
+import { OfflineCommandDialog } from '@/components/workspace/auth/OfflineCommandDialog';
 
 /**
  * 🔥 资源引用：用户点名要使用的媒体模型 / 凭据
@@ -109,6 +111,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
   // 🔥 资源引用相关：Popover 开关 + 凭据列表
   const [isResourcePopoverOpen, setIsResourcePopoverOpen] = useState(false);
+  const [showOfflineCommand, setShowOfflineCommand] = useState(false); // 离线指挥设置弹窗
   const [credentials, setCredentials] = useState<CredentialMeta[]>([]);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
 
@@ -178,7 +181,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
   //    凭据管理页打开时才入库——用户从不打开凭据管理时，@ 列表会一直是空的
   useEffect(() => {
     if (!isResourcePopoverOpen || !userId) return;
-    const loadCredentials = async () => {
+    const loadCredentials = async (retry = 0): Promise<void> => {
       setCredentialsLoading(true);
       try {
         // 同步失败不阻塞列表加载（还能看到手工创建的凭据）
@@ -186,9 +189,21 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
         const electron = (window as any).electron;
         if (!electron?.localStorage?.listCredentialsMeta) return;
         const creds = await electron.localStorage.listCredentialsMeta(userId);
+        // 🔥 空结果重试：应用刚启动时 local-backend 冷启动未就绪，主进程 fetch 失败会
+        //    静默返回 []（与 loadBaseProjectTools 的冷启动问题同源），导致第一次打开 @
+        //    显示"暂无凭据"、打开凭据管理后才恢复——延迟重试补齐这个窗口
+        if ((creds || []).length === 0 && retry < 2) {
+          await new Promise(r => setTimeout(r, 1500));
+          return loadCredentials(retry + 1);
+        }
         setCredentials(creds || []);
       } catch (error) {
         logger.error('[CHAT-INPUT] 加载凭据失败:', error);
+        // 🔥 异常同样走重试（对齐 loadBaseProjectTools 的冷启动对冲），重试耗尽仍失败才放弃
+        if (retry < 2) {
+          await new Promise(r => setTimeout(r, 1500));
+          return loadCredentials(retry + 1);
+        }
       } finally {
         setCredentialsLoading(false);
       }
@@ -657,6 +672,9 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
         {/* 按钮区域 */}
         <div className="flex items-center justify-between px-3 py-2 pb-3">
           <div className="flex items-center space-x-2">
+            {/* 🔥 离线指挥状态徽标（邮件远程指挥：灰=未启用/绿=监听中/黄=执行中，点击进设置） */}
+            <OfflineStatusBadge onOpen={() => setShowOfflineCommand(true)} />
+
             {/* 文件上传按钮 - 移除边框样式 */}
             <Button
               variant="ghost"
@@ -874,6 +892,12 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
       {/* 隐藏的文件输入 */}
       <input ref={fileInputRef} type="file" multiple className="hidden" onChange={onFileChange} accept="*/*" />
+
+      {/* 🔥 离线指挥设置弹窗（入口=左下角徽标点击，直连回调不经 ChatHeader） */}
+      <OfflineCommandDialog
+        open={showOfflineCommand}
+        onOpenChange={setShowOfflineCommand}
+      />
     </div>
   );
 };

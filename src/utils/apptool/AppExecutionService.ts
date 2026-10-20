@@ -135,6 +135,8 @@ export interface AppExecutionOptions {
   workingDir?: string;
   // 🔥 新增：入口文件
   entryPoint?: string;
+  /** 🔥 GPU 任务是否等待训练终态（默认 true；false=实例创建成功即返回，云端自治执行，结果稍后同步） */
+  waitResult?: boolean;
 }
 
 // 🔥 执行结果
@@ -219,6 +221,7 @@ export const executeApp = async (
     code: providedCode,
     workingDir,
     entryPoint,
+    waitResult,
   } = options;
 
   try {
@@ -228,9 +231,11 @@ export const executeApp = async (
     let projectFiles: ProjectFile[] = [];
     let mainFile = 'main.py';
     let zipBase64: string | undefined;
-    
-    if (providedCode) {
-      // 直接使用传入的代码
+
+    if (providedCode && !isGpu) {
+      // 🔥 仅本地执行支持草稿代码（RunDev 单文件模式）。
+      // GPU 训练/云端运行以整个项目为单位（appId → 拉全项目 zip + 入口探测），恒忽略 code——
+      // 防止调用方误传编辑器内容导致"只跑单个文件"（如浏览 probe_gpu.py 后点云端运行）
       codeContent = extractCodeContent(providedCode);
     } else {
       // 🔥 从项目目录获取代码（支持多文件）
@@ -310,6 +315,7 @@ export const executeApp = async (
         mainFile,
         zipBase64,
         entryPoint: entryPoint || mainFile,
+        waitResult,
       });
     } else {
       return await executeLocalTask(codeContent, {
@@ -353,6 +359,7 @@ async function executeGpuTask(
     mainFile?: string;
     zipBase64?: string;
     entryPoint?: string;
+    waitResult?: boolean;
   }
 ): Promise<AppExecutionResult> {
   const { 
@@ -367,6 +374,7 @@ async function executeGpuTask(
     mainFile = 'main.py',
     zipBase64,
     entryPoint = 'main.py',
+    waitResult = true,
   } = options;
   
   const backendUrl = getEcsUrl();
@@ -402,6 +410,44 @@ async function executeGpuTask(
   } else {
     // 🔥 单文件：发送代码内容
     requestBody.code = codeContent;
+  }
+
+  // 🔥 wait=false：不等训练终态。后端 /execute 是同步接口（waitForCompletion 无限等到任务终态才响应），
+  //    若 await fetch 会把整条链路挂死几小时。改为 fire-and-forget 提交（连接由后端继续自治跑完收尾：
+  //    终态写库/WS 通知/实例清理/扣费镜像全部照常），前端轮询任务登记（=实例创建成功）即返回 streaming。
+  if (!waitResult) {
+    fetch(executeUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    }).catch((e) => console.warn('[APP-EXECUTION-SERVICE] 后台任务连接中断（预期内，云端自治不受影响）:', e?.message || e));
+
+    const { trainingTaskStorage } = await import('@/services/storage');
+    const REGISTER_TIMEOUT_MS = 10 * 60_000;
+    const t0 = Date.now();
+    while (Date.now() - t0 < REGISTER_TIMEOUT_MS) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const task = await trainingTaskStorage.getById(taskId);
+        if (task) {
+          console.log(`🚀 [APP-EXECUTION-SERVICE] 任务已登记（实例创建成功）: taskId=${taskId}, status=${(task as any).status}`);
+          return {
+            success: true,
+            type: 'appExecution',
+            executionMode: 'gpu',
+            taskId,
+            appId,
+            gpuInstanceType,
+            gpuStatus: 'streaming',
+          };
+        }
+      } catch { /* 后端未就绪，继续等 */ }
+    }
+    return {
+      success: false,
+      executionMode: 'gpu',
+      error: '等待实例创建超时（10分钟），任务可能未启动成功。请查看后端日志，或稍后在训练任务列表确认。',
+    };
   }
 
   const response = await fetch(executeUrl, {

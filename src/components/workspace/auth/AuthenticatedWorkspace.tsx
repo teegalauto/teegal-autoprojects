@@ -4,6 +4,7 @@ import WorkspaceGrid from "../layout/WorkspaceGrid";
 import { useWorkspace } from "@/hooks/workspace/useWorkspace";
 import { createHandlers } from "@/hooks/workspace/useWorkspaceHandlers";
 import { UserProfile } from "@/context/AuthContext";
+import { offlineChannel, loadOfflineConfig, buildRoundReport } from "@/utils/auto/offline/offlineChannel";
 
 interface AuthenticatedWorkspaceProps {
   user: UserProfile | any;
@@ -19,6 +20,10 @@ const AuthenticatedWorkspace: React.FC<AuthenticatedWorkspaceProps> = ({ user })
   const sendRef = useRef(handlers.handleSendMessage);
   sendRef.current = handlers.handleSendMessage;
 
+  // 🔥 离线指挥桥：邮件远程指挥走同一条编排入口（轮询云端 pending 指令 → 执行 → complete 回函）
+  const cancelRef = useRef(handlers.handleCancel);
+  cancelRef.current = handlers.handleCancel;
+
   // 终态回包需要挖最终 summary 文本：.then 闭包里直接读 workspace.messages 可能是旧值，经 ref 取最新
   const messagesRef = useRef(workspace.messages);
   messagesRef.current = workspace.messages;
@@ -30,6 +35,39 @@ const AuthenticatedWorkspace: React.FC<AuthenticatedWorkspaceProps> = ({ user })
     const text = last?.result || last?.content;
     return text ? String(text) : undefined;
   };
+
+  // 离线回合起点：execute 前快照 messages 长度，回函组装只取本回合新增片段
+  const roundStartRef = useRef(0);
+
+  // 🔥 离线指挥轮询：启用状态下启动；设置面板开关切换经 offline-config-changed 事件同步启停。
+  //    配置按账号归属校验（loadOfflineConfig(uid)），user 切换时重新 sync 防沿用上一账号通道
+  useEffect(() => {
+    const uid = String(user?.id ?? '');
+    const syncChannel = () => {
+      const cfg = loadOfflineConfig(uid);
+      if (cfg?.enabled) {
+        offlineChannel.start({
+          // 🔥 离线指令带 email 来源标签：历史时间戳旁显示邮箱图标
+          execute: (q: string) => {
+            roundStartRef.current = (messagesRef.current || []).length;
+            return sendRef.current(q, [], { source: 'email' });
+          },
+          cancel: () => cancelRef.current(),
+          // 回函正文 = 本回合消息流组装（summarizer 正文 + reactor 折叠总览行，跟前端一样的结构）
+          getRoundReport: () => buildRoundReport((messagesRef.current || []).slice(roundStartRef.current)),
+        }, uid);
+      } else {
+        offlineChannel.stop();
+      }
+    };
+    syncChannel();
+    window.addEventListener('offline-config-changed', syncChannel);
+    return () => {
+      window.removeEventListener('offline-config-changed', syncChannel);
+      offlineChannel.stop();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   useEffect(() => {
     const electron = (window as any).electron;

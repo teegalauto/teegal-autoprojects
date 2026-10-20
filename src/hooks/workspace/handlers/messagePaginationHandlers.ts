@@ -18,7 +18,7 @@ import { messageStorage, storageMode } from '@/services/storage';
  * - 支持计算总消息数
  */
 
-const MESSAGES_PER_PAGE = 20;
+const MESSAGES_PER_PAGE = 50;
 
 interface PaginationState {
   conversationId: string;
@@ -79,9 +79,12 @@ const formatDatabaseMessages = (dbMessages: any[]): Message[] => {
       sessionId: msg.session_id,
       memory: msg.memory,
       metadata: {
+        // 🔥 保留 DB metadata（含 source 标签），再叠加加载上下文字段
+        ...(metadata as Record<string, any>),
         conversationId: msg.conversation_id,
         isSnapshotMode: msg.role === 'auto'
-      }
+      },
+      source: (metadata as any)?.source // 🔥 userQuery 来源标签（'email'=离线邮件指挥，缺省 chat）
     };
   });
 };

@@ -49,6 +49,12 @@ interface StreamOutput {
 }
 
 /**
+ * 🔥 平台判定：Windows → PowerShell 语法（$env:TEMP / .ps1），
+ * macOS/Linux → bash 语法（/tmp、base64 -d、python3）。preload 暴露 process.platform
+ */
+const isWinPlatform = (): boolean => (window as any).electron?.platform === 'win32';
+
+/**
  * 🔥 检测代码语言
  */
 function detectLanguage(code: string): 'python' | 'node' | 'shell' {
@@ -149,6 +155,8 @@ export async function executeCpuTask(
   let tempFileName: string;
   let command: string;
 
+  const isWin = isWinPlatform();
+
   switch (detectedLang) {
     case 'python':
       tempFileName = `teegal_${timestamp}_${randomId}.py`;
@@ -157,26 +165,42 @@ export async function executeCpuTask(
       tempFileName = `teegal_${timestamp}_${randomId}.js`;
       break;
     default:
-      // 🔥 shell 多行代码在 Windows（PowerShell）下执行，必须用 .ps1：
-      // .sh 会被 Windows 当成无关联文件 → `&` 调用时弹出"选择用什么应用打开"
-      tempFileName = `teegal_${timestamp}_${randomId}.ps1`;
+      // 🔥 shell 多行代码：Windows（PowerShell）下必须用 .ps1（.sh 会被 Windows 当成
+      // 无关联文件 → `&` 调用时弹出"选择用什么应用打开"）；macOS/Linux 用 .sh 交 bash 执行
+      tempFileName = `teegal_${timestamp}_${randomId}.${isWin ? 'ps1' : 'sh'}`;
   }
 
-  const tempFilePath = `$env:TEMP\\${tempFileName}`;
+  const tempFilePath = isWin ? `$env:TEMP\\${tempFileName}` : `/tmp/${tempFileName}`;
 
   // 使用 Base64 编码避免转义问题
   const codeBase64 = btoa(unescape(encodeURIComponent(code)));
 
   // 构建命令：写入文件 -> 执行
-  if (detectedLang === 'python') {
-    command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); python "${tempFilePath}"`;
-  } else if (detectedLang === 'node') {
-    command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); node "${tempFilePath}"`;
+  if (isWin) {
+    if (detectedLang === 'python') {
+      command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); python "${tempFilePath}"`;
+    } else if (detectedLang === 'node') {
+      command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); node "${tempFilePath}"`;
+    } else {
+      // Shell 模式 - 直接执行代码作为命令
+      // 如果是多行，先写入 .ps1 再执行（执行环境是 PowerShell）
+      if (code.includes('\n')) {
+        command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); powershell -NoProfile -ExecutionPolicy Bypass -File "${tempFilePath}"`;
+      } else {
+        // 单行命令直接执行
+        command = code;
+      }
+    }
   } else {
-    // Shell 模式 - 直接执行代码作为命令
-    // 如果是多行，先写入 .ps1 再执行（执行环境是 PowerShell）
-    if (code.includes('\n')) {
-      command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); powershell -NoProfile -ExecutionPolicy Bypass -File "${tempFilePath}"`;
+    // 🔥 macOS/Linux：bash 语法，base64 解码写文件后执行
+    // （python3：macOS 12+ 不自带 python 命令；base64 -d 在 macOS/Linux 通用）
+    const writeCmd = `printf '%s' '${codeBase64}' | base64 -d > "${tempFilePath}"`;
+    if (detectedLang === 'python') {
+      command = `rm -f "${tempFilePath}"; ${writeCmd}; python3 "${tempFilePath}"`;
+    } else if (detectedLang === 'node') {
+      command = `rm -f "${tempFilePath}"; ${writeCmd}; node "${tempFilePath}"`;
+    } else if (code.includes('\n')) {
+      command = `rm -f "${tempFilePath}"; ${writeCmd}; bash "${tempFilePath}"`;
     } else {
       // 单行命令直接执行
       command = code;
@@ -278,13 +302,21 @@ export async function executeCommandInDir(
   const startTime = Date.now();
   const timeout = options?.timeout || 1800;
 
-  // 构建环境变量
+  // 构建环境变量（🔥 Windows → PowerShell $env: 前缀；macOS/Linux → bash 命令级前缀）
   let fullCommand = command;
   if (options?.env && Object.keys(options.env).length > 0) {
-    const envVars = Object.entries(options.env)
-      .map(([key, value]) => `$env:${key} = "${value}"`)
-      .join('; ');
-    fullCommand = `${envVars}; ${command}`;
+    const entries = Object.entries(options.env);
+    if (isWinPlatform()) {
+      const envVars = entries
+        .map(([key, value]) => `$env:${key} = "${value}"`)
+        .join('; ');
+      fullCommand = `${envVars}; ${command}`;
+    } else {
+      const envVars = entries
+        .map(([key, value]) => `${key}="${value}"`)
+        .join(' ');
+      fullCommand = `${envVars} ${command}`;
+    }
   }
 
   onProgress?.({ type: 'start', data: command });
@@ -338,7 +370,8 @@ export async function checkPythonAvailability(): Promise<{ available: boolean; v
     let output = '';
     
     executeCommandStream({
-      command: 'python --version',
+      // 🔥 macOS 12+ 不自带 python 命令，POSIX 检测 python3
+      command: isWinPlatform() ? 'python --version' : 'python3 --version',
       timeout: 10,
       onOutput: (data: StreamOutput) => {
         if (data.type === 'stdout' && data.data) {
@@ -518,7 +551,11 @@ async function executeMultiFileProject(
   // 而不是拒绝报错（否则与注释声明的"不可执行时扫描真实入口"意图矛盾）
   const mainFileExt = mainFile?.split('.').pop()?.toLowerCase() || '';
   const mainFileExecutable = !!mainFile && mainFileExt !== '' && !NON_EXECUTABLE_EXTS.includes(mainFileExt);
-  const mainFileOk = mainFileExecutable && await fileExists(`${projectDir}\\${mainFile}`);
+  // 🔥 路径拼接按平台选分隔符（Mac/Linux 用 /，Windows 用 \）——硬编码 \ 会让
+  // macOS 上 fileExists 永远失败 → 入口探测失效 → 多文件项目无法运行
+  const sep = isWinPlatform() ? '\\' : '/';
+  const joinPath = (name: string) => `${projectDir}${sep}${name}`;
+  const mainFileOk = mainFileExecutable && await fileExists(joinPath(mainFile));
   if (!mainFileOk) {
     // 🔥 按惯例优先级探测入口（根目录 → 常见子目录 src/）
     const ENTRY_CANDIDATES = [
@@ -529,7 +566,7 @@ async function executeMultiFileProject(
     ];
     let detected: string | null = null;
     for (const candidate of ENTRY_CANDIDATES) {
-      if (await fileExists(`${projectDir}\\${candidate}`)) {
+      if (await fileExists(joinPath(candidate))) {
         detected = candidate;
         break;
       }
@@ -541,7 +578,7 @@ async function executeMultiFileProject(
     // 探测不到就保留原 mainFile 走后面的非可执行拦截（给出明确错误）
   }
 
-  const mainFilePath = `${projectDir}\\${effectiveMainFile}`;
+  const mainFilePath = joinPath(effectiveMainFile);
 
   // 🔥 构建执行命令
   let command: string;
@@ -549,7 +586,7 @@ async function executeMultiFileProject(
 
   // 🔥 优先检测 package.json（Node/npm 项目）
   try {
-    const packageJsonPath = `${projectDir}\\package.json`;
+    const packageJsonPath = joinPath('package.json');
     const packageJsonResult = await electron?.userpcFile?.read?.(packageJsonPath);
     
     if (packageJsonResult?.success && packageJsonResult?.data?.content) {
@@ -585,8 +622,10 @@ async function executeMultiFileProject(
       };
     }
 
+    // 🔥 macOS 12+ 不自带 python 命令，POSIX 统一用 python3
+    const pythonBin = isWinPlatform() ? 'python' : 'python3';
     if (ext === 'py') {
-      command = `python "${mainFilePath}"`;
+      command = `${pythonBin} "${mainFilePath}"`;
       commandType = 'python';
     } else if (ext === 'js' || ext === 'mjs') {
       command = `node "${mainFilePath}"`;
@@ -596,7 +635,7 @@ async function executeMultiFileProject(
       commandType = 'ts-node';
     } else {
       // 默认用 Python
-      command = `python "${mainFilePath}"`;
+      command = `${pythonBin} "${mainFilePath}"`;
       commandType = 'python';
     }
   }

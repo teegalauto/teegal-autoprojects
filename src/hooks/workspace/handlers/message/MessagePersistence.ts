@@ -52,6 +52,12 @@ export class MessagePersistence {
         icon_text: message.iconText,
         session_id: message.sessionId,
         memory: message.memory,
+        // 🔥 metadata 落库（messages 表已有 JSON 扩展列）：source 标签随 metadata 持久化，
+        // 历史加载时经 formatDatabaseMessages 还原到 Message.source
+        metadata: {
+          ...(message.metadata || {}),
+          ...(message.source ? { source: message.source } : {}),
+        },
       };
 
       await messageStorage.create(messageData);

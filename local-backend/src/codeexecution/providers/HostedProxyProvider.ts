@@ -42,6 +42,9 @@ export class HostedProxyProvider implements GpuCloudProvider {
   private secret: string;
   /** taskId -> (basename -> 云端已签 URL)，多任务并发互不串扰 */
   private latestUrlMapByTask: Map<string, Map<string, string>> = new Map();
+  // 🔥 本地 taskId -> 云端 instanceId 映射：refreshUrlMap 以云端 instanceId 为 key，
+  // 而 generatePresignedUrl 按 objectKey 里的本地 taskId 查——不映射则精确匹配恒 miss
+  private taskIdToInstanceId: Map<string, string> = new Map();
   /** 云端规格表缓存（唯一权威在云端，首次使用时拉取一次；null=未拉取） */
   private specsCache: GpuSpec[] | null = null;
   private specsCachePromise: Promise<GpuSpec[]> | null = null;
@@ -148,7 +151,12 @@ export class HostedProxyProvider implements GpuCloudProvider {
     if (task?.fullLogUrl) {
       urlMap.set('full_log.txt', task.fullLogUrl);
     }
+    // 🔥 双 key 写入：instanceId（轮询返回）+ 云端 task.taskId（若有），保证 generatePresignedUrl
+    // 无论按本地 taskId 还是云端 instanceId 查都能精确命中
     this.latestUrlMapByTask.set(taskId, urlMap);
+    if (task?.taskId && task.taskId !== taskId) {
+      this.latestUrlMapByTask.set(task.taskId, urlMap);
+    }
   }
 
   async queryPrice(spec: GpuSpec): Promise<PriceInfo> {
@@ -166,9 +174,10 @@ export class HostedProxyProvider implements GpuCloudProvider {
   }
 
   async createInstance(config: InstanceConfig): Promise<InstanceResult> {
+    let data: any = null;
     try {
       // 🔥 code 为本地 GpuWrapper 已包装的最终代码；spec.provider 透传给云端选择厂商
-      const data = await this.request('POST', '/execute', {
+      data = await this.request('POST', '/execute', {
         taskId: config.taskId,
         userId: config.userId,
         appId: config.appId,
@@ -186,6 +195,11 @@ export class HostedProxyProvider implements GpuCloudProvider {
     } catch (error: any) {
       console.error(`[GPU-HOSTED] 启动云端任务失败: ${config.taskId}`, error.message);
       return { success: false, error: error.message, errorCode: error.code };
+    } finally {
+      // 🔥 记录 taskId <-> instanceId 映射（refreshUrlMap 用 instanceId 做 key，查询按 taskId）
+      if (data?.instanceId && data.instanceId !== config.taskId) {
+        this.taskIdToInstanceId.set(config.taskId, data.instanceId);
+      }
     }
   }
 
@@ -368,13 +382,19 @@ export class HostedProxyProvider implements GpuCloudProvider {
    */
   generatePresignedUrl(objectKey: string): string {
     const basename = objectKey.split('/').pop() || objectKey;
-    // objectKey 形如 training-tasks/{taskId}/output/{filename}，先按任务精确定位
+    // objectKey 形如 training-tasks/{taskId}/output/{filename}，按任务精确定位。
+    // 🔥 严禁跨任务兜底：训练图表次次同名（loss_curve.png 等），按 basename 全局找
+    // 会串到旧任务（v1.3.59 引入的缺陷，导致图片链接指向 failed 旧任务/已过期签名）。
+    // 本任务查不到 = 云端未上传该文件 → 返回空串（诚实缺失），绝不拿别的任务顶包
     const taskMatch = objectKey.match(/training-tasks\/([^/]+)\/output\//);
     if (taskMatch) {
-      const url = this.latestUrlMapByTask.get(taskMatch[1])?.get(basename);
-      if (url) return url;
+      const taskId = taskMatch[1];
+      const instanceId = this.taskIdToInstanceId.get(taskId) || taskId;
+      const url = this.latestUrlMapByTask.get(instanceId)?.get(basename)
+        ?? this.latestUrlMapByTask.get(taskId)?.get(basename);
+      return url || '';
     }
-    // 兜底：full_log_url 等非标准 key（遍历各任务映射）
+    // 兜底：仅限不含 taskId 的非标准 key
     for (const urlMap of this.latestUrlMapByTask.values()) {
       const url = urlMap.get(basename);
       if (url) return url;

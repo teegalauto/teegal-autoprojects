@@ -154,7 +154,6 @@ function inferProviderFromInstanceType(instanceType: string): string {
 
 async function executeGpuTraining(
   appId: string,
-  codeContent: string | undefined,
   gpuInstanceType: string | undefined,
   wait: boolean,
   sessionId: string,
@@ -164,10 +163,9 @@ async function executeGpuTraining(
   let loadingToastId: string | number | undefined;
 
   try {
-    // 🔥 如果没有提供代码，让 AppExecutionService 从文件树读取
-    const finalCodeContent = codeContent || '';
-    
-    const gpuCheck = checkGpuRequirement(finalCodeContent || 'import torch');
+    // 🔥 代码以整个项目为单位（appId → 拉全项目），不支持单文件 code 传参；
+    // LLM 想跑新代码先 save_project_file 保存到项目再启动训练
+    const gpuCheck = checkGpuRequirement('import torch');
     const isGpu = true;
 
     console.log(`🚀 [RUN-GPU-TRAIN] GPU 需求检测:`, gpuCheck);
@@ -241,7 +239,8 @@ async function executeGpuTraining(
 
     console.log(`[RUN-GPU-TRAIN] GPU规格: ${finalGpuInstanceType}, 推断Provider: ${finalGpuProvider}`);
 
-    // 🔥 调用统一执行入口，自动从文件树读取代码并支持多文件
+    // 🔥 调用统一执行入口：恒走项目分支（拉全项目 zip + 入口探测），不传 code
+    // waitResult=wait：false 时实例创建成功即返回（fire-and-forget 提交，云端自治），不挂起等训练终态
     const result = await appExecutionService.execute({
       appId,
       userId,
@@ -249,7 +248,7 @@ async function executeGpuTraining(
       isGpu: true,
       gpuInstanceType: finalGpuInstanceType,
       gpuProvider: finalGpuProvider,
-      code: finalCodeContent || undefined,
+      waitResult: wait,
     });
 
     dismissTrainingToast(loadingToastId);
@@ -467,16 +466,25 @@ async function processExecutionResult(
 
 💡 可以使用 list_instance_types 查看可用的实例规格（GPU 卡型 / CPU 档位），然后重新发起。`;
       } else if (result.failureReason === 'execution_error' && result.instanceCreated) {
+        // 🔥 直接内联日志尾部：Python traceback 恒在日志末尾，而 200k 全量 output 进 ReAct 历史
+        //    会被截断保头（traceback 反而丢）——LLM 只能烧轮次"重读代码核对/查任务记录"。
+        //    error 是 LLM 必读字段，尾部 3000 字符足够覆盖完整 traceback，一轮定位
+        const logTail = (result.output || '').trim().slice(-3000);
         errorDetail = `GPU 实例已成功运行，但代码执行失败
 
 📋 执行详情：
 - GPU 实例: ${result.gpuInstanceType || '未知'}
 - 运行时长: ${result.actualDuration || '未知'}秒
-- 失败原因: 代码执行出错（请查看 output 日志）
 
-💡 这说明 GPU 实例已成功创建并运行，问题在于训练代码本身。
-请仔细分析 output 日志中的错误信息，修复代码后重新训练。`;
+📋 错误日志（末尾部分，Python 报错通常在最后）：
+\`\`\`
+${logTail || '（日志为空，无 stderr 输出）'}
+\`\`\`
+
+💡 直接根据上述 traceback 修复代码（save_project_file），修复后重新 run_project_oncloud，无需重读全部代码。`;
       } else if (result.failureReason === 'timeout' && result.instanceCreated) {
+        // 🔥 超时场景也内联日志尾部：末尾输出正是判断"训练慢/卡死/loss 不收敛"的一手依据
+        const logTail = (result.output || '').trim().slice(-2000);
         errorDetail = `GPU 训练超时
 
 📋 执行详情：
@@ -484,10 +492,19 @@ async function processExecutionResult(
 - 运行时长: ${result.actualDuration || '未知'}秒
 - 失败原因: 训练时间超过限制
 
-💡 建议：优化训练代码效率，或选择更强的 GPU 规格。`;
+📋 日志末尾（用于判断是训练慢还是卡死）：
+\`\`\`
+${logTail || '（日志为空）'}
+\`\`\`
+
+💡 建议：优化训练代码效率（减小数据量/epoch、简化模型），或选择更强的 GPU 规格。`;
       } else {
-        // 🔥 其他失败情况，使用原始 error
+        // 🔥 其他失败情况，使用原始 error + 日志尾部（崩溃信息在日志末尾，同样内联给 LLM）
+        const logTail = (result.output || '').trim().slice(-2000);
         errorDetail = result.error || '训练失败';
+        if (logTail) {
+          errorDetail += `\n\n📋 日志末尾（报错通常在最后）：\n\`\`\`\n${logTail}\n\`\`\``;
+        }
       }
     } else {
       message = `✅ GPU 训练成功完成！
@@ -599,7 +616,7 @@ export async function executeRunGpuTrainTool(
 
       // 🔥 使用解析后的完整 UUID
       const fullAppId = validation.resolvedId!;
-      return await executeGpuTraining(fullAppId, undefined, gpuInstanceType, wait, sessionId, context);
+      return await executeGpuTraining(fullAppId, gpuInstanceType, wait, sessionId, context);
     }
 
     // 场景 2：从 query 解析 appId
@@ -629,7 +646,7 @@ export async function executeRunGpuTrainTool(
 
       // 🔥 使用解析后的完整 UUID
       const fullAppId = validation.resolvedId!;
-      return await executeGpuTraining(fullAppId, undefined, gpuInstanceType, wait, sessionId, context);
+      return await executeGpuTraining(fullAppId, gpuInstanceType, wait, sessionId, context);
     }
 
     // 没解析到 appId，返回引导提示

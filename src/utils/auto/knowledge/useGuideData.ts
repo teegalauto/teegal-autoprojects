@@ -25,6 +25,12 @@ export const useGuideKnowledgeBase: KnowledgeItem[] = [
     category: "platform"
   },
   {
+    question: "怎么给你发大文件？",
+    answer: `小文件：直接作为邮件普通附件发送，我能收到附件直链并下载。大文件：离线邮件指挥时我会自动给你发一个上传链接（手机或电脑浏览器打开即可选文件上传，24小时有效），不用换工具；普通对话里直接把文件拖进对话或给文件路径即可。QQ邮箱"超大附件"、百度网盘分享页这类登录态页面我抓不到文件，遇到时我会主动给你上传链接。`,
+    keywords: ["大文件", "附件", "超大附件", "发文件", "传文件", "上传文件", "网盘", "百度网盘", "QQ邮箱超大附件", "提取码", "链接打不开", "中转页", "文件太大"],
+    category: "platform"
+  },
+  {
     question: "我要训练一个模型，怎么做？",
     answer: `1) 准备数据：用公开数据集或上传自有数据，让LLM解析结构
 2) 创建模型：让LLM根据任务类型自动生成神经网络结构
@@ -76,6 +82,53 @@ export const useGuideKnowledgeBase: KnowledgeItem[] = [
 ⚠️ TensorFlow 未预装：GPU 镜像里 import tensorflow 会报 ModuleNotFoundError。用户要求 TF 代码时，一律改写为 PyTorch 实现（阿里云环境封闭网络，pip 不可用）。`,
     keywords: ["框架", "PyTorch", "YOLO", "ResNet", "BERT", "模型", "支持什么框架", "TensorFlow", "keras", "tf", "强化学习", "RL", "gym", "gymnasium", "stable-baselines", "PPO", "DQN", "JAX"],
     category: "model"
+  },
+  {
+    question: "云端镜像预装了哪些 Python 库？版本是什么？",
+    answer: `【阿里云 GPU 镜像（workbees0327:gpu-latest，封闭网络）】
+预装：torch/torchvision(cu121)、numpy<2、ultralytics(YOLO目标检测，权重 /app/weights/)、transformers/accelerate/datasets/diffusers/peft、sklearn/pandas/matplotlib、gymnasium/stable-baselines3/tianshou、torch_geometric。
+pip 不可用，代码只能用预装库，数据和模型文件从用户数据目录读取。
+
+【腾讯云 CVM 镜像（img-xxx，可联网）】
+预装：Python3 + 常用科学计算栈（torch cu121 系列、numpy 2.2.6、pandas、sklearn、matplotlib）。
+任务依赖在代码开头自举 pip install 安装。
+
+⚠️ 版本坑（实测踩过）：腾讯镜像 runtime 是 numpy 2.2.6（新），而 pandas/parquet 生态是旧 wheel——半新半旧组合：
+1) 旧 pandas 与 numpy 2 不兼容：import 报 unregister_extension_type AttributeError，进程退出码 1。
+2) pyarrow≤15 的 wheel 全部用 numpy 1.x 编译，在 numpy 2 环境下 import 必崩——切勿 pin 12.0.1/14.0.2！
+正确写法（v3 自举）：按 numpy 大版本自适应选候选，numpy2 环境首选 pip install "pyarrow==18.1.0"。
+依赖 import 失败后不要在同一进程重装换版本重试（.so 已被进程映射，重装不可靠），
+改用 fastparquet 独立引擎兜底：装 fastparquet，读写 parquet 时传 engine="fastparquet"（代码里放一个 engine 开关变量）。
+自举装完必须用真实临时文件读写 parquet 冒烟验证，确认可用再进训练主流程。
+同理：给镜像环境补自举时，一律固定版本号并按 numpy 大版本适配，不要裸装 latest。`,
+    keywords: ["镜像", "预装", "云端环境", "Python库", "pip", "pandas", "pyarrow", "版本", "版本冲突", "依赖", "torch", "cu121", "自举安装", "gpu-latest", "requirements", "parquet", "unregister_extension_type"],
+    category: "training"
+  },
+  {
+    question: "怎么做 PPT / 修改 PPT？",
+    answer: `云端电脑已预装 PPT 工具链：markitdown（pptx→Markdown 读内容结构）、python-pptx（生成/修改）、LibreOffice（soffice --headless --convert-to pdf）、poppler（pdftoppm -png 出图），中文字体已配好。
+
+改 PPT 标准流程：
+1) markitdown 文件.pptx > 结构.md，先看内容与结构
+2) python-pptx 写脚本精改（文本/样式/页序）
+3) soffice --headless --convert-to pdf 渲染
+4) pdftoppm -png 出每页图，逐页检查版式、溢出、中文显示
+5) 有问题回到第 2 步迭代，确认无误再交付
+
+新建 PPT：python-pptx 直接写，同样渲染出图自检后再交付。交付用 uploadfiletooss 上传拿 URL。`,
+    keywords: ["ppt", "pptx", "做ppt", "修改ppt", "改ppt", "幻灯", "幻灯片", "演示", "演示文稿", "slides", "slide", "presentation", "markitdown", "python-pptx", "soffice", "powerpoint", "keynote"],
+    category: "platform"
+  },
+  {
+    question: "云端训练进程退出码 -9 或被 SIGKILL 杀死，怎么办？",
+    answer: `退出码 -9（SIGKILL）且日志无 Python traceback = 系统级强杀，最常见是小内存实例 OOM：
+4G 内存档的 CPU 实例加载全量大数据集（如 10 年行情 parquet）会被 OOM killer 直接杀掉，死前没有 traceback。
+排查：先看 stdout 死前日志走到哪一步（数据加载/训练循环），再评估数据量。
+解决：改用大内存档的 CPU 实例（32G 内存档实测可跑），代码无需改动；
+若必须小内存实例，用 max_codes/min_seg 等参数限制数据量或分块读取。
+注意：-9 说明前面的依赖自举已经通过（如日志已走到"parquet引擎就绪"），问题在数据阶段，不要回头折腾依赖。`,
+    keywords: ["退出码-9", "SIGKILL", "OOM", "内存不足", "被杀", "killed", "内存", "32G", "4G", "数据量", "实例规格", "CPU实例", "强杀", "OOM killer", "-9"],
+    category: "training"
   },
   {
     question: "数据格式有什么要求？",
@@ -353,7 +406,10 @@ return { success: true, data: { greeting: '你好，' + name } };
    - 兜底：若公钥探测失败（Permission denied），用 plink 密码通道（activate 输出会给出 authMode=password 和 hostkey 指纹，命令模板原样照抄）：
      userpc_shell(command="& \"$env:USERPROFILE\\.teegal\\bin\\plink.exe\" -ssh -batch -hostkey \"<activate返回的指纹>\" -pw $env:SSHPASS ubuntu@<IP> \"命令\"", credentialName=<activate 返回的凭据名>)
    - 实例就是一台干净 Linux 机器：可装依赖、git clone、跑服务、传文件
+   - 🔥 重新开机（或新开）得到的是全新机器：之前部署的服务/文件都不存在，直接重新部署，别浪费时间验证旧服务
    - 多条命令依次执行即可，机器在两次命令之间保持运行状态
+   - 🔥 复杂命令（多层引号/管道/特殊字符）或写远端文件，不要用 userpc_shell+ssh 硬扛本地转义：改用 ssh_remote（instanceId + command 执行 / remotePath + content 写文件，Node 直连免转义，三平台一致）
+   - 🔥 部署本地项目/文件到实例：ssh_remote push 模式 scp 直传——传 projectId+filePath+remotePath（项目文件）或 localPath+remotePath（本地路径，文件或目录均可）。一次调用完成传输，内容不占上下文、零大小限制，禁止逐文件读取再写入远端
 
 3. 关机：ssh_instance(action='close', instanceId='<实例ID>')
    - 云端按开机→关机时长自动结算扣费，关机即停止计费
@@ -363,10 +419,33 @@ return { success: true, data: { greeting: '你好，' + name } };
    - 不计费、不经过云端账本；绑定前自动做连通测试并配公钥免密
    - list 中显示为"自有机器（不计费）"；close 只解除与项目的绑定，机器本身不受影响
 
+5. 预览域名（机子上跑了 web 服务后）：ssh_instance(action='register', host='<机子IP>', port='<服务端口>', projectId='<项目id>')
+   - 返回 https://<短码>.preview.workbees.space 正式 HTTPS 地址，浏览器可直接访问（裸 IP:端口会被浏览器提示不安全）
+   - 幂等：同 projectId 重新登记（如重启后 IP 变了）复用同一域名；返回的 URL 要写进总结告知用户
+
 ⚠️ 注意：
 - 与 run_project_oncloud（跑完即销毁）不同，SSH 实例从开机到关机持续计费，用完务必 close
 - 超过最长租期或余额不足时云端会自动关机`,
-    keywords: ["ssh", "ssh_instance", "云主机", "开机", "远程机器", "云服务器", "租用实例", "linux实例", "S5", "CPU实例", "远程操作", "远程开发", "自有机器", "自有服务器", "绑定服务器"],
+    keywords: ["ssh", "ssh_instance", "ssh_remote", "云主机", "开机", "远程机器", "云服务器", "租用实例", "linux实例", "S5", "CPU实例", "远程操作", "远程开发", "自有机器", "自有服务器", "绑定服务器", "预览域名", "https", "register", "写文件到实例", "转义"],
+    category: "platform"
+  },
+  {
+    question: "项目部署到云端机子后，用户怎么用域名访问？",
+    answer: `机子上部署好 web 服务后，有两条路把"裸 IP:端口"变成正常可访问的地址：
+
+方式一（默认推荐）：官方预览域名，一条命令搞定
+- ssh_instance(action='register', host='<机子IP>', port='<服务端口>', projectId='<项目id>')
+- 立即返回 https://<短码>.preview.workbees.space（官方 nginx HTTPS 反代到机子，机子零改动、不用装证书）
+- 适合临时演示/验收；机子关机后域名自然 404，重新开机 IP 变了重新 register 一次即可（同 projectId 域名不变）
+
+方式二：用户自定义域名（正式长期使用才走这条，需要用户自己动手）
+- 用户自己买一个域名（任意注册商），在 DNS 服务商处加一条 A 记录指向机子公网 IP（可用 @ 和 www 两条）
+- 机子上开放 80/443 端口；HTTPS 证书需用户自己在机子上配置（如 certbot --nginx，或前面套一层 Cloudflare）
+- 如果不想暴露机子 IP 或被墙，可套 CDN（如 Cloudflare 代理模式，A 记录开橙云）
+- 这条路只能用户自己完成（涉及花钱买域名和 DNS 权限），你只能引导：告知机子 IP、要加的记录类型、开放哪些端口
+
+选择建议：临时看效果/验收 → 方式一（你来完成）；长期对外服务/自己的品牌 → 方式二（用户买域名自己绑定）。`,
+    keywords: ["域名", "自定义域名", "访问地址", "发布网站", "部署网站", "上线", "https", "证书", "备案", "预览域名", "preview", "A记录", "DNS", "绑定域名", "浏览器不安全", "网站访问"],
     category: "platform"
   },
   {
@@ -474,14 +553,14 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
   },
   {
     question: "怎么查看训练任务历史？",
-    answer: `用list_train_tasks工具查看某个项目的所有训练任务列表（含标记和备注），用get_train_task_detail工具查看某个任务的详细信息（包括输出日志、图表等）。
+    answer: `用list_tasks工具查看某个项目的任务列表（type='train'为云端训练，type='localrun'为本地执行，缺省两源合并；含标记和备注），用get_task_detail工具查看某个任务的详细信息（包括输出日志、图表等，taskId双源自动命中）。
 训练完成后建议用update_train_task_remark工具为任务添加备注，记录本次训练的主要修改内容和结果，便于后续迭代时快速了解每次训练的重点。例如：update_train_task_remark(taskId='xxx', remark='本次修改kl离散度loss_weight从0.1到0.3，val_loss从2.3降到1.8')`,
-    keywords: ["训练任务", "任务历史", "list_train_tasks", "get_train_task_detail", "训练记录", "任务列表", "任务详情", "update_train_task_remark", "训练备注", "训练总结"],
+    keywords: ["训练任务", "任务历史", "list_tasks", "get_task_detail", "训练记录", "任务列表", "任务详情", "update_train_task_remark", "训练备注", "训练总结"],
     category: "platform"
   },
   {
     question: "怎么停止正在进行的GPU训练？",
-    answer: `用stop_gpu_train工具停止正在运行的GPU训练任务，需要传入taskId参数。可以先用list_train_tasks获取所有训练任务列表，找到正在运行（running/pending状态）的任务的taskId，然后调用stop_gpu_train(taskId='xxx')停止训练。停止后会释放云端ECI实例，不再产生计费。`,
+    answer: `用stop_gpu_train工具停止正在运行的GPU训练任务，需要传入taskId参数。可以先用list_tasks(type='train')获取训练任务列表，找到正在运行（running/pending状态）的任务的taskId，然后调用stop_gpu_train(taskId='xxx')停止训练。停止后会释放云端ECI实例，不再产生计费。`,
     keywords: ["停止训练", "stop_gpu_train", "停止GPU训练", "终止训练", "停止计费", "释放实例", "stop training"],
     category: "training"
   },
@@ -1199,6 +1278,12 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
     category: "platform"
   },
   {
+    question: "怎么快速熟悉一个已有项目？",
+    answer: `先读项目记忆档案：call_memory 传 projectId（可省 query 翻最近任务档案，或带 query 定向查"上次部署配置"等）。档案里是每个任务的过程笔记（关键结论/文件路径/踩坑记录），先读档案再定向看代码，比盲目拉全项目快得多。任务完成时系统会自动把 ReAct 过程笔记存入项目档案。代码认知链路：list_project_files mode=skeleton 看全项目定义索引 → read_project_file 按 skeleton 给的行号定点精读；小项目（几个文件）直接 read_project_file 传 files 数组批量读（每文件前 60 行，超限自带续读坐标）。`,
+    keywords: ["项目记忆", "项目档案", "熟悉项目", "call_memory", "projectId", "历史记录", "之前做过", "接手项目", "项目历史"],
+    category: "platform"
+  },
+  {
     question: "怎么复现论文结果？",
     answer: `找官方代码，严格按论文设置超参和数据。注意随机种子、硬件差异。无法复现时仔细检查细节。`,
     keywords: ["复现", "reproduce", "论文复现", "结果复现", "replication"],
@@ -1374,37 +1459,17 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
   },
   {
     question: "GPU训练代码有哪些约束？",
-    answer: `GPU训练代码使用以下全局变量（已预定义）：
+    answer: `GPU训练代码只有一条核心约定：
 
-_OUTPUT_DIR：输出目录（本地磁盘 /tmp/output/）
-_files：文件列表（用于前端显示模型文件）
-_charts：图表列表（用于前端显示训练图表）
+_OUTPUT_DIR：输出目录（/tmp/output/，已预定义全局变量）。需要交付的文件（模型/图表/结果数据）保存到这里即可——训练结束后系统自动上传云端、前端自动显示（.pth/.pt 等识别为模型文件，.png/.jpg 识别为图表，含子目录如 YOLO runs/），并把下载 URL 写进任务结果。不需要手动登记。
 
-示例代码：
-import os, json
+print 的日志会全量回传，训练指标直接 print 即可。
 
-# 保存模型（会上传 + 前端显示）
-model_path = os.path.join(_OUTPUT_DIR, 'model.pth')
-torch.save(model.state_dict(), model_path)
-_files.append(model_path)  # 🔥 必须！否则前端不显示
+可选增强（非必须，按需使用）：
+- _files/_charts 全局列表：append 路径可精确控制前端显示哪些文件
+- 训练结束时 finally 里 print 一行 JSON（无前缀）：print(json.dumps({"success": True, "output": "摘要", "files": [...], "charts": [...]}, ensure_ascii=False))——让任务状态和摘要更精确；不输出时系统按退出码+产物自动扫描兜底，结果一样完整回传
 
-# 保存图表（会上传 + 前端显示）
-chart_path = os.path.join(_OUTPUT_DIR, 'loss.png')
-plt.savefig(chart_path)
-_charts.append(chart_path)  # 🔥 必须！否则前端不显示
-
-# 缓存文件（不上传，放在 /tmp/output 之外）
-cache_file = '/tmp/cache/data.pkl'
-with open(cache_file, 'wb') as f:
-    pickle.dump(df, f)
-
-🔥 结果输出规范（训练结束必须输出）：把整个训练包在 try/finally 中，finally 里单独 print 一行 JSON（无任何前缀文字，系统从日志末尾提取）：
-finally:
-    print(json.dumps({"success": True, "output": "训练完成 mAP50=0.62", "files": [model_path], "charts": [chart_path]}, ensure_ascii=False))
-
-要求：①单独一行、{ 开头 } 结尾、无 [output] 之类前缀；②必含 success 和 output 字段；③files/charts 写 _OUTPUT_DIR 拼出的绝对路径。
-⚠️ 未按规范输出时系统会自动迁移+扫描产物兜底（模型不丢），但结果会带"训练代码未按规范输出结果JSON"的错误标记——建议按规范输出，保证 success/output 状态准确。
-⚠️ 上传规则：_OUTPUT_DIR 下所有文件（含子目录）训练后自动上传到云端；但以下判定为缓存/临时文件不上传：以 . 开头的隐藏文件、~ 结尾、.log/.pkl/.cache/.tmp/.pyc 后缀——需要交付的文件不要用这些命名。
+⚠️ 临时文件不要放 _OUTPUT_DIR（会被上传）：放 /tmp/output 之外；同理交付文件不要用 .log/.pkl/.cache/.tmp/.pyc 后缀命名（判定为临时文件不上传）。
 
 ⚠️ 网络：云端外网受限，下载数据集请用 list_cloud_files 返回的内网地址；代码里的 OSS/COS 外网 URL 会被系统自动替换为内网，但 GitHub/HuggingFace 等其他外网地址不可用（会卡到超时）。
 
@@ -1414,17 +1479,13 @@ finally:
   },
   {
     question: "GPU训练输出文件怎么让前端显示？",
-    answer: `两种方式，建议都做：
+    answer: `最简方式：把文件保存到 _OUTPUT_DIR（/tmp/output/）即可——系统自动上传并在前端显示（模型/图表按后缀自动归类，含子目录），无需手动登记。
 
-方式1：append 到全局列表
-模型：_files.append(model_path)
-图表：_charts.append(chart_path)
+想精确控制显示内容时（可选）：
+- 方式1：_files.append(model_path) / _charts.append(chart_path)
+- 方式2：finally 里 print 一行 JSON：print(json.dumps({"success": True, "output": "摘要", "files": [...], "charts": [...]}, ensure_ascii=False))
 
-方式2：训练结束时（finally 中）单独 print 一行 JSON（无前缀）：
-print(json.dumps({"success": True, "output": "摘要", "files": [model_path], "charts": [chart_path]}, ensure_ascii=False))
-系统提取该 JSON 作为任务结果，files/charts 中的文件自动上传并回填云端 URL。
-
-路径用 _OUTPUT_DIR 拼绝对路径；写错时系统按文件名兜底匹配。两者都没做时系统自动扫描 /tmp/output 兜底收集（含子目录，如 YOLO runs/ 目录里的 args.yaml、train_batch*.jpg 等框架自动生成产物）。`,
+路径用 _OUTPUT_DIR 拼绝对路径；写错时系统按文件名兜底匹配，两者都没做时自动扫描 /tmp/output 兜底收集。`,
     keywords: ["前端显示", "输出文件", "_files", "_charts", "模型不显示", "图表不显示", "显示模型", "显示图表", "结果JSON", "finally输出"],
     category: "training"
   },

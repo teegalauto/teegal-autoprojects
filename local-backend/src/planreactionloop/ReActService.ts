@@ -44,6 +44,8 @@ export interface ReActRoundRequest {
     parameters: Record<string, any>;
     /** 🔥 真实轮号（executor push 时写入）：后端折叠行按真实轮号渲染，保证内容稳定 */
     roundNumber?: number;
+    /** 🔥 主动归档标记（LLM 传 archive=true 后由 executor 写入） */
+    archived?: boolean;
     result: {
       success: boolean;
       data?: any;
@@ -66,6 +68,10 @@ export interface ReActRoundResponse {
     name: string;
     parameters: Record<string, any>;
   }>;
+  /** 🔥 主动归档请求：LLM 判断笔记已记全，本轮工具执行完后归档旧轮次 */
+  archiveRequest?: boolean;
+  /** 🔥 归档时保留最近几条完整（= clearWindow） */
+  keepRecent?: number;
   error?: string;
 }
 
@@ -101,13 +107,14 @@ export class ReActService {
     const userQuery = environmentText?.split('\n')[0]?.replace('用户查询:', '').trim() || '';
 
     try {
-      // 🔥 clearWindow / maxHistoryChars 可从凭据表的 param 型参数读取，默认 6 / 60000
+      // 🔥 clearWindow / maxHistoryChars 可从凭据表的 param 型参数读取，默认 5 / 36000
+      // （实测 clearWindow=5 时归档批次对齐稳定，上游缓存命中 60%-80%）
       // 截断/折叠/动态压缩逻辑统一在 ReActProtocols.buildExecutionHistory 中处理
-      const CLEAR_WINDOW = getParamValue('clearWindow', userId, 6);
-      const MAX_HISTORY_CHARS = getParamValue('maxHistoryChars', userId, 60000);
+      const CLEAR_WINDOW = getParamValue('clearWindow', userId, 5);
+      const MAX_HISTORY_CHARS = getParamValue('maxHistoryChars', userId, 36000);
 
       // 构建 Prompt
-      const { systemPrompt, userPrompt } = ReActProtocols.buildPrompt({
+      const { systemPrompt, userPrompt, parts } = ReActProtocols.buildPrompt({
         roundNumber,
         maxRounds,
         userQuery,
@@ -119,13 +126,19 @@ export class ReActService {
         dynamicEnvironmentText,
         writeNotes,
         clearWindow: CLEAR_WINDOW, // 🔥 传入 clearWindow，保持与截断逻辑一致
-        maxHistoryChars: MAX_HISTORY_CHARS, // 🔥 历史体积预算，超出自动压缩窗口
+        maxHistoryChars: MAX_HISTORY_CHARS, // 🔥 历史体积预算，超出自动梯度压缩
+        sessionId, // 🔥 压缩级棘轮按 session 记忆（压缩一旦激活不回落，防历史内容反复变化打断缓存）
       });
 
 
-      // 🔥 每轮 prompt 体积监控（一行，简洁）：字符按 ~3字符/token 估算
-      const promptKB = (systemPrompt.length + userPrompt.length) / 1024;
-      console.log(`[REACT-SERVICE] Round ${roundNumber} prompt: ${promptKB.toFixed(1)}KB (~${Math.round((systemPrompt.length + userPrompt.length) / 3)} tokens)`);
+      // 🔥 每轮 prompt 体积监控（一行带分项归因）+ 归档/笔记走势（总量/条数/最大单条，看笔记是否逐轮膨胀）
+      const totalChars = systemPrompt.length + userPrompt.length;
+      const promptKB = totalChars / 1024;
+      const p = parts;
+      const noteSegs = (writeNotes || '').split('\n---\n').filter(s => s.trim());
+      const noteMax = noteSegs.length ? Math.max(...noteSegs.map(s => s.length)) : 0;
+      const archivedCount = (toolResults || []).filter(t => t.archived).length;
+      console.log(`[REACT-SERVICE] Round ${roundNumber} prompt: ${promptKB.toFixed(1)}KB (~${Math.round(totalChars / 3)} tokens) | 历史${(p.history / 1024).toFixed(1)}KB 归档${archivedCount}条 笔记${((writeNotes || '').length / 1024).toFixed(1)}KB/${noteSegs.length}条(max${noteMax}) 固定${(p.staticEnv / 1024).toFixed(1)}KB 动态${(p.dynamicEnv / 1024).toFixed(1)}KB`);
 
       // 调用 LLM
       const llmResponse = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber);
@@ -142,7 +155,7 @@ export class ReActService {
 
       // 解析 letMeDo、writeNotes、completeReport 和 Tools
       const content = llmResponse.data || '';
-      const { letMeDo, writeNotes: parsedWriteNotes, completeReport, tools } = this.parseReActResponse(content);
+      const { letMeDo, writeNotes: parsedWriteNotes, completeReport, tools, archive } = this.parseReActResponse(content);
 
       // 🔥 如果有 completeReport，在末尾添加提示：report 内容对用户不可见
       const finalCompleteReport = completeReport
@@ -156,6 +169,10 @@ export class ReActService {
         writeNotes: parsedWriteNotes,
         completeReport: finalCompleteReport,
         tools,
+        // 🔥 主动归档：LLM 声明 archive=true 时连同 clearWindow 一起返回，
+        // executor 据此给旧条目打 archived 标记（保留最近 clearWindow 条完整）
+        archiveRequest: archive === true,
+        keepRecent: CLEAR_WINDOW,
       };
     } catch (error) {
       console.error('[REACT-SERVICE] 推理失败:', { sessionId, roundNumber, error });
@@ -198,6 +215,13 @@ export class ReActService {
             { role: 'user', content: userPrompt },
           ],
           temperature: 0.3,
+          // 🔥 reactor 是工具调用循环，不需要深度思考——低思考档省输出 token
+          //（实测 deepseek 系不控时单轮 reasoning 可达 1.8 万字符）。summarizer 不传，保留默认思考强度
+          reasoningEffort: 'low',
+          // 🔥 输出硬闸：reactor 正常输出（writeNotes+letMeDo+tools）< 2000 token，思考参数失效时
+          //   防止模型把 prompt 长度镜像成长输出（实测 glm-5.3-flash 思考 26100 字符/轮 197s）。
+          //   思考耗尽预算时 LLMService 自带兜底：去除 max_tokens 并追加收敛提示重试一次
+          max_tokens: 6000,
         },
         resolvedModel.callConfig,
         600000  // 🔥 10分钟超时，前沿模型如 K2.6 响应较慢
@@ -243,8 +267,25 @@ export class ReActService {
     writeNotes?: string;
     completeReport?: string;
     tools: Array<{ name: string; parameters: Record<string, any> }>;
+    archive?: boolean;
     parseError?: string;
   } {
+    // 🔥 DeepSeek 系模型偶发格式漂移：忽略 JSON 指令，输出训练时的原生 DSML 工具调用标记
+    //（<｜DSML｜ invoke name="x"> ... <｜DSML｜ parameter name="p">v</｜DSML｜ parameter>）
+    // 该格式 JSON 提取必然失败，之前会导致「无 tool 无 report」下一轮重试再漂移 → 空转烧轮次
+    if (content.includes('DSML')) {
+      const dsmlTools = this.parseDSMLToolCalls(content);
+      if (dsmlTools.length > 0) {
+        console.warn(`[REACT-SERVICE] 检测到 DSML 格式工具调用（DeepSeek 格式漂移），已转换 ${dsmlTools.length} 个工具`);
+        return {
+          letMeDo: '（模型以 DSML 格式返回工具调用，已自动转换执行）',
+          writeNotes: undefined,
+          completeReport: undefined,
+          tools: dsmlTools,
+        };
+      }
+    }
+
     // 提取 JSON
     const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) ||
                       content.match(/\{[\s\S]*\}/);
@@ -264,6 +305,19 @@ export class ReActService {
     if (!parsed) {
       const errorPreview = jsonStr.substring(0, 200);
       console.error('[REACT-SERVICE] JSON 解析失败，原始内容:', errorPreview);
+      // 🔥 第5层兜底：宽松字段提取。JSON 整体坏掉（多为 writeNotes 长文本含未转义引号）
+      // 但关键字段的字符串值本身合法时仍可抢救——尤其 completeReport，抓到即任务完成；
+      // 否则执行器只会「继续下一轮」，长任务会空转烧几百轮 token
+      const salvage = this.salvageReActFields(jsonStr);
+      if (salvage.completeReport || salvage.letMeDo) {
+        console.warn('[REACT-SERVICE] JSON 整体解析失败，宽松提取抢救字段:', Object.keys(salvage).filter(k => (salvage as any)[k]).join(','));
+        return {
+          letMeDo: salvage.letMeDo || 'JSON 输出格式有误，已抢救关键信息',
+          writeNotes: salvage.writeNotes,
+          completeReport: salvage.completeReport,
+          tools: [],
+        };
+      }
       return {
         letMeDo: `JSON 解析失败，请检查输出格式。上次输出开头: ${errorPreview}`,
         parseError: `JSON 解析失败: ${errorPreview}`,
@@ -275,6 +329,8 @@ export class ReActService {
     const writeNotes = parsed.writeNotes;
     const completeReport = parsed.completeReport;
     const tools = parsed.tools || [];
+    // 🔥 主动归档请求：LLM 判断笔记已记全，本轮工具执行完后归档旧轮次（executor 侧打标记）
+    const archive = parsed.archive === true;
 
     // 验证 tools 格式
     const validTools = tools.filter((t: any) =>
@@ -284,7 +340,66 @@ export class ReActService {
       parameters: t.parameters || {},
     }));
 
-    return { letMeDo, writeNotes, completeReport, tools: validTools };
+    return { letMeDo, writeNotes, completeReport, tools: validTools, archive };
+  }
+
+  /**
+   * 🔥 解析 DeepSeek DSML 格式的工具调用（格式漂移兜底）
+   * 实际标记形如 <｜DSML｜ invoke name="x"> / <｜DSML｜ parameter name="p" string="true">v</｜DSML｜ parameter>
+   * 全角竖线数量在不同中转/版本下不稳定（｜ / ｜｜），故用宽松正则不依赖竖线：
+   * 只要出现 `invoke name="..."` 与 `parameter name="..."` 结构即提取
+   */
+  private parseDSMLToolCalls(content: string): Array<{ name: string; parameters: Record<string, any> }> {
+    const tools: Array<{ name: string; parameters: Record<string, any> }> = [];
+    // 按下一个 invoke 或文本结束切分每个工具调用块
+    const invokeRe = /invoke\s+name="([^"]+)"([\s\S]*?)(?=invoke\s+name=|$)/g;
+    let m: RegExpExecArray | null;
+    while ((m = invokeRe.exec(content)) !== null) {
+      const name = m[1];
+      const body = m[2];
+      if (!name) continue;
+      const parameters: Record<string, any> = {};
+      const paramRe = /parameter\s+name="([^"]+)"([^>]*)>([\s\S]*?)<\//g;
+      let p: RegExpExecArray | null;
+      while ((p = paramRe.exec(body)) !== null) {
+        const key = p[1];
+        let value: any = p[3];
+        // string="true" 声明的参数保持字符串；否则尝试转数字/布尔
+        const isString = /\sstring="true"/.test(p[2]);
+        if (!isString) {
+          const trimmed = value.trim();
+          if (trimmed === 'true') value = true;
+          else if (trimmed === 'false') value = false;
+          else if (trimmed !== '' && !Number.isNaN(Number(trimmed))) value = Number(trimmed);
+        }
+        parameters[key] = value;
+      }
+      tools.push({ name, parameters });
+    }
+    return tools;
+  }
+
+  /**
+   * 🔥 从损坏的 JSON 中宽松提取顶层字符串字段（值须是合法转义的字符串字面量）
+   * 用于 safeJSONParse 全部修复层都失败的场景：整体非法但单个字段可抢救。
+   * 抓到 completeReport 时执行器会按任务完成收尾，避免无限空转。
+   */
+  private salvageReActFields(jsonStr: string): { letMeDo?: string; writeNotes?: string; completeReport?: string } {
+    const grab = (field: string): string | undefined => {
+      const m = jsonStr.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+      if (!m) return undefined;
+      try {
+        const v = JSON.parse(`"${m[1]}"`);
+        return typeof v === 'string' && v.trim() ? v : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      letMeDo: grab('letMeDo'),
+      writeNotes: grab('writeNotes'),
+      completeReport: grab('completeReport'),
+    };
   }
 }
 

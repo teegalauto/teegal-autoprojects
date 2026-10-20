@@ -1,4 +1,5 @@
-import React, { useRef, useState, useCallback, useLayoutEffect } from 'react';
+import React, { useRef, useState, useCallback, useLayoutEffect, useMemo } from 'react';
+import { splitDiffLines, computeDiffLines, computeDiffStats } from './FileTree/utils';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Undo2, GitCommit } from 'lucide-react';
@@ -17,8 +18,8 @@ interface DiffLine {
   content: string;
 }
 
-export const DiffViewer: React.FC<DiffViewerProps> = ({ 
-  oldCode, 
+export const DiffViewer: React.FC<DiffViewerProps> = ({
+  oldCode,
   newCode,
   onRevert,
   onAccept
@@ -48,14 +49,27 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   // 🔥 滚动时更新位置，驱动 minimap viewport indicator 同步
   // ⚠️ 必须放在下方两个 early return 之前：否则"无历史版本/代码一致"的渲染只执行 6 个 hook，
   // 加载到历史版本后走完整路径变成 7 个 → hook 数不一致 → React error #300（Rendered more hooks）
+  const rafRef = useRef(0);
   const handleScroll = useCallback(() => {
-    if (scrollContainerRef.current) {
-      setScrollTop(scrollContainerRef.current.scrollTop);
-    }
+    if (rafRef.current) return; // 🔥 rAF 节流：滚动事件高频触发，避免每帧全量重渲染
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      if (scrollContainerRef.current) {
+        setScrollTop(scrollContainerRef.current.scrollTop);
+      }
+    });
   }, []);
 
-  // 1. 如果没有历史版本
-  if (!oldCode) {
+  // 🔥 diff 计算结果缓存：只在内容变化时重算（曾裸跑在 render 体内，
+  // 滚动一行就全量重算 LCS + 重渲染上万行 DOM 直接卡死）
+  const diffLines: DiffLine[] | null = useMemo(
+    () => computeDiffLines(oldCode, newCode),
+    [oldCode, newCode]
+  );
+
+  // 1. 无历史版本且当前内容也为空，才无从对比
+  // 🔥 新文件场景（oldCode 为空、newCode 有内容）：与空串对比，走下方 diff 渲染全部显示为新增（全绿）
+  if (!oldCode && !newCode) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-gray-400 bg-gray-50/50">
         <div className="text-sm font-medium">暂无历史版本记录</div>
@@ -73,67 +87,58 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     );
   }
 
-  // 🔥 标准化行尾符：CRLF→LF，去除行尾空白，避免行尾差异导致整文件重写
-  const normalizeLine = (line: string) => line.replace(/\r$/, '').trimEnd();
-  const oldLines = oldCode.split('\n').map(normalizeLine);
-  const newLines = newCode.split('\n').map(normalizeLine);
-  
-  // 使用动态规划思想实现最长公共子序列算法来辅助diff
-  const m = oldLines.length;
-  const n = newLines.length;
-  
-  // 创建二维数组记录LCS
-  const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-  
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (oldLines[i - 1] === newLines[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
-    }
-  }
-  
-  // 根据LCS回溯找出差异
-  const diffLines: DiffLine[] = [];
-  let i = m, j = n;
-  
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
-      // 相同行
-      diffLines.unshift({
-        type: 'unchanged',
-        oldLineNumber: i,
-        newLineNumber: j,
-        content: oldLines[i - 1]
-      });
-      i--;
-      j--;
-    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-      // 新增行
-      diffLines.unshift({
-        type: 'added',
-        oldLineNumber: null,
-        newLineNumber: j,
-        content: newLines[j - 1]
-      });
-      j--;
-    } else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
-      // 删除行
-      diffLines.unshift({
-        type: 'deleted',
-        oldLineNumber: i,
-        newLineNumber: null,
-        content: oldLines[i - 1]
-      });
-      i--;
-    }
+  // 🔥 文件过大（裁剪公共前后缀后仍超 LCS 规模护栏）：不做逐行对比，宁缺毋滥。
+  // 工具栏（接受/回退）照常可用——操作不依赖 diff 结果
+  if (diffLines === null) {
+    const oldCount = splitDiffLines(oldCode).length;
+    const newCount = splitDiffLines(newCode).length;
+    const { added, deleted } = computeDiffStats(oldCode, newCode);
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-gray-400 bg-gray-50/50 gap-3">
+        <div className="text-sm font-medium">文件过大，暂不支持逐行对比</div>
+        <div className="text-xs text-gray-400">
+          旧版本 {oldCount} 行 / 新版本 {newCount} 行 ·
+          <span className="text-green-600"> +{added}</span>
+          <span className="text-red-600"> -{deleted}</span>
+          ，可在编辑器中直接查看内容
+        </div>
+        {(onRevert || onAccept) && (
+          <div className="flex gap-2">
+            {onRevert && (
+              <Button variant="outline" size="sm" onClick={onRevert} className="h-7 px-2 text-xs">
+                <Undo2 className="w-3.5 h-3.5 mr-1" />
+                回退
+              </Button>
+            )}
+            {onAccept && (
+              <Button variant="outline" size="sm" onClick={onAccept} className="h-7 px-2 text-xs">
+                <GitCommit className="w-3.5 h-3.5 mr-1" />
+                接受
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+    );
   }
 
   // 🔥 统计新增/删除行数
   const addedCount = diffLines.filter(l => l.type === 'added').length;
   const deletedCount = diffLines.filter(l => l.type === 'deleted').length;
+
+  // 🔥 minimap 修改标记采样：变更行过多时抽稀到 ≤400 个标记（每行一个 div 曾上万节点）
+  const changedCount = diffLines.filter(l => l.type !== 'unchanged').length;
+  const minimapStride = Math.max(1, Math.ceil(changedCount / 400));
+  const minimapMarkers: { type: 'added' | 'deleted'; topPercent: number }[] = [];
+  let changedSeen = 0;
+  for (let idx = 0; idx < diffLines.length; idx++) {
+    const l = diffLines[idx];
+    if (l.type === 'unchanged') continue;
+    if (changedSeen % minimapStride === 0) {
+      minimapMarkers.push({ type: l.type, topPercent: (idx / diffLines.length) * 100 });
+    }
+    changedSeen++;
+  }
 
   // 🔥 点击 minimap 跳转（点击位置居中显示，基于 viewHeight 映射区域）
   const handleMinimapClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -227,21 +232,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         >
           {/* 🔥 修改标记 — 映射区域高度 = scroll container 的 clientHeight（viewHeight），排除水平滚动条偏差 */}
           <div className="absolute left-0 right-0 overflow-hidden" style={{ height: viewHeight || undefined, top: 0 }}>
-            {diffLines.map((line, index) => {
-              const topPercent = (index / diffLines.length) * 100;
-              const heightPercent = 100 / diffLines.length;
-              
+            {minimapMarkers.map((m, index) => {
               return (
                 <div
                   key={index}
                   className={`absolute left-0 right-0 ${
-                    line.type === 'added' ? 'bg-green-400' : 
-                    line.type === 'deleted' ? 'bg-red-400' : 
-                    'bg-transparent'
+                    m.type === 'added' ? 'bg-green-400' : 'bg-red-400'
                   }`}
                   style={{
-                    top: `${topPercent}%`,
-                    height: `${Math.max(heightPercent, 1)}px`
+                    top: `${m.topPercent}%`,
+                    height: `${Math.max((minimapStride * 100) / diffLines.length, 1)}px`
                   }}
                 />
               );

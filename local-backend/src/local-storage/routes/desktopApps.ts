@@ -35,6 +35,30 @@ router.get('/', (req, res) => {
 });
 
 /**
+ * GET /api/local/desktop-apps/project-memory?user_id=&project_id=&query=&limit=
+ * 🔥 查询项目记忆：无 query 时间倒序翻档案；有 query 打分×时间衰减定向查
+ * （必须在 GET /:id 之前注册，否则被动态路由捕获）
+ */
+router.get('/project-memory', (req, res) => {
+  try {
+    const { user_id, project_id, query, limit } = req.query as any;
+    if (!user_id || !project_id) {
+      return res.status(400).json({ error: 'user_id 与 project_id 必填' });
+    }
+    const memories = desktopAppDAO.queryProjectMemory({
+      userId: user_id,
+      projectId: project_id,
+      query,
+      limit: limit ? parseInt(limit, 10) : 5,
+    });
+    res.json({ data: memories });
+  } catch (error: any) {
+    console.error('❌ 查询项目记忆失败:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * GET /api/local/desktop-apps/:id
  * 获取单个桌面应用
  */
@@ -230,6 +254,32 @@ router.post('/boot-project/ensure', (req, res) => {
     res.json({ data: app, created: !existed });
   } catch (error: any) {
     console.error('❌ 确保 BootCode 项目失败:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/local/desktop-apps/project-memory/save
+ * 🔥 保存项目记忆（ReAct 任务完成收尾时由客户端触发；多项目任务每个归属项目存一条）
+ */
+router.post('/project-memory/save', (req, res) => {
+  try {
+    const { user_id, project_ids, user_query, write_note, conversation_id } = req.body;
+    if (!user_id || !Array.isArray(project_ids) || project_ids.length === 0) {
+      return res.status(400).json({ error: 'user_id 与 project_ids 必填' });
+    }
+    for (const pid of project_ids) {
+      desktopAppDAO.saveProjectMemory({
+        projectId: pid,
+        userId: user_id,
+        userQuery: user_query,
+        writeNote: write_note,
+        conversationId: conversation_id,
+      });
+    }
+    res.json({ success: true, saved: project_ids.length });
+  } catch (error: any) {
+    console.error('❌ 保存项目记忆失败:', error);
     res.status(500).json({ error: error.message });
   }
 });

@@ -70,6 +70,10 @@ export interface Message {
   // 🔥 新字段：记忆（来自 memory++）
   memory?: string;
 
+  // 🔥 userQuery 来源标签：'chat'（聊天输入，缺省）| 'email'（离线邮件指挥）| 未来 IM 渠道扩展
+  // 持久化在 messages.metadata JSON 的 source 字段，渲染时非 chat 来源在时间戳旁显示来源图标
+  source?: string;
+
   // 🔥 保留旧字段用于向后兼容
   phase_data?: {
     phase: string;

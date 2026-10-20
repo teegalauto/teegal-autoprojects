@@ -168,53 +168,132 @@ export function fixMalformedJSON(jsonStr: string): string {
     result = result.substring(0, start) + fixed + result.substring(end);
   }
 
-  // 修复2：括号不匹配（使用栈 + 字符串感知，正确处理嵌套顺序）
-  // 旧实现先补 } 再补 ]，对 { "tools": [ ... } 这种嵌套会生成 }]（非法），
-  // 应该先关内层 ] 再关外层 }。用栈记录打开顺序，逆序闭合即可。
-  // 同时跳过 JSON 字符串值内的括号（如 task 里的 [-3,3]），避免误计数。
+  // 修复2：括号不匹配（字符串感知 + 就地补齐闭合符）
+  // 旧实现只把缺失闭合符追加到末尾：能救"输出被截断"，救不了"中间漏一个 }"——
+  // 真实案例：GLM 输出深嵌套+长字符串 JSON 时漏掉工具对象的闭合 }，后面还有
+  // 数组的 ] 和根 }，旧逻辑跳过不匹配的 ]、误消费根 }，补完仍非法 → sessioncreate 掉会话。
+  // 就地补齐：遇到 ]/} 与栈顶不符时，先把内层缺失的闭合符补在当前位置再消费当前字符；
+  // 末尾再按嵌套逆序补齐截断场景的剩余开括号。顺带清理 ] } 前的悬挂逗号。
   const bracketStack: string[] = [];
   let inString = false;
   let escaped = false;
+  let balanced = '';
   for (let i = 0; i < result.length; i++) {
     const char = result[i];
-    if (escaped) { escaped = false; continue; }
-    if (char === '\\') { escaped = true; continue; }
-    if (char === '"') { inString = !inString; continue; }
-    if (inString) continue;
+    if (escaped) { escaped = false; balanced += char; continue; }
+    if (char === '\\') { escaped = true; balanced += char; continue; }
+    if (char === '"') { inString = !inString; balanced += char; continue; }
+    if (inString) { balanced += char; continue; }
     if (char === '{' || char === '[') {
       bracketStack.push(char);
+      balanced += char;
     } else if (char === '}' || char === ']') {
-      const top = bracketStack[bracketStack.length - 1];
-      if (top === '{' && char === '}') bracketStack.pop();
-      else if (top === '[' && char === ']') bracketStack.pop();
+      const expected = char === '}' ? '{' : '[';
+      let drop = false;
+      if (bracketStack.length && bracketStack[bracketStack.length - 1] === expected) {
+        bracketStack.pop();
+      } else if (bracketStack.includes(expected)) {
+        // 内层漏闭合：就地补齐（内层先关），如 [... { ... ] → [... { ... }]
+        while (bracketStack.length && bracketStack[bracketStack.length - 1] !== expected) {
+          const open = bracketStack.pop()!;
+          balanced += open === '{' ? '}' : ']';
+        }
+        bracketStack.pop();
+      } else {
+        drop = true; // 多余的闭合符（栈中无对应开括号）：丢弃
+      }
+      if (!drop) {
+        balanced += char;
+      }
+    } else {
+      balanced += char;
     }
   }
+  // 截断场景：仍未闭合的开括号按嵌套逆序补到末尾
   for (let i = bracketStack.length - 1; i >= 0; i--) {
-    result += bracketStack[i] === '{' ? '}' : ']';
+    balanced += bracketStack[i] === '{' ? '}' : ']';
   }
+  // 🔥 悬挂逗号统一清理（字符串感知）：扫描内就地补齐的闭合符和末尾补齐的闭合符
+  // 都可能前面残留逗号（如 {...true}, + 补]} → ,]} 非法），末尾一次清干净
+  result = stripDanglingCommas(balanced);
 
   return result;
 }
 
+/** 字符串感知的悬挂逗号清理：仅删除 } ] 前的逗号（字符串内容不碰） */
+function stripDanglingCommas(s: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; out += ch; continue; }
+    if (ch === '}' || ch === ']') {
+      const trimmed = out.replace(/\s+$/, '');
+      if (trimmed.endsWith(',')) out = trimmed.slice(0, -1);
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * 解析 + LaTeX 静默破坏检测
+ * \theta 等首字母恰为合法转义的命令会被 JSON.parse"成功"但静默破坏（\t→TAB），
+ * 解析成功也必须检测，破坏时带 LaTeX 保护重修；重修失败宁可返回脏数据不丢内容
+ */
+function checkedParse(s: string): any {
+  const result = JSON.parse(s);
+  if (!hasSilentLatexCorruption(result)) return result;
+  try {
+    return JSON.parse(repairJSONEscapes(s));
+  } catch {
+    return result;
+  }
+}
+
+/**
+ * 组合修复管线：依次尝试 原样 → 修转义 → 修结构 → 归一化 → 归一化+修结构
+ * 供 safeJSONParse 高层（提取主体后/归一化后）复用
+ */
+function parseWithAllFixes(s: string): any | null {
+  const candidates = [
+    s,
+    repairJSONEscapes(s),
+    fixMalformedJSON(s),
+    normalizeJSONStructure(s),
+    fixMalformedJSON(normalizeJSONStructure(s)),
+  ];
+  for (const candidate of candidates) {
+    try {
+      return checkedParse(candidate);
+    } catch {
+      // 下一个候选
+    }
+  }
+  return null;
+}
+
 /**
  * 安全的 JSON 解析
- * 多层尝试：直接解析 → 修复无效转义序列 → 修复后解析
+ * 多层尝试：直接解析 → 修复转义 → 修复结构 → 提取主体+全管线 → 全角/Python字面量归一化
  */
 export function safeJSONParse(jsonStr: string): any | null {
-  // 第1层：直接解析
-  // 🔥 注意：含单反斜杠 LaTeX（如 \theta）的 JSON 是"合法"JSON（\t 是合法转义符），
-  // JSON.parse 会成功但把 \theta 静默解析成 TAB+"heta"，必须解析后检测并重修
+  // 第0层：去 BOM（JSON.parse 对 \uFEFF 直接抛错）
+  if (jsonStr.charCodeAt(0) === 0xfeff) {
+    jsonStr = jsonStr.slice(1);
+  }
+
+  // 第1层：直接解析（含 LaTeX 静默破坏检测）
   try {
-    const result = JSON.parse(jsonStr);
-    if (!hasSilentLatexCorruption(result)) {
-      return result;
-    }
-    // 检测到静默破坏：带 LaTeX 命令保护重新解析
-    try {
-      return JSON.parse(repairJSONEscapes(jsonStr));
-    } catch {
-      return result; // 修复失败则回退原结果（宁可脏数据也不能丢数据）
-    }
+    return checkedParse(jsonStr);
   } catch {
     // 继续尝试
   }
@@ -222,42 +301,207 @@ export function safeJSONParse(jsonStr: string): any | null {
   // 第2层：修复无效的转义序列（如 \a, \[, \] 等 LaTeX 公式中的反斜杠）
   // 🔥 含 LaTeX 命令保护（\theta/\times/\neq 等首字母恰为 JSON 合法转义符的命令）
   try {
-    return JSON.parse(repairJSONEscapes(jsonStr));
-  } catch (e) {
+    return checkedParse(repairJSONEscapes(jsonStr));
+  } catch {
     // 继续尝试
   }
 
-  // 第3层：使用 fixMalformedJSON 修复（处理多行字符串等）
+  // 第3层：使用 fixMalformedJSON 修复（多行字符串 + 括号就地补齐）
   try {
     const fixed = fixMalformedJSON(jsonStr);
     if (fixed !== jsonStr) {
-      const result = JSON.parse(fixed);
-      // 🔥 同样检测静默 LaTeX 破坏（多行字符串 + \theta 共存时）
-      if (!hasSilentLatexCorruption(result)) {
-        return result;
-      }
-      try {
-        return JSON.parse(repairJSONEscapes(fixed));
-      } catch {
-        return result;
-      }
+      return checkedParse(fixed);
     }
   } catch {
     // 继续尝试
   }
 
-  // 第4层：尝试提取 JSON 对象（从第一个 { 到最后一个 }）
+  // 第4层：提取 JSON 主体（剥 markdown 围栏/前后散文）后跑完整修复管线
+  // 🔥 旧实现提取后只修转义——"围栏+漏括号/截断"组合场景救不了
+  const firstBrace = jsonStr.indexOf('{');
+  const lastBrace = jsonStr.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      const inner = jsonStr.substring(firstBrace, lastBrace + 1);
+      const result = parseWithAllFixes(inner);
+      if (result !== null) return result;
+    } catch {
+      // 继续尝试
+    }
+  }
+
+  // 第5层：全角结构符/Python 字面量归一化（中文弱模型常见瑕疵，仅动字符串外的结构符）
   try {
-    const firstBrace = jsonStr.indexOf('{');
-    const lastBrace = jsonStr.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      const jsonContent = jsonStr.substring(firstBrace, lastBrace + 1);
-      // 再次尝试修复转义（含 LaTeX 命令保护）
-      return JSON.parse(repairJSONEscapes(jsonContent));
+    const normalized = normalizeJSONStructure(jsonStr);
+    if (normalized !== jsonStr) {
+      const result = parseWithAllFixes(normalized);
+      if (result !== null) return result;
     }
   } catch {
     // 继续尝试
   }
 
   return null;
+}
+
+/**
+ * 🔥 结构归一化（最后一道抢救层，仅动字符串"外"的结构性瑕疵，字符串内容一律不碰）：
+ * - 全角结构符 → ASCII：：，｛｝［］“”（中文弱模型在结构位打全角是常见瑕疵）
+ * - Python 字面量 → JSON：True/False/None → true/false/null（词边界，仅字符串外）
+ * 注意：全角引号当定界符的退化场景中，其"字符串内容"也会过 Python 字面量替换——
+ * 该层仅在常规解析全部失败后触发，宁可小概率内容变形也不放弃整个 JSON。
+ * ASCII 单引号定界（'a':1）不做处理：与英文撇号无法区分，误伤风险大于收益。
+ */
+export function normalizeJSONStructure(jsonStr: string): string {
+  const FW: Record<string, string> = {
+    '：': ':', '，': ',', '｛': '{', '｝': '}', '［': '[', '］': ']', '“': '"', '”': '"',
+  };
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let plain = ''; // 当前连续非字符串片段
+  const flush = () => {
+    if (!plain) return;
+    let t = '';
+    for (const ch of plain) t += FW[ch] ?? ch;
+    t = t.replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null');
+    out += t;
+    plain = '';
+  };
+  for (let i = 0; i < jsonStr.length; i++) {
+    const ch = jsonStr[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { flush(); inString = true; out += ch; continue; }
+    plain += ch;
+  }
+  flush();
+  return out;
+}
+
+/**
+ * 🔥 字符串感知的平衡闭合定位：返回 text[openIdx]（[ 或 {）的匹配闭合符下标。
+ * 括号交叉错乱（漏括号导致栈不匹配）返回 -1，调用方回退为"截到末尾"交给修复管线。
+ */
+export function findBalancedEnd(text: string, openIdx: number): number {
+  const open = text[openIdx];
+  if (open !== '[' && open !== '{') return -1;
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = openIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '[' || ch === '{') { stack.push(ch); continue; }
+    if (ch === ']' || ch === '}') {
+      const top = stack.pop();
+      if (!top) return -1;
+      if ((ch === ']' && top !== '[') || (ch === '}' && top !== '{')) return -1;
+      if (!stack.length) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * 🔥 平衡括号提取顶层 JSON 对象（字符串感知，嵌套 parameters 不再被 [^}]* 截断）。
+ * 每个候选走 safeJSONParse 全修复管线（含未闭合尾部对象的补齐抢救），坏对象丢弃。
+ */
+export function extractJSONObjects(text: string): any[] {
+  const results: any[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth === 0) continue;
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const obj = safeJSONParse(text.slice(start, i + 1));
+        if (obj && typeof obj === 'object') results.push(obj);
+        start = -1;
+      }
+    }
+  }
+  // 尾部未闭合对象（输出截断）：fixMalformedJSON 补齐闭合符后抢救
+  if (depth > 0 && start >= 0) {
+    const obj = safeJSONParse(fixMalformedJSON(text.slice(start)));
+    if (obj && typeof obj === 'object') results.push(obj);
+  }
+  return results;
+}
+
+/**
+ * 🔥 工具调用 key 名漂移归一：params/arguments/args→parameters、tool/tool_name/toolName→name
+ * 静默风险：{name, params:{task}} 不归一时 parameters 变 {} → sessioncreate 空任务启动会话
+ * （比工具丢失更糟）。无合法 name 的对象返回 null（调用方丢弃）。
+ */
+export function normalizeToolAliases(item: any): { name: string; parameters: Record<string, any> } | null {
+  if (!item || typeof item !== 'object') return null;
+  const name = item.name ?? item.tool ?? item.tool_name ?? item.toolName;
+  if (typeof name !== 'string' || !name) return null;
+  const rawParams = item.parameters ?? item.params ?? item.arguments ?? item.args;
+  return {
+    name,
+    parameters: rawParams && typeof rawParams === 'object' ? rawParams : {}
+  };
+}
+
+/**
+ * 🔥 意图推断最后抢救：原文含合法工具名但结构化解析全部失败（JSON 形态碎裂、
+ * key 无引号、括号交叉错乱等）时，escape-aware 正则直接配对 name + task/
+ * sessionId/priority 重建工具调用。key 引号可选（兼容无引号 key 的退化形态）。
+ * 返回 undefined = 没抢救到（调用方按"该丢就丢"处理）。
+ */
+export function salvageToolsFromText(
+  raw: string,
+  validNames: string[]
+): Array<{ name: string; parameters: Record<string, any> }> | undefined {
+  const tools: Array<{ name: string; parameters: Record<string, any> }> = [];
+  const seen = new Set<string>();
+  // key 引号可选：既匹配 "name"/"tool"，也匹配无引号 name:/tool:
+  const re = /"?(?:name|tool|tool_name|toolName)"?\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const name = m[1];
+    if (!validNames.includes(name)) continue;
+    const rest = raw.slice(m.index, m.index + 4000); // 覆盖超长 task 值（实测 1600+ 字符）
+    const params: Record<string, any> = {};
+    // task 尾引号可选：输出被 max_tokens 截断时 task 值没有闭合引号，截到内容末尾
+    // 也比丢弃强（长任务描述截断仍可用；[^"\\] 遇下一个引号自然停，不越界）
+    const taskMatch = rest.match(/"?(?:task|instruction)"?\s*:\s*"((?:[^"\\]|\\.)*)"?/);
+    if (taskMatch) params.task = unescapeJSONString(taskMatch[1]);
+    const prioMatch = rest.match(/"?(?:priority|urgent)"?\s*:\s*(true|false)/);
+    if (prioMatch) params.priority = prioMatch[1] === 'true';
+    const sidMatch = rest.match(/"?(?:sessionId|session_id)"?\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (sidMatch) params.sessionId = unescapeJSONString(sidMatch[1]);
+    const key = `${name}\u0000${params.task || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tools.push({ name, parameters: params });
+  }
+  return tools.length ? tools : undefined;
 }

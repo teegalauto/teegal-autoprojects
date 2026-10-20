@@ -398,6 +398,27 @@ router.get('/token-usage/today', (req, res) => {
   }
 });
 
+// 🔥 任务级聚合：按 sessionId 输出每任务的轮数/token/缓存命中率
+router.get('/token-usage/session-aggregates', (req, res) => {
+  try {
+    const days = parseInt(req.query.days as string) || 7;
+    console.log(`[LLM-MODELS-API] 获取最近 ${days} 天的 sessionId 任务级聚合`);
+
+    const aggregates = tokenUsageService.getSessionAggregates(days);
+
+    res.json({
+      success: true,
+      data: aggregates,
+    });
+  } catch (error) {
+    console.error('[LLM-MODELS-API] 获取任务级聚合失败:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch session aggregates',
+    });
+  }
+});
+
 // ========== 通用路由（必须放在最后） ==========
 
 router.get('/:id', (req, res) => {

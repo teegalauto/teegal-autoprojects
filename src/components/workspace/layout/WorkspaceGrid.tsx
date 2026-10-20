@@ -183,7 +183,9 @@ const WorkspaceGrid = ({
       {sidePanel && (
         <div className="w-[500px] flex-shrink-0 h-full bg-white border-l shadow-lg">
           <div
-            className="flex items-center justify-between px-4 py-2 border-b"
+            className="flex items-center justify-between px-4 py-2 border-b h-12"
+            // 🔥 h-12 与 ChatHeader 锁同一高度（48px）：此处不锁会被内容撑成 ~45px，两侧头部有视觉差；
+            // 下方内容区 h-[calc(100%-48px)] 也是按 48px 设计的
             // 🔥 整个头部默认 drag（恢复大可拖区域，之前缩到只剩标题导致侧边栏头部几乎拖不动窗口）；
             // 仅筛选菜单打开期间临时取消 drag：点击外部收菜单需要 DOM 点击事件，drag 区会吞掉点击
             // （当初"整个头部 drag 导致菜单收不回"的根因）。所有交互元素（创建/筛选/关闭）单独 no-drag

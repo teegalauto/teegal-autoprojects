@@ -17,6 +17,7 @@ declare global {
       };
       getAppVersion?: () => Promise<string>;
       getUserDataPath?: () => Promise<string>;
+      setOfflinePowerSave?: (on: boolean) => Promise<void>;
       systemCommand?: (options: { command: string; timeout?: number; workingDir?: string }) => Promise<{ success: boolean; message?: string; error?: string }>;
     };
   }

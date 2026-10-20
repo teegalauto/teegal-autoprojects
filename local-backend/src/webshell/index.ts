@@ -4,7 +4,6 @@
  */
 
 export * from './types';
-export * from './SimpleSearchService';
 export * from './UrlReaderService';
 export * from './providers/SearchProviders';
 export * from './providers/FetchProviders';

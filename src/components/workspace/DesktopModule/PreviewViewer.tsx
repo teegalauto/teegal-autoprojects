@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { X, RefreshCw, AlertCircle, FileText, Download, CheckCircle2, Copy, Maximize2, FolderOpen, FileIcon, CloudUpload, Check, Image, FileSpreadsheet, FileCode, FileArchive, File, Sparkles } from "lucide-react";
+import { X, RefreshCw, AlertCircle, FileText, Download, CheckCircle2, Copy, Maximize2, FolderOpen, FileIcon, CloudUpload, Check, Image, FileSpreadsheet, FileCode, FileArchive, File, Sparkles, ChevronDown, ChevronRight } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useTranslation } from "react-i18next";
 import { ChartRenderer } from './ChartRenderer';
@@ -71,14 +71,39 @@ interface PreviewViewerProps {
 const PATH_TO_FILE_KEY = 'preview_path_to_file_map';
 
 /**
- * 🔥 渲染文本内容，URL 自动转为可点击链接（新窗口打开）
- * 用于执行日志中的服务地址（"✅ 服务已启动: http://localhost:8083/"）等
+ * 🔥 渲染文本内容：图片/视频 URL 直接内联渲染（LLM 未按协议输出时产物链接只出现在日志里，
+ * 内联后无需点击新窗口即可看图）；其余 URL 自动转为可点击链接（新窗口打开）
  */
 const renderContentWithLinks = (text: string) => {
   // 停止字符：空白、引号/反引号、Markdown 尾部 *、右括号等，避免链接尾部带脏字符
   const parts = text.split(/(https?:\/\/[^\s<>"'`)\]*,，。；]+)/g);
   return parts.map((part, i) => {
     if (!/^https?:\/\//.test(part)) return part;
+    // 🔥 图片 URL 内联渲染（云端产物 OSS/COS 直链可访问），点击新窗口放大；加载失败自动隐藏避免破图
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?\S*)?$/i.test(part)) {
+      return (
+        <img
+          key={i}
+          src={part}
+          alt="训练产物图片"
+          className="block max-w-md max-h-80 w-auto rounded border bg-white my-2 cursor-zoom-in"
+          onClick={() => window.open(part, '_blank')}
+          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+        />
+      );
+    }
+    // 🔥 视频 URL 内联渲染
+    if (/\.(mp4|webm|mov)(\?\S*)?$/i.test(part)) {
+      return (
+        <video
+          key={i}
+          src={part}
+          controls
+          preload="metadata"
+          className="block max-w-md rounded border bg-white my-2"
+        />
+      );
+    }
     return (
       <a
         key={i}
@@ -125,6 +150,8 @@ export const PreviewViewer: React.FC<PreviewViewerProps> = ({
   const [uploadingPaths, setUploadingPaths] = useState<Set<string>>(new Set());
   // 🔥 复制链接成功标记（记录刚复制的 URL）
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  // 🔥 [teegal] 系统日志展开状态（默认折叠）
+  const [showSystemLog, setShowSystemLog] = useState(false);
 
   /**
    * 🔥 从 localStorage 加载已上传的文件映射
@@ -610,6 +637,23 @@ export const PreviewViewer: React.FC<PreviewViewerProps> = ({
   // 🔥 缓存清洗后的内容，避免渲染时重复调用 cleanContent（每次调用都会解析 JSON + 正则替换）
   const cleanedContent = useMemo(() => cleanContent(content), [content, cleanContent]);
 
+  // 🔥 [teegal] 系统行与用户日志分流：wrapper 收尾日志（迁移/上传/URL 更新）折叠成一行摘要，
+  //    避免机器噪音淹没用户输出；用户 print 与训练日志保持原样
+  const { userLog, systemLog, systemLogCount } = useMemo(() => {
+    const lines = cleanedContent.split('\n');
+    const userLines: string[] = [];
+    const sysLines: string[] = [];
+    for (const line of lines) {
+      if (line.trimStart().startsWith('[teegal]')) sysLines.push(line);
+      else userLines.push(line);
+    }
+    return {
+      userLog: userLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+      systemLog: sysLines.join('\n'),
+      systemLogCount: sysLines.length
+    };
+  }, [cleanedContent]);
+
   // 🔥 检测内容中的文件路径
   const detectedPaths = useMemo(() => {
     return detectFilePaths(cleanedContent);
@@ -737,7 +781,24 @@ export const PreviewViewer: React.FC<PreviewViewerProps> = ({
             </div>
             {cleanedContent && (
               <div className="bg-gray-50 p-3 rounded-lg overflow-x-auto font-mono text-sm text-gray-700 whitespace-pre-wrap">
-                {renderContentWithLinks(cleanedContent)}
+                {userLog && renderContentWithLinks(userLog)}
+                {systemLogCount > 0 && (
+                  <div className={userLog ? 'mt-3 border-t border-gray-200 pt-2' : ''}>
+                    <button
+                      onClick={() => setShowSystemLog(v => !v)}
+                      className="flex items-center gap-1 text-xs text-gray-400 hover:text-blue-600 transition-colors"
+                      title="云端 wrapper 系统日志"
+                    >
+                      {showSystemLog ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                      ⚙️ 系统日志 {systemLogCount} 行
+                    </button>
+                    {showSystemLog && (
+                      <div className="mt-1 text-gray-500">
+                        {renderContentWithLinks(systemLog)}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

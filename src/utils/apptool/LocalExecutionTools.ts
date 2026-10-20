@@ -4,8 +4,7 @@
  *
  * 🔥 本地执行工具：
  * - run_project_onlocal: 本地执行项目代码（Python/Node/Shell），区别于 train_project 云端训练
- * - list_localrun_logs: 列出本地执行日志
- * - get_localrun_logdetail: 获取本地执行日志详情
+ * - list_localrun_logs / get_localrun_logdetail: 已合并入 TaskHistoryTools（list_tasks / get_task_detail，本文件执行器仍保留供分发）
  */
 
 import { AutoStep, AutoToolResult } from "../auto/types";
@@ -140,21 +139,30 @@ export async function executeRunDevTool(
   let codeToCheck = code || '';
 
   if (isMultiFile && mainFile) {
+    const electron = (window as any).electron;
+    const userDataPath = await getAppBasePath(fullAppId);
+    const normalizedPath = mainFile.replace(/\//g, '\\');
+    const fullPath = `${userDataPath}\\${normalizedPath}`;
+
+    let readResult: any = null;
     try {
-      const electron = (window as any).electron;
-      const userDataPath = await getAppBasePath(fullAppId);
-      const normalizedPath = mainFile.replace(/\//g, '\\');
-      const fullPath = `${userDataPath}\\${normalizedPath}`;
-      
-      const result = await electron.userpcFile.read(fullPath);
-      if (result.success && result.data?.content) {
-        codeToCheck = result.data.content;
-      } else {
-        console.warn('[RUN-DEV] 无法读取 mainFile 进行安全检查:', mainFile, result.error);
-      }
+      readResult = await electron.userpcFile.read(fullPath);
     } catch (e) {
-      console.warn('[RUN-DEV] 读取 mainFile 失败:', e);
+      console.warn('[RUN-DEV] 读取 mainFile 异常:', e);
     }
+
+    if (!readResult?.success) {
+      // 🔥 显式指定的 mainFile 不存在 → 直接报错，禁止底层静默回退自动探测入口
+      // （否则"跑 sanity_check.py 校验"会被无声改成"跑 main.py 全量训练"，LLM 的执行意图被改写；
+      //   且 GPU 安全检查也因读不到文件而落空）
+      const fileName = mainFile.split(/[\\/]/).pop() || mainFile;
+      return {
+        success: false,
+        error: `指定的入口文件「${mainFile}」在项目中不存在，已拒绝执行（防止静默误跑其他入口）。\n排查：① 文件可能尚未创建——先 save_project_file 保存；② 可能在子目录——用 list_project_files(projectId='${appId}', mode='search', query='${fileName}') 确认真实路径后再传完整相对路径。`,
+        statusCode: 404,
+      };
+    }
+    codeToCheck = readResult.data?.content || '';
   }
 
   if (codeToCheck && codeToCheck.trim()) {
@@ -251,7 +259,7 @@ export async function executeListExecutionLogsTool(
   if (!appId) {
     return {
       success: false,
-      error: "缺少 projectId 参数。用法: list_localrun_logs(projectId='xxx')",
+      error: "缺少 projectId 参数。用法: list_tasks(projectId='xxx')",
     };
   }
 
@@ -309,9 +317,9 @@ export async function executeListExecutionLogsTool(
       logSummary += `   时间: ${new Date(log.created_at).toLocaleString()}\n\n`;
     });
 
-    logSummary += `💡 提示：使用 get_localrun_logdetail(logId='完整的UUID') 获取执行日志详情`;
+    logSummary += `💡 提示：使用 get_task_detail(taskId='完整的UUID') 获取执行日志详情`;
     if (totalCount > 10 && !morePage) {
-      logSummary += `\n⚠️ 总共有 ${totalCount} 条记录，默认返回最近 10 条。如需查看更早记录，请使用 list_localrun_logs(projectId='${appId}', morePage='11-20')`;
+      logSummary += `\n⚠️ 总共有 ${totalCount} 条记录，默认返回最近 10 条。如需查看更早记录，请使用 list_tasks(projectId='${appId}', type='localrun', morePage='11-20')`;
     }
 
     return {

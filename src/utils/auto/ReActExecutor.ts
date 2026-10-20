@@ -6,6 +6,8 @@ import { EnvironmentBuilder } from './environment/EnvironmentBuilder';
 import { ExecuteCommandProgress } from '@/utils/systemtools/executeCommand';
 import { importantObjectTracker } from './context/ImportantObjectTracker';
 import { getToolDisplayName } from './AvailableToolsRegistry';
+import { ToolApiClient } from '@/utils/ToolApiClient';
+import { resolveProjectId } from '@/utils/apptool/ProjectIdResolver';
 
 /**
  * 截断笔记，只保留最近 N 轮的内容
@@ -28,6 +30,43 @@ function truncateWriteNotes(notes: string, maxRounds: number): string {
   // 添加省略提示
   const omittedCount = rounds.length - maxRounds;
   return `[省略了前 ${omittedCount} 轮笔记]\n---\n${recentRounds.join('\n---\n')}`;
+}
+
+/**
+ * 🔥 项目记忆存档（任务收尾时调用，fire-and-forget 不阻塞收尾）
+ * 从本次任务的工具参数统计 projectId（短 id 经 resolveProjectId 解析为完整 UUID），
+ * 每个归属项目存一条 {userQuery + 过程笔记}——下次接手项目先读档案快速建立熟悉度
+ */
+async function archiveProjectMemory(params: {
+  userId?: string;
+  conversationId?: string;
+  userQuery: string;
+  writeNotes: string;
+  toolResults: ToolResult[];
+}): Promise<void> {
+  try {
+    if (!params.userId) return;
+    const counts = new Map<string, number>();
+    const resolved = { id: '' };
+    for (const t of params.toolResults || []) {
+      const raw = t.parameters?.projectId || t.parameters?.appId;
+      if (!raw || typeof raw !== 'string') continue;
+      const err = await resolveProjectId(raw, resolved, params.userId);
+      const pid = err ? raw : resolved.id;
+      counts.set(pid, (counts.get(pid) || 0) + 1);
+    }
+    if (counts.size === 0) return;
+    await ToolApiClient.memory.saveProjectMemory({
+      userId: params.userId,
+      projectIds: [...counts.keys()],
+      userQuery: params.userQuery || '',
+      writeNote: params.writeNotes || '',
+      conversationId: params.conversationId,
+    });
+    console.log(`[REACT-EXECUTOR] 📝 项目记忆已存档: ${counts.size} 个项目`);
+  } catch (e) {
+    console.warn('[REACT-EXECUTOR] 项目记忆存档失败（不影响任务收尾）:', e);
+  }
 }
 
 /**
@@ -79,6 +118,8 @@ interface ToolResult {
   parameters: Record<string, any>;
   /** 🔥 真实轮号：后端折叠行用真实轮号渲染，保证内容只由条目自身决定 */
   roundNumber?: number;
+  /** 🔥 主动归档标记（LLM 传 archive=true 后写入）：服务端渲染为索引摘要行，体积立降 */
+  archived?: boolean;
   result: AutoToolResult;
 }
 
@@ -99,6 +140,10 @@ interface ReActRoundResponse {
     name: string;
     parameters: Record<string, any>;
   }>;
+  /** 🔥 主动归档请求：LLM 判断笔记已记全，本轮工具执行完后归档旧轮次 */
+  archiveRequest?: boolean;
+  /** 🔥 归档时保留最近几条完整（= 服务端 clearWindow） */
+  keepRecent?: number;
   error?: string;
 }
 
@@ -122,6 +167,11 @@ export class ReActExecutor {
   // 🔥 通用连续推理失败熔断：可恢复错误连续失败 N 轮也终止（防止未知错误模式撞墙到 MAX_ROUNDS）
   private consecutiveRoundErrors: number = 0;
   private readonly MAX_CONSECUTIVE_ROUND_ERRORS = 5;
+
+  // 🔥 连续无有效动作熔断：LLM 连续 N 轮既不调工具也不给 completeReport（多为输出坏 JSON
+  // 且自愈重试无效），强制收尾，防止空转到 MAX_ROUNDS 烧几百轮 token
+  private consecutiveNoOps: number = 0;
+  private readonly MAX_CONSECUTIVE_NO_OPS = 5;
   
   private executionLog: Array<{
     toolName: string;
@@ -407,12 +457,11 @@ export class ReActExecutor {
       });
     }
 
-    const { letMeDo, tools, writeNotes: newWriteNotes, completeReport } = roundResponse;
+    const { letMeDo, tools, writeNotes: newWriteNotes, completeReport, archiveRequest, keepRecent } = roundResponse;
 
     // 🔥 推理成功，重置连续超时/连续失败计数器
     this.consecutiveTimeoutErrors = 0;
     this.consecutiveRoundErrors = 0;
-
     // 🔥 累加 writeNotes：将新的 notes 追加到原有 notes 后面，并添加轮次标签
     let currentWriteNotes = writeNotes || '';
     if (newWriteNotes) {
@@ -431,6 +480,7 @@ export class ReActExecutor {
     if (!hasTool) {
       // 🔥 如果有 completeReport，任务完成
       if (completeReport) {
+        this.consecutiveNoOps = 0; // 任务结束，计数复位（防残留到下个 session）
         // 🔥 从 completeReport 中提取重要对象（只记录最终结果，避免中间临时文件）
         if (conversationId) {
           importantObjectTracker.extractFromExecutionResult(conversationId, {
@@ -458,21 +508,64 @@ export class ReActExecutor {
             data: { completeReport },
           },
         });
+        // 🔥 项目记忆存档（fire-and-forget，不阻塞收尾）
+        void archiveProjectMemory({
+          userId,
+          conversationId,
+          userQuery,
+          writeNotes: currentWriteNotes,
+          toolResults,
+        });
         return toolResults;
       }
 
-      // 🔥 没有 tool 也没有 completeReport，继续下一轮
-      console.warn(`[REACT-EXECUTOR] Round ${roundNumber} 无 tool 也无 completeReport，继续下一轮`);
-      
+      // 🔥 没有 tool 也没有 completeReport：连续 N 轮无有效动作则强制收尾（防空转烧 token），否则继续下一轮
+    this.consecutiveNoOps++;
+    if (this.consecutiveNoOps >= this.MAX_CONSECUTIVE_NO_OPS) {
+      console.warn(`[REACT-EXECUTOR] Round ${roundNumber} 连续 ${this.consecutiveNoOps} 轮无有效动作，强制收尾`);
+      this.consecutiveNoOps = 0;
+      const forcedReport = `${currentWriteNotes ? currentWriteNotes.slice(-2000) : ''}\n\n【自动收尾】连续 ${this.MAX_CONSECUTIVE_NO_OPS} 轮未产生有效工具调用，任务强制结束。`.trim();
+
+      await this.safeOnMessage(callbacks, callId, {
+        role: 'auto',
+        apiRole: 'reactor',
+        content: letMeDo,
+        result: '',
+        status: 'completed',
+        iconText: 'Done!',
+        sessionId,
+      });
       toolResults.push({
-        toolName: '_no_action',
+        toolName: 'complete',
         parameters: {},
         roundNumber,
         result: {
           success: true,
-          data: { message: letMeDo },
+          data: { completeReport: forcedReport },
         },
       });
+      // 🔥 项目记忆存档（强制收尾也存，fire-and-forget）
+      void archiveProjectMemory({
+        userId,
+        conversationId,
+        userQuery,
+        writeNotes: currentWriteNotes,
+        toolResults,
+      });
+      return toolResults;
+    }
+
+    console.warn(`[REACT-EXECUTOR] Round ${roundNumber} 无 tool 也无 completeReport（${this.consecutiveNoOps}/${this.MAX_CONSECUTIVE_NO_OPS}），继续下一轮`);
+
+    toolResults.push({
+      toolName: '_no_action',
+      parameters: {},
+      roundNumber,
+      result: {
+        success: true,
+        data: { message: letMeDo },
+      },
+    });
 
       return this.handleRound({
         sessionId,
@@ -490,6 +583,7 @@ export class ReActExecutor {
     }
 
     // 🔥 有工具，执行工具（即使有 completeReport 也要先执行完工具）
+    this.consecutiveNoOps = 0; // 有工具要执行 = 有效轮，复位无动作计数
     // 🔥 一轮多工具：无依赖操作（如同轮读多个文件）可一次传多个，顺序执行、逐个回报——
     //    把"读10个文件=10轮"压成1轮，任务总轮次减半以上
     const executedResults: ToolResult[] = [];
@@ -511,6 +605,18 @@ export class ReActExecutor {
         letMeDo,
         roundNumber,
       }));
+    }
+
+    // 🔥 主动归档：LLM 判断关键信息已记入笔记（archive=true），工具执行完后把旧轮次标记归档——
+    //    下一轮执行历史里旧条目渲染为索引摘要行（保留最近 keepRecent 条完整），prompt 体积立降
+    if (archiveRequest) {
+      const keep = keepRecent || 6;
+      const archBoundary = Math.max(0, toolResults.length + executedResults.length - keep);
+      for (let i = 0; i < archBoundary; i++) {
+        const item = toolResults[i];
+        if (item && !item.archived) item.archived = true;
+      }
+      console.log(`[REACT-EXECUTOR] Round ${roundNumber} 主动归档: ${archBoundary}/${toolResults.length} 条旧结果标记为归档（保留最近 ${keep} 条完整）`);
     }
 
     // 🔥 递归调用
@@ -581,7 +687,7 @@ export class ReActExecutor {
       userEmail,
       sessionId,
       callbacks,
-      letMeDo,
+      content,
     });
 
     // 🔥 打印工具执行结果
@@ -740,9 +846,10 @@ export class ReActExecutor {
     userEmail?: string;
     sessionId: string;
     callbacks: ReActCallbacks;
-    letMeDo: string;
+    /** 🔥 进度流展示文案：多工具轮只有第一个工具带 letMeDo，后续传空串（与首推/完成推送一致） */
+    content: string;
   }): Promise<AutoToolResult> {
-    const { callId, toolName, parameters, userId, conversationId, userEmail, sessionId, callbacks, letMeDo } = params;
+    const { callId, toolName, parameters, userId, conversationId, userEmail, sessionId, callbacks, content } = params;
 
     const step: AutoStep = {
       id: callId,
@@ -765,10 +872,13 @@ export class ReActExecutor {
         
         // 终端输出实时更新（包括 start 事件也显示为 terminal 类型）
         // 🔥 包含 executionId，使前端可以终止命令
+        // 🔥 用与首推/完成推送同源的 content（多工具轮非第一个工具为空串）。
+        //    原实现固定推 letMeDo：第二个工具一旦有终端输出，文案就被写进它的卡片，
+        //    且接收端过滤空串导致完成推送（''）清不掉 → 实时 UI 文案重复，仅重载后正常
         callbacks.onMessage(callId, {
           role: 'auto',
           apiRole: 'reactor',
-          content: letMeDo,
+          content: content,
           result: JSON.stringify({
             type: 'terminal',
             status: 'streaming',
@@ -844,6 +954,9 @@ export class ReActExecutor {
       /timeout.*exceeded/i,        // 超时 exceeded
       /ETIMEDOUT/i,                // 网络超时
       /请求.*超时/i,               // 中文超时提示
+      /上游超时或失败/i,           // 🔥 llmProxy 5min 上游超时返回的 502（本质是模型排队/处理超时，
+                                   //    原先不匹配 → 走通用失败分支：无 UI 提示 + 5 轮才熔断，用户看到的就是静默卡死）
+      /Bad Gateway/i,              // 网关类 502/504
     ];
 
     for (const pattern of timeoutPatterns) {

@@ -88,6 +88,9 @@ interface HeadlessAuthPayload {
   accessToken: string;
   refreshToken: string;
   user?: any;
+  /** 🔥 离线指挥开机自启配置（可选）：存在则 preload 一并写入 localStorage，
+   *  机器装好即自动进入邮件监听（首次 poll 云端自动发握手信），无需人工在面板开启 */
+  offline?: { addr: string; token: string };
   injectedAt?: string;
 }
 
@@ -203,11 +206,14 @@ export function startAgentServer(getWindow: () => BrowserWindow | null): void {
           return sendJson(400, { ok: false, error: 'accessToken 与 refreshToken 必填' });
         }
         try {
+          const offlineAddr = String(payload?.offline?.addr || '').trim();
+          const offlineToken = String(payload?.offline?.token || '').trim();
           const record: HeadlessAuthPayload = {
             userId: String(payload?.userId || ''),
             accessToken,
             refreshToken,
             user: payload?.user || null,
+            ...(offlineAddr && offlineToken ? { offline: { addr: offlineAddr, token: offlineToken } } : {}),
             injectedAt: new Date().toISOString(),
           };
           require('fs').writeFileSync(getHeadlessAuthPath(), JSON.stringify(record, null, 2));

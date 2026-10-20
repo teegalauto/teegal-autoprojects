@@ -133,8 +133,8 @@ export function initAutoUpdater(window: BrowserWindow) {
   setupAutoUpdaterEvents();
 
   // 应用启动后延迟检查更新（避免影响启动速度）
-  // 🔥 开发环境下不自动检查；避免重复设置定时器
-  if (process.env.NODE_ENV !== 'development' && !checkUpdateTimeout) {
+  // 🔥 开发环境下不自动检查；headless 云端镜像机禁用自动更新（版本以镜像为准）；避免重复设置定时器
+  if (process.env.NODE_ENV !== 'development' && !checkUpdateTimeout && !isHeadlessMachine()) {
     checkUpdateTimeout = setTimeout(() => {
       checkForUpdates();
     }, 5000); // 5秒后检查
@@ -264,10 +264,14 @@ async function performInstall(version: string) {
   await new Promise(resolve => setTimeout(resolve, 500));
 
   // 🔥 执行安装
-  // isSilent=true: 纯静默安装（配合 perMachine=false 用户目录安装，全程无 UAC 弹窗，零点击）
+  // isSilent=false: one-click 安装器显示安装进度小窗口（任务栏有对应条目）。
+  //   静默模式下安装器完全零 UI：应用退出后任务栏条目消失、桌面只剩快捷方式
+  //   重建时 Explorer 未刷新的空白临时图标，用户会误以为软件崩了。
+  //   免 UAC 与此参数无关：oneClick + perMachine=false 本就以普通用户权限
+  //   安装到用户目录，非静默同样全程无 UAC 弹窗
   // forceRunAfter=true: 安装完成后自动运行新版本
-  log.info('[AutoUpdater] 启动静默安装...');
-  autoUpdater.quitAndInstall(true, true);
+  log.info('[AutoUpdater] 启动安装（显示进度窗口）...');
+  autoUpdater.quitAndInstall(false, true);
 }
 
 function onUpdateError(error: Error) {
@@ -336,9 +340,22 @@ function setupIpcHandlers() {
 }
 
 /**
+ * 云端镜像机判定（systemd 服务注入 TEEGAL_HEADLESS=1，启动即存在）：
+ * 自动更新含下载+quitAndInstall 重启，耗时分钟级且会中断客户指挥中的会话——
+ * 云端机版本一律以镜像为准，唯一更新途径 = 重烧镜像
+ */
+function isHeadlessMachine(): boolean {
+  return process.env.TEEGAL_HEADLESS === '1';
+}
+
+/**
  * 检查更新
  */
 async function checkForUpdates() {
+  if (isHeadlessMachine()) {
+    log.info('[AutoUpdater] headless 云端机：更新已禁用，版本以镜像为准');
+    return { success: false, error: '云端机版本以镜像为准，更新请重烧镜像' };
+  }
   try {
     log.info('[AutoUpdater] 开始检查更新...');
     const result = await autoUpdater.checkForUpdates();

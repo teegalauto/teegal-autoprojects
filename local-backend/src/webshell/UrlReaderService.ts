@@ -4,6 +4,7 @@
  */
 
 import { FirecrawlFetchProvider, NativeFetchProvider, JinaFetchProvider, contentCache } from './providers/FetchProviders';
+import { hostedFetch } from './hostedClient';
 import { userModelRegistry, SimpleUserModel } from '../utils/llm/UserModelRegistry';
 import { modelBindingRegistry } from '../utils/llm/ModelBindingRegistry';
 import { llmService, ContentPart, LLMMessage } from '../utils/LLMService';
@@ -190,7 +191,33 @@ export class UrlReaderService {
       }
     }
 
-    // 2. 尝试 Jina AI Reader
+    // 2. 官方 hosted 通道（服务端 firecrawl，登录即可用，无需本地配 Key；未登录直接抛错落到下一级）
+    try {
+      console.log('🚀 [URL-READER-SERVICE] 尝试官方 hosted 通道 (Firecrawl)...');
+      const result = await hostedFetch(url);
+      if (result.content) {
+        console.log('✅ [URL-READER-SERVICE] 官方 hosted 通道成功');
+        return {
+          success: true,
+          url,
+          title: result.metadata?.title || '网页内容',
+          content: result.content,
+          mediaType: 'web',
+          metadata: {
+            author: result.metadata?.author,
+            publishedDate: result.metadata?.publishedDate,
+            domain: result.metadata?.domain,
+          },
+          summary: userQuery ? `已获取网页内容，可以根据"${userQuery}"进行分析` : '网页内容已提取'
+        };
+      }
+      console.warn('⚠️ [URL-READER-SERVICE] 官方 hosted 通道返回空内容，落到下一级');
+    } catch (error) {
+      console.warn('⚠️ [URL-READER-SERVICE] 官方 hosted 通道失败:', error);
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+
+    // 3. 尝试 Jina AI Reader
     if (this.jinaProvider) {
       try {
         console.log('🚀 [URL-READER-SERVICE] 尝试 Jina AI Reader...');
@@ -213,7 +240,7 @@ export class UrlReaderService {
       }
     }
 
-    // 3. 使用原生 Fetch 作为兜底
+    // 4. 使用原生 Fetch 作为兜底
     try {
       console.log('🚀 [URL-READER-SERVICE] 使用原生 Fetch...');
       const result = await this.nativeProvider.fetch(url);

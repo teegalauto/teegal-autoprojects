@@ -265,6 +265,40 @@ function detectDangerousCommand(command: string): ErrorMessage | null {
 }
 
 /**
+ * 🔥 凭据解析（userpc_shell / userpc_run_python 共用）：
+ * credentialName → IPC 查凭据 → platform 型走官方租约运行时取值 → {env_var: value} 供环境变量注入
+ */
+async function resolveCredentialEnv(
+  credentialName: string | undefined,
+  userId: string | undefined
+): Promise<{ env?: Record<string, string>; error?: string }> {
+  if (!credentialName) return {};
+  if (!userId) return { error: `传入 credentialName="${credentialName}" 但缺少用户身份，无法解析凭据` };
+  try {
+    const electron = (window as any).electron;
+    if (!electron?.localStorage?.getCredentialByName) return {};
+    const credential = await electron.localStorage.getCredentialByName(credentialName, userId);
+    if (!credential) {
+      return { error: `凭据 "${credentialName}" 不存在或值为空` };
+    }
+    let credValue: string;
+    if (credential.source === 'platform' && credential.provider) {
+      const { resolvePlatformCredential } = await import('../../services/cloud/CredentialLeaseService');
+      credValue = await resolvePlatformCredential(userId, credential.provider);
+    } else if (credential.value) {
+      credValue = credential.value;
+    } else {
+      return { error: `凭据 "${credentialName}" 不存在或值为空` };
+    }
+    console.log(`🔑 [CREDENTIAL] 已注入凭据 "${credentialName}" → 环境变量 ${credential.env_var}${credential.source === 'platform' ? '（官方租约）' : ''}`);
+    return { env: { [credential.env_var]: credValue } };
+  } catch (error: any) {
+    console.error('❌ [CREDENTIAL] 获取凭据失败:', error);
+    return { error: `获取凭据 "${credentialName}" 失败: ${error.message}` };
+  }
+}
+
+/**
  * 🔥 执行系统命令 - 使用 Electron IPC
  * ⚠️ 已移除所有安全检查，允许执行任意命令
  */
@@ -482,47 +516,16 @@ export async function executeExecuteCommandTool(
     credentialName
   });
 
-  // 🔥 凭据注入：如果提供了 credentialName，通过 IPC 获取凭据并准备环境变量
-  let credentialEnv: Record<string, string> | undefined;
-  if (credentialName && context?.userId) {
-    try {
-      const electron = (window as any).electron;
-      if (electron?.localStorage?.getCredentialByName) {
-        const credential = await electron.localStorage.getCredentialByName(credentialName, context.userId);
-        if (credential) {
-          // 🔥 platform 型凭据：值由官方租约服务运行时下发（厂商临时 key），LLM 零感知
-          let credValue: string;
-          if (credential.source === 'platform' && credential.provider) {
-            const { resolvePlatformCredential } = await import('../../services/cloud/CredentialLeaseService');
-            credValue = await resolvePlatformCredential(context.userId, credential.provider);
-          } else if (credential.value) {
-            credValue = credential.value;
-          } else {
-            return {
-              success: false,
-              error: `凭据 "${credentialName}" 不存在或值为空`,
-              metadata: { toolName: 'userpc_shell' },
-            };
-          }
-          credentialEnv = { [credential.env_var]: credValue };
-          console.log(`🔑 [EXECUTE-COMMAND-TOOL] 已注入凭据 "${credentialName}" → 环境变量 ${credential.env_var}${credential.source === 'platform' ? '（官方租约）' : ''}`);
-        } else {
-          return {
-            success: false,
-            error: `凭据 "${credentialName}" 不存在或值为空`,
-            metadata: { toolName: 'userpc_shell' },
-          };
-        }
-      }
-    } catch (error: any) {
-      console.error('❌ [EXECUTE-COMMAND-TOOL] 获取凭据失败:', error);
-      return {
-        success: false,
-        error: `获取凭据 "${credentialName}" 失败: ${error.message}`,
-        metadata: { toolName: 'userpc_shell' },
-      };
-    }
+  // 🔥 凭据注入：如果提供了 credentialName，通过共用函数获取凭据并准备环境变量
+  const cred = await resolveCredentialEnv(credentialName, context?.userId);
+  if (cred.error) {
+    return {
+      success: false,
+      error: cred.error,
+      metadata: { toolName: 'userpc_shell' },
+    };
   }
+  const credentialEnv = cred.env;
 
   if (!command) {
     const hasCommandParam = 'command' in params;
@@ -552,6 +555,90 @@ export async function executeExecuteCommandTool(
   }
 
   command = command.trim();
+
+  // 🔥 Windows 无 sshpass（Linux 工具）：短路返回平台指引——PowerShell 的 CommandNotFoundException
+  //    会让 LLM 乱猜（改 paramiko / 怀疑凭据冲突），结构化指引把它一次拉回正确通道
+  if (getPlatform() === 'windows' && /^\s*sshpass\s/.test(command)) {
+    const msg = formatErrorMessage({
+      title: '❌ Windows 没有 sshpass（这是 Linux 工具）',
+      reason: 'sshpass 在 Windows 上不存在，命令无法执行',
+      suggestion: `SSH 到远程机的正确方式：
+1. 首选：直接写裸 ssh 命令，平台自动补公钥免密参数：ssh user@host '命令'（userpc_shell 传 credentialName=凭据名 可注入 SSHPASS）
+2. 公钥未生效需密码通道时，用 plink（userpc_shell 传 credentialName=凭据名）：
+   & "$env:USERPROFILE\\.teegal\\bin\\plink.exe" -ssh -batch -pw $env:SSHPASS user@host "命令"
+3. 或先用 ssh_instance（action=activate / add）获取当下真实可用的命令模板`
+    });
+    return {
+      success: false,
+      error: msg,
+      data: {
+        type: 'terminal',
+        command,
+        outputs: [msg],
+        exitCode: -1,
+        executionTime: 0,
+        error: msg,
+      },
+      metadata: { toolName: 'userpc_shell' },
+    };
+  }
+
+  // 🔥 macOS/Linux 无 plink（Windows 工具）：对称短路返回平台指引——bash 的 command not found
+  //    同样会让 LLM 乱猜（装 putty / 改 paramiko），结构化指引把它一次拉回正确通道
+  if (getPlatform() !== 'windows' && /^\s*plink\b/.test(command)) {
+    const msg = formatErrorMessage({
+      title: '❌ macOS/Linux 没有 plink（这是 Windows 工具）',
+      reason: 'plink 在 macOS/Linux 上默认不存在，命令无法执行',
+      suggestion: `SSH 到远程机的正确方式：
+1. 首选：直接写裸 ssh 命令，平台自动补公钥免密参数：ssh user@host '命令'（userpc_shell 传 credentialName=凭据名 可注入 SSHPASS）
+2. 公钥未生效需密码通道时（userpc_shell 传 credentialName=凭据名，SSHPASS 自动注入）：
+   - Linux：sshpass -e ssh user@host "命令"
+   - macOS：expect -c 'set timeout 30; spawn ssh user@host "命令"; expect "*assword:*" { send $env(SSHPASS)\\r; exp_continue } eof'
+3. 或先用 ssh_instance（action=activate / add）获取当下真实可用的命令模板`
+    });
+    return {
+      success: false,
+      error: msg,
+      data: {
+        type: 'terminal',
+        command,
+        outputs: [msg],
+        exitCode: -1,
+        executionTime: 0,
+        error: msg,
+      },
+      metadata: { toolName: 'userpc_shell' },
+    };
+  }
+
+  // 🔥 SSHPASS 密码凭据 + 裸 ssh 命令防呆：ssh.exe（Windows）与 POSIX 的 ssh 都不消费 SSHPASS
+  //    环境变量（那是 sshpass/plink 的机制）。公钥未生效的机器上裸 ssh 会卡在密码提示直到超时
+  //    （LLM 只看到"命令执行超时"，无法自诊断）。追加 -o BatchMode=yes：公钥已生效照常成功；
+  //    未生效秒败（Permission denied），失败输出里附带平台对应的密码通道模板引导自救。
+  let sshPasswordGuard: { credentialName?: string; host?: string; user?: string } | null = null;
+  if (
+    typeof window !== 'undefined' &&
+    /^ssh\s/.test(command) &&
+    !/plink|sshpass|expect\b|BatchMode/i.test(command)
+  ) {
+    const target = command.match(/(\S+)@(\S+)/);
+    // 🔥 双平台统一补 BatchMode + ConnectTimeout——公钥已生效则一次免密成功；未生效立即失败并
+    //    附自救指引，不再挂满超时。
+    //    -i 仅 Windows 需要（-NoProfile/服务化环境 HOME/USERPROFILE 解析不可靠，见 sshInstance.sshIdentityArg）；
+    //    macOS/Linux 的 ssh 原生读取 ~/.ssh/id_* 默认私钥，不注入 -i。已带 -i 的命令不覆盖 LLM 指定的密钥。
+    command = command.replace(/^ssh\s/, 'ssh -o BatchMode=yes -o ConnectTimeout=10 ');
+    if (navigator.userAgent.includes('Windows')) {
+      const hostIdx = target ? command.indexOf(target[0]) : -1;
+      const argsPart = hostIdx > 0 ? command.slice(0, hostIdx) : command;
+      if (!/\s-i\s/.test(argsPart)) {
+        command = command.replace(/^ssh\s/, 'ssh -i "$env:USERPROFILE\\.ssh\\id_ed25519" ');
+      }
+    }
+    sshPasswordGuard = target
+      ? { credentialName: credentialName || undefined, user: target[1], host: target[2] }
+      : { credentialName: credentialName || undefined };
+    console.log(`🔑 [EXECUTE-COMMAND-TOOL] 裸 ssh → 规范化 (BatchMode${navigator.userAgent.includes('Windows') ? ' + -i' : ''})${target ? ` (${target[1]}@${target[2]})` : ''}`);
+  }
 
   onProgress?.({ type: 'start', data: command });
 
@@ -619,9 +706,23 @@ export async function executeExecuteCommandTool(
               return;
             }
 
+            // 🔥 裸 ssh 被 BatchMode 快速失败时的自救指引（有凭据给平台对应的密码通道模板，无凭据指回绑定流程）
+            const guardHint = (!isSuccess && sshPasswordGuard)
+              ? (sshPasswordGuard.credentialName
+                ? (navigator.userAgent.includes('Windows')
+                  ? `\n\n💡 SSH 密码凭据无法被 ssh 自动使用（Windows 无 sshpass，ssh 不读 SSHPASS），公钥免密未生效。两种解法：
+1. plink 密码通道: & "$env:USERPROFILE\\.teegal\\bin\\plink.exe" -ssh -batch -pw $env:SSHPASS ${sshPasswordGuard.user}@${sshPasswordGuard.host} "命令" （userpc_shell 继续传 credentialName=${sshPasswordGuard.credentialName}）
+2. 修复公钥免密: 在常驻面板重新绑定该机器（或 ssh_instance action=add），绑定流程会自动注入公钥`
+                  : `\n\n💡 SSH 密码凭据无法被 ssh 自动使用（ssh 不读 SSHPASS 环境变量），公钥免密未生效。两种解法：
+1. 密码通道（userpc_shell 继续传 credentialName=${sshPasswordGuard.credentialName}，SSHPASS 自动注入）：
+   - Linux: sshpass -e ssh ${sshPasswordGuard.user}@${sshPasswordGuard.host} "命令"
+   - macOS: expect -c 'set timeout 30; spawn ssh ${sshPasswordGuard.user}@${sshPasswordGuard.host} "命令"; expect "*assword:*" { send $env(SSHPASS)\\r; exp_continue } eof'
+2. 修复公钥免密: 在常驻面板重新绑定该机器（或 ssh_instance action=add），绑定流程会自动注入公钥`)
+                : `\n\n💡 ssh 公钥免密未生效（BatchMode 下立即失败而非挂起等密码）。解法：用 ssh_instance（action=activate 复用 / action=add 绑定）获取当下真实可用的命令模板——activate 会重新探测并自动修复公钥免密，返回的模板直接照抄，不要凭记忆拼 ssh 命令`)
+              : '';
             resolve({
               success: isSuccess,
-              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}`,
+              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}`,
               data: {
                 type: 'terminal',
                 command,
@@ -799,7 +900,8 @@ export function executeCommandStream(options: StreamCommandOptions): StreamComma
 export async function executeRunPythonTool(
   step: AutoStep,
   _planId: string,
-  onProgress?: (progress: ExecuteCommandProgress) => void
+  onProgress?: (progress: ExecuteCommandProgress) => void,
+  context?: { userId?: string }
 ): Promise<AutoToolResult> {
   console.log('⚡ [RUN-PYTHON-TOOL] 执行 Python 代码工具');
 
@@ -814,6 +916,21 @@ export async function executeRunPythonTool(
       metadata: { toolName: 'userpc_run_python' }
     };
   }
+
+  // 🔥 凭据注入：与 userpc_shell 同通道（credentialName → env_var 环境变量）。
+  //    原实现无注入通道，LLM 用 paramiko 消费 SSHPASS 时拿到空值 → AuthenticationException
+  //    被误判为"密码错/凭据冲突"，白白烧轮次排查
+  const credentialName = params.credentialName;
+  const cred = await resolveCredentialEnv(credentialName, context?.userId);
+  if (cred.error) {
+    return { success: false, error: cred.error, metadata: { toolName: 'userpc_run_python' } };
+  }
+  const credentialEnv = cred.env;
+
+  // 🔥 脚本引用 SSH 密码但未传 credentialName：输出尾部附提示，把 LLM 一次拉回正确通道
+  const sshHint = !credentialName && /SSHPASS|paramiko|sshpass/i.test(code)
+    ? '\n💡 提示: 脚本引用了 SSHPASS/SSH 密码但未传 credentialName——本工具传 credentialName=凭据名 即可注入 SSHPASS 环境变量；Windows 也可直接用 userpc_shell 写裸 ssh（平台自动补公钥免密参数）'
+    : '';
 
   const tempFileName = `teegal_script_${Date.now()}.py`;
 
@@ -852,6 +969,7 @@ export async function executeRunPythonTool(
       const streamResult = executeCommandStream({
         command,
         timeout,
+        env: credentialEnv, // 🔥 注入凭据环境变量（与 userpc_shell 同通道）
         onOutput: (data) => {
           if (data.type === 'stdout' && data.data) {
             outputLines.push(data.data);
@@ -861,6 +979,7 @@ export async function executeRunPythonTool(
             onProgress?.({ type: 'stderr', data: data.data });
           } else if (data.type === 'close') {
             const hasStderr = outputLines.some(line => line.includes('[stderr]'));
+            if (sshHint) outputLines.push(sshHint);
             onProgress?.({ type: 'complete', exitCode: data.exitCode });
             resolve({
               success: data.exitCode === 0,

@@ -16,6 +16,8 @@
 
 import { AutoStep, AutoToolResult } from '@/utils/auto/types';
 import { CloudAuthService } from '@/services/cloud/CloudAuthService';
+import { getAuthToken } from '@/services/cloud/CloudApiClient';
+import { CLOUD_BASE_URL } from '@/config/api';
 import { resolveProjectId, isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { getBackendUrl } from '@/config/env';
 import { executeExecuteCommandTool, ExecuteCommandProgress } from './executeCommand';
@@ -98,15 +100,16 @@ async function resolveLocalPublicKey(userId?: string): Promise<{ pub: string; pu
   return null;
 }
 
-/** 执行链 detailed 版：失败原因不静默（超时/执行错误透出给诊断） */
-async function runLocalShellDetailed(
+/** 执行链 detailed 版：失败原因不静默（超时/执行错误透出给诊断）。timeout 秒，默认 30 */
+export async function runLocalShellDetailed(
   command: string,
   userId?: string,
-  credentialName?: string
+  credentialName?: string,
+  timeout: number = 30
 ): Promise<{ ok: boolean; out: string; err?: string }> {
   try {
     const result = await executeExecuteCommandTool(
-      { toolParams: { command, timeout: 30, ...(credentialName ? { credentialName } : {}) } } as unknown as AutoStep,
+      { toolParams: { command, timeout, ...(credentialName ? { credentialName } : {}) } } as unknown as AutoStep,
       'ssh-instance',
       undefined,
       { userId }
@@ -160,6 +163,41 @@ async function deleteCredentialByInstance(
     }
   } catch {
     // 凭据清理失败不影响关机
+  }
+}
+
+/**
+ * 🔥 孤儿 SSH 凭据对账清理（惰性：开机/绑机入口触发，失败静默不影响主流程）
+ * 僵尸凭据来源：云端控制台手动关机/实例到期释放时本地无感知（本地表都没记录关机事件）；
+ * close 路径的三路兜底也可能因本地表记录缺失而扑空。
+ * 规则（只碰自动入库的 SSH 凭据，手工凭据绝不动）：
+ *   name 以 ssh_ 开头 + description 以「云端实例 /自有机器 」开头 → 凭据名不在活跃资源表 → 删除
+ * 资源表查询失败时跳过整个对账（数据源不可靠时绝不能删用户数据）。
+ */
+async function cleanupOrphanSshCredentials(userId?: string): Promise<void> {
+  try {
+    const electron = (window as any).electron;
+    if (!electron?.localStorage?.listCredentials || !userId) return;
+    const [creds, lr] = await Promise.all([
+      electron.localStorage.listCredentials(userId),
+      localApi(`/api/rental/resources?userId=${encodeURIComponent(userId)}&active=1&sync=1`)
+        .catch(() => ({ ok: false, status: 0, data: null })),
+    ]);
+    if (!lr.ok) return;
+    const boundNames = new Set(
+      ((lr.data?.resources || []) as any[]).map((r) => r.credential_name).filter(Boolean)
+    );
+    for (const c of (creds || []) as any[]) {
+      if (!/^ssh_/.test(c.name || '')) continue;
+      if (!/^(云端实例|自有机器) .+SSH 密码/.test(c.description || '')) continue;
+      if (boundNames.has(c.name)) continue;
+      try {
+        await electron.localStorage.deleteCredential(c.id);
+        console.log(`[SSH-INSTANCE] 🧹 清理孤儿凭据: ${c.name}`);
+      } catch { /* 单条失败继续 */ }
+    }
+  } catch {
+    // 对账失败不影响主流程
   }
 }
 
@@ -236,7 +274,7 @@ async function waitUntilReady(rentalId: string): Promise<{ ready: boolean; insta
  */
 const PLINK_PATH = '"$env:USERPROFILE\\.teegal\\bin\\plink.exe"';
 
-async function ensurePlink(userId?: string): Promise<boolean> {
+export async function ensurePlink(userId?: string): Promise<boolean> {
   const check = await runLocalShell(`if (Test-Path ${PLINK_PATH}) { 'PLINK_OK' } else { 'PLINK_MISSING' }`.replace(/\s+/g, ' '), userId);
   if (check.includes('PLINK_OK')) return true;
   await runLocalShell(
@@ -253,32 +291,62 @@ async function ensurePlink(userId?: string): Promise<boolean> {
  * 注意：-hostkey 验证通过【不会】写入注册表缓存 → 指纹必须回传给 LLM 模板复用。
  * 绝不用 `echo y |` 管道——spawn 环境下会挂死等 tty。
  */
-async function plinkExec(
+export async function plinkExec(
   host: string,
   user: string,
   credentialName: string,
   command: string,
   userId?: string,
-  port: number = 22
+  port: number = 22,
+  timeout: number = 30
 ): Promise<{ out: string; fingerprint?: string; err?: string }> {
   const base = `${PLINK_PATH} -ssh -P ${port} -batch -pw $env:SSHPASS ${user}@${host}`.replace(/\s+/g, ' ');
   // 🔥 2>&1 必须带：-batch 的 "host key is not cached" 错误（含指纹）走 stderr，不合并就拿不到指纹
-  const r1 = await runLocalShellDetailed(`${base} "${command}" 2>&1`, userId, credentialName);
+  const r1 = await runLocalShellDetailed(`${base} "${command}" 2>&1`, userId, credentialName, timeout);
   let out = r1.out;
   const fp = out.match(/SHA256:[A-Za-z0-9+/=]+/);
   if (fp && /host key is not cached/i.test(out)) {
-    const r2 = await runLocalShellDetailed(`${PLINK_PATH} -ssh -P ${port} -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName);
+    const r2 = await runLocalShellDetailed(`${PLINK_PATH} -ssh -P ${port} -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName, timeout);
     return { out: r2.out, fingerprint: fp[0], err: r2.err };
   }
   return { out, err: r1.err };
 }
 
 /**
- * 🔥 公钥现场注入（本地自救）：不依赖云端 cloud-init（实测不可靠，authorized_keys 常 为空）。
- * 密码通道拿到 hostkey 指纹后，用 plink 把本地公钥追加进服务器 authorized_keys。
- * 返回 ok=true 后重探公钥通道即可免密。
+ * 🔥 POSIX（macOS/Linux）密码通道命令构建：Windows 用 plink，POSIX 无 plink。
+ * sshpass（Linux 常见）优先，macOS 自带 expect 兜底。密码一律经 SSHPASS 环境变量
+ * （credentialName → executeCommand 环境注入，与 Windows plink 同机制），不进命令行不进日志。
+ * stdinFile 非空时把本地文件重定向进 ssh stdin（公钥注入场景必须走文件重定向）。
  */
-async function injectPublicKeyViaPlink(
+async function buildPosixSshPasswordCommand(params: {
+  host: string;
+  user: string;
+  port: number;
+  remoteCmd: string;
+  stdinFile?: string;
+  userId?: string;
+}): Promise<string | null> {
+  const { host, user, port, remoteCmd, stdinFile, userId } = params;
+  const portArg = port !== 22 ? `-p ${port} ` : '';
+  const redirect = stdinFile ? ` < ${stdinFile}` : '';
+  const bin = await runLocalShell('command -v sshpass || command -v expect', userId);
+  if (/\/sshpass\s*$/.test(bin.trim())) {
+    return `sshpass -e ssh ${portArg}-o StrictHostKeyChecking=no ${user}@${host} "${remoteCmd}"${redirect}`;
+  }
+  if (/\/expect\s*$/.test(bin.trim())) {
+    // macOS 自带 expect：spawn 包一层 sh -c 让 < 重定向作用于 ssh；
+    // expect -c 整段单引号防 bash 展开，密码在 send 时取 $env(SSHPASS)
+    return `expect -c 'set timeout 30; spawn /bin/sh -c "ssh ${portArg}-o StrictHostKeyChecking=no ${user}@${host} \\"${remoteCmd}\\"${redirect}"; expect { "*assword:*" { send "$env(SSHPASS)\\r"; exp_continue } eof }'`;
+  }
+  return null;
+}
+
+/**
+ * 🔥 公钥现场注入（本地自救）：不依赖云端 cloud-init（实测不可靠，authorized_keys 常 为空）。
+ * 密码通道可用后，把本地公钥追加进服务器 authorized_keys。返回 ok=true 后重探公钥通道即可免密。
+ * Windows 走 plink（cmd /c + < 重定向，实测成功的唯一形态）；macOS/Linux 走 sshpass/expect。
+ */
+async function injectPublicKeyViaPasswordChannel(
   host: string,
   user: string,
   credentialName: string,
@@ -289,13 +357,29 @@ async function injectPublicKeyViaPlink(
   // 确保本地公钥文件存在（必要时生成）
   const local = await resolveLocalPublicKey(userId);
   if (!local) return { ok: false, out: '', err: '本地无 SSH 公钥且生成失败' };
-  // 指纹缺失（hostkey 已在注册表缓存）时省略 -hostkey，同样走缓存无交互
-  const hostArg = fingerprint ? ` -hostkey "${fingerprint}"` : '';
-  // 🔥 cmd /c + < 重定向 stdin（实测成功的唯一形态：INJECT_OK + 免密打通）。
-  //    PowerShell 管道（Get-Content | plink）会让 plink 参数解析失败（Host does not exist），
-  //    公钥文本嵌命令行又会被引号转义破坏——公钥必须走文件重定向。
-  const cmd = `cmd /c '%USERPROFILE%\\.teegal\\bin\\plink.exe -ssh -P ${port} -batch${hostArg} -pw %SSHPASS% ${user}@${host} "cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo INJECT_OK" < ${local.pubPath}'`;
-  const r = await runLocalShellDetailed(cmd.replace(/\s+/g, ' '), userId, credentialName);
+
+  if (navigator.userAgent.includes('Windows')) {
+    // 指纹缺失（hostkey 已在注册表缓存）时省略 -hostkey，同样走缓存无交互
+    const hostArg = fingerprint ? ` -hostkey "${fingerprint}"` : '';
+    // 🔥 cmd /c + < 重定向 stdin（实测成功的唯一形态：INJECT_OK + 免密打通）。
+    //    PowerShell 管道（Get-Content | plink）会让 plink 参数解析失败（Host does not exist），
+    //    公钥文本嵌命令行又会被引号转义破坏——公钥必须走文件重定向。
+    const cmd = `cmd /c '%USERPROFILE%\\.teegal\\bin\\plink.exe -ssh -P ${port} -batch${hostArg} -pw %SSHPASS% ${user}@${host} "cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo INJECT_OK" < ${local.pubPath}'`;
+    const r = await runLocalShellDetailed(cmd.replace(/\s+/g, ' '), userId, credentialName);
+    return { ok: r.ok && r.out.includes('INJECT_OK'), out: r.out, err: r.err };
+  }
+
+  // 🔥 macOS/Linux：sshpass/expect 包 ssh；POSIX 无 hostkey 注册表，
+  // StrictHostKeyChecking=no 首连自动收录 known_hosts，无需指纹
+  const cmd = await buildPosixSshPasswordCommand({
+    host, user, port, userId,
+    remoteCmd: 'cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo INJECT_OK',
+    stdinFile: local.pubPath,
+  });
+  if (!cmd) {
+    return { ok: false, out: '', err: '本机无 sshpass/expect，无法自动注入公钥（macOS 自带 expect；Linux 可安装 sshpass，或手动 ssh-copy-id）' };
+  }
+  const r = await runLocalShellDetailed(cmd, userId, credentialName, 60);
   return { ok: r.ok && r.out.includes('INJECT_OK'), out: r.out, err: r.err };
 }
 
@@ -345,7 +429,7 @@ async function probeSshReady(
       // 🔥 公钥自愈：只要密码通道可达（或拿到指纹），就现场注入本地公钥 → 收敛到免密 key 模式
       //    （服务端 authorized_keys 为空是常态——cloud-init 注入不可靠，靠本地自救）
       if (passwordReady || pr.fingerprint) {
-        const inj = await injectPublicKeyViaPlink(host, user, credentialName, pr.fingerprint, userId, port);
+        const inj = await injectPublicKeyViaPasswordChannel(host, user, credentialName, pr.fingerprint, userId, port);
         if (inj.ok) {
           for (let i = 0; i < 2; i++) {
             const out2 = await runLocalShell(cmd, userId);
@@ -379,6 +463,46 @@ async function probeSshReady(
     } else {
       plinkDiag = '[plink 密码通道跳过] plink.exe 不可用且下载失败';
     }
+  } else if (credentialName) {
+    // 🔥 macOS/Linux 密码通道：sshpass/expect 包 ssh（密码走 SSHPASS 环境变量），
+    // 与 Windows plink 同一凭据注入机制。先探测，可用则现场注入公钥收敛免密
+    const pwCmd = await buildPosixSshPasswordCommand({ host, user, port, remoteCmd: 'echo ok', userId });
+    if (pwCmd) {
+      const pr = await runLocalShellDetailed(pwCmd, userId, credentialName, 60);
+      const passwordReady = pr.ok && pr.out.includes('ok');
+      plinkDiag = passwordReady
+        ? '[密码通道可用（sshpass/expect）]'
+        : `[密码通道失败] ${pr.err ? `执行错误: ${pr.err}` : `输出摘要: ${pr.out.replace(/\s+/g, ' ').slice(0, 200) || '（空输出）'}`}`;
+
+      if (passwordReady) {
+        const inj = await injectPublicKeyViaPasswordChannel(host, user, credentialName, undefined, userId, port);
+        if (inj.ok) {
+          // 重探用外层 BatchMode 公钥探测命令（cmd），非密码通道命令
+          for (let i = 0; i < 2; i++) {
+            const out2 = await runLocalShell(cmd, userId);
+            if (out2.includes('ok')) {
+              return {
+                ready: true,
+                authMode: 'key',
+                diag: [hint, '[公钥已通过密码通道现场注入并生效（不依赖云端 cloud-init）]', keyLines.join('\n')].filter(Boolean).join('\n'),
+              };
+            }
+            await new Promise(r => setTimeout(r, 5000));
+          }
+          plinkDiag += '；公钥注入返回成功但公钥探测仍未通过';
+        } else {
+          plinkDiag += `；公钥自动注入失败（不影响密码通道）: ${inj.err || inj.out.replace(/\s+/g, ' ').slice(0, 120) || '（空输出）'}`;
+        }
+
+        return {
+          ready: true,
+          authMode: 'password',
+          diag: [hint, plinkDiag, '[公钥未生效，已降级密码通道（sshpass/expect）]', keyLines.join('\n')].filter(Boolean).join('\n'),
+        };
+      }
+    } else {
+      plinkDiag = '[密码通道跳过] 本机无 sshpass/expect（macOS 自带 expect；Linux 可安装 sshpass）';
+    }
   } else if (!credentialName) {
     plinkDiag = '[plink 密码通道跳过] 无密码凭据（自动入库失败，见 DevTools console 的 [SSH-INSTANCE] 日志）';
   }
@@ -399,6 +523,8 @@ export interface SshOpenOptions {
   /** 登记项目归属（本地表 app_id），LLM 传项目 ID / UI 传当前 appId */
   projectId?: string;
   userId?: string;
+  /** 长租月数（1/3/6/12）：预付折扣月租一次扣清，期内免分段扣费，到期自动关机。不传=按量 */
+  months?: number;
   /** 进度回调（UI 展示用；LLM 路径不传） */
   onProgress?: (msg: string) => void;
   /** 指定复用某台活跃实例（LLM activate 复用路径） */
@@ -442,6 +568,9 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
   if (!instanceType && !resumeInstanceId) {
     return { ok: false, error: '缺少 instanceType（如 S5.MEDIUM4，可用 list_instance_types 查询规格）' };
   }
+
+  // 🔥 惰性对账：顺手清理孤儿 SSH 凭据（云端控制台手动关机/到期释放的僵尸），失败静默
+  cleanupOrphanSshCredentials(userId).catch(() => {});
 
   // 1. 复用检查
   let target: any = null;
@@ -499,6 +628,7 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
         publicKey: localKey?.pub || undefined,
         userId,
         appId: projectId || undefined,
+        months: opts.months || undefined,
       }),
     });
     const openData = openRes.data;
@@ -564,18 +694,49 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
   return { ok: true, instance: target, credentialName, sshReady, authMode, plinkFingerprint, reused, probeDiag };
 }
 
-/** 活跃实例清单（本地资源表，带项目归属 app_id；查询时云端自愈校正） */
+/** 活跃实例清单（本地资源表，带项目归属 app_id；默认查询时云端自愈校正，opts.sync=false 走纯本地表轻量查询） */
 export async function sshListActive(
-  userId?: string
+  userId?: string,
+  opts?: { sync?: boolean }
 ): Promise<{ ok: boolean; instances: any[]; error?: string }> {
   const uid = userId || '';
+  const sync = opts?.sync !== false;
   const res = await localApi(
-    `/api/rental/resources?userId=${encodeURIComponent(uid)}&active=1&sync=1`
+    `/api/rental/resources?userId=${encodeURIComponent(uid)}&active=1${sync ? '&sync=1' : ''}`
   ).catch(() => ({ ok: false, status: 0, data: null }));
   if (!res.ok) {
     return { ok: false, instances: [], error: res.data?.error || `查询失败 (HTTP ${res.status})` };
   }
   return { ok: true, instances: res.data?.resources || [] };
+}
+
+/** 直连连接信息（ssh_remote 工具用；按 id/rentalId/instanceId 三路命中本地资源表） */
+export interface SshConnectionInfo {
+  host: string;
+  port: number;
+  user: string;
+  credentialName: string | null;
+  source: string;
+}
+
+/** 解析实例的直连参数（host/port/user/凭据名；密码由执行链凭据注入机制按名取） */
+export async function resolveInstanceConnection(
+  instanceId: string,
+  userId?: string
+): Promise<SshConnectionInfo | null> {
+  const lr = await localApi(`/api/rental/resources?userId=${encodeURIComponent(userId || '')}&sync=1`)
+    .catch(() => ({ ok: false, status: 0, data: null }));
+  const rec = (lr.data?.resources || []).find((r: any) =>
+    r.id === instanceId || r.cloud_rental_id === instanceId || r.cloud_instance_id === instanceId
+  );
+  if (!rec || !rec.host) return null;
+  return {
+    host: rec.host,
+    port: Number(rec.port) || 22,
+    user: rec.username || rec.ssh_user || 'ubuntu',
+    credentialName: rec.credential_name || null,
+    source: rec.source || 'cloud',
+  };
 }
 
 /** 自有机器凭据入库（密码只进凭据库，不经任何后端；存在则更新） */
@@ -650,6 +811,8 @@ export async function sshAddSelfInstance(
   }
 
   // 1. 凭据先入库（连通测试的 plink 通道依赖凭据名注入 SSHPASS；失败/重复绑定会回滚）
+  // 🔥 惰性对账：顺手清理孤儿 SSH 凭据，失败静默
+  cleanupOrphanSshCredentials(userId).catch(() => {});
   const credName = (opts.credentialName || `ssh_self-${Date.now().toString(36)}`).trim();
   onProgress?.('保存凭据...');
   if (!(await upsertSelfCredential(credName, host, username, password, userId))) {
@@ -772,6 +935,31 @@ export async function sshCloseInstance(
   return { ok: true, rentalId };
 }
 
+/** 租赁详情（含长租预付信息 prepaid；续费入口用来判断是否长租 + 当前到期时间） */
+export async function sshGetInstanceDetail(
+  rentalId: string,
+  userId?: string
+): Promise<{ ok: boolean; instance?: any; error?: string }> {
+  const r = await rentalApi(`/instances/${encodeURIComponent(rentalId)}`);
+  if (!r.ok) return { ok: false, error: r.data?.error || `查询失败 (HTTP ${r.status})` };
+  return { ok: true, instance: r.data?.instance };
+}
+
+/** 续费预付长租：租期从原到期时间顺延，一次扣续费月数的折后总额 */
+export async function sshRenewInstance(
+  rentalId: string,
+  months: number,
+  userId?: string
+): Promise<{ ok: boolean; expireAt?: number; total?: number; error?: string }> {
+  const r = await rentalApi(`/instances/${encodeURIComponent(rentalId)}/renew`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ months, ...(userId ? { userId } : {}) }),
+  });
+  if (!r.ok) return { ok: false, error: r.data?.error || `续费失败 (HTTP ${r.status})` };
+  return { ok: true, expireAt: r.data?.expireAt, total: r.data?.total };
+}
+
 // ============================================================
 // LLM 工具入口（薄封装，核心逻辑在上面三个函数）
 // ============================================================
@@ -797,6 +985,7 @@ function usageHint(inst: any, credentialName: string | null, authMode?: 'key' | 
   if (authMode !== 'password' && credentialName) {
     hint.push(`   （密码兜底，macOS/Linux）: userpc_shell 传 credentialName=${credentialName}, command='sshpass -e ssh -o StrictHostKeyChecking=no ${user}@${ip} 命令'`);
   }
+  hint.push(`   部署 web 服务后调 ssh_instance(action=register, host=${ip}, port=服务端口, projectId=项目id) 换取官方 HTTPS 预览域名（浏览器裸 IP 访问会有不安全告警）`);
   hint.push(`   用完后务必调 ssh_instance(action=close, instanceId=${inst.id}) 关机结算`);
   hint.push(`   凭据用法: shell 传 credentialName=${credentialName || '凭据名'} 自动注入密码变量；代码里引用凭据名会自动替换为密码`);
   return hint;
@@ -830,7 +1019,7 @@ function selfUsageHint(inst: any, credentialName: string | null, authMode?: 'key
 
 /**
  * ssh_instance 工具执行入口
- * action: activate（开机/复用）| add（绑定自有服务器）| close（关机/解绑）| list（活跃实例清单）
+ * action: activate（开机/复用）| add（绑定自有服务器）| close（关机/解绑）| list（活跃实例清单）| register（登记预览反代 HTTPS 短链）
  */
 export async function executeSshInstanceTool(
   step: AutoStep,
@@ -856,7 +1045,7 @@ export async function executeSshInstanceTool(
     return ok([
       `活跃常驻实例 ${r.instances.length} 台（按项目归属区分，root 权限用 sudo -i）:`,
       ...lines,
-      `凭据用法: userpc_shell 传 credentialName=凭据名 即自动登录对应机子；代码/脚本里引用该凭据名会自动替换成密码`,
+      `凭据用法: userpc_shell 传 credentialName=凭据名 即自动注入 SSHPASS 环境变量（仅 plink -pw $env:SSHPASS / sshpass -e 消费，脚本里写凭据名不会被替换；公钥免密是主路径，凭据名只做密码兜底）`,
       `绑定用户自有服务器: action=add + host/port/username/password（连通测试通过后自动配公钥免密并登记，不计费）`,
     ]);
   }
@@ -896,9 +1085,36 @@ export async function executeSshInstanceTool(
     return ok(hint);
   }
 
+  // ---------- register：登记预览反代（web 服务部署完成后换官方泛域名 HTTPS 短链） ----------
+  if (action === 'register') {
+    const host = String(params.host || '').trim();
+    const port = Number(params.port || 0);
+    const projectId = String(params.projectId || '').trim() || undefined;
+    if (!host || !port) {
+      return fail('缺少 host 或 port（已部署 web 服务的机子 IP 与监听端口）');
+    }
+    const token = getAuthToken();
+    if (!token) return fail('未登录，无法登记预览域名');
+    try {
+      const res = await fetch(`${CLOUD_BASE_URL}/api/preview/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ host, port, projectId }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) return fail(data?.error || `预览域名登记失败 (HTTP ${res.status})`);
+      return ok([
+        `✅ 预览域名已就绪: ${data.url}（nginx HTTPS 反代 → http://${host}:${port}，浏览器可直接访问，无安全告警）`,
+        `   把该地址写入总结/回函告知用户；机子重启 IP 变化后重新 register（同 projectId）会复用同一域名`,
+      ]);
+    } catch (e: any) {
+      return fail(`预览域名登记失败: ${e?.message || e}`);
+    }
+  }
+
   // ---------- activate：开机（或复用；instanceId 命中自有机器直接复用） ----------
   if (action !== 'activate') {
-    return fail(`未知 action: ${action}（支持 activate | add | close | list）`);
+    return fail(`未知 action: ${action}（支持 activate | add | close | list | register）`);
   }
 
   const instanceId = String(params.instanceId || '').trim();
@@ -913,8 +1129,15 @@ export async function executeSshInstanceTool(
       .catch(() => ({ ok: false, status: 0, data: null }));
     const rec = (lr.data?.resources || []).find((x: any) => x.id === instanceId && x.source === 'workstation');
     if (rec && (rec.status === 'booting' || rec.status === 'running')) {
-      const hint = selfUsageHint(rec, rec.credential_name || null);
-      hint.unshift(`sshReady=true | authMode=reused(自有机器) | credentialName=${rec.credential_name || '（未设置）'}`);
+      // 🔥 复用必须重新探测真实 authMode：绑定时的 authMode 未持久化，服务器重装/authorized_keys
+      //    被清后公钥可能失效——凭记忆给裸 ssh 模板会让 LLM 卡密码超时。探测自带 plink 自愈
+      //    （公钥失效时用密码通道重新注入，恢复免密）；机器是活的，maxAttempts=1 秒级完成。
+      const probe = await probeSshReady(rec.host, rec.username || 'root', rec.credential_name || null, context?.userId, 1, Number(rec.port) || 22);
+      if (!probe.ready) {
+        return fail(`自有机器 ${instanceId} 当前 SSH 不可达（${probe.diag || 'key/password 均未连通'}）；机器未开机或网络不通时请用户检查，恢复后重试或用 action=add 重新绑定`);
+      }
+      const hint = selfUsageHint(rec, rec.credential_name || null, probe.authMode, probe.fingerprint);
+      hint.unshift(`sshReady=true | authMode=${probe.authMode} | credentialName=${rec.credential_name || '（未设置）'}`);
       return ok(hint);
     }
     if (rec) {
