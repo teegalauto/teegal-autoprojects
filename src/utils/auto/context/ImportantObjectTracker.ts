@@ -9,6 +9,7 @@
  */
 
 import { isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
+import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
 
 export interface ProjectActivityStats {
   trainCount: number;      // GPU 训练次数
@@ -661,7 +662,7 @@ export class ImportantObjectTracker {
    * 🔥 排序策略：先按 mentionCount 降序（活跃度），再按 lastSeenAt 降序（最近性）
    * @param activeInstances 活跃 SSH 实例快照（可选）：归属匹配的项目条目下直接带出，免调 ssh_instance 查询省一轮
    */
-  getFormattedObjects(conversationId: string, activeInstances?: any[], rootHints?: Map<string, string>): string {
+  async getFormattedObjects(conversationId: string, activeInstances?: any[], rootHints?: Map<string, string>): Promise<string> {
     const objects = this.getConversationObjects(conversationId);
 
     if (objects.length === 0) {
@@ -693,6 +694,15 @@ export class ImportantObjectTracker {
 
     if (apps.length > 0) {
       lines.push('### 对话中提到的项目 (Projects)');
+      // 🔥 项目本地代码目录（getAppBasePath：code_path 或默认 userDataPath/apps/{appId}）：
+      //    不告知此路径，LLM 做本地渲染/执行类任务只能全盘搜索项目文件
+      //    （真实案例：manim 渲染搜不到落盘文件，被迫用脚本重抄一遍代码）
+      //    注意不能用 getCodePath——普通项目 code_path 为 null，会漏掉默认路径
+      const codePaths = new Map<string, string>();
+      await Promise.all(apps.map(async (app) => {
+        const p = await getAppBasePath(app.id).catch(() => null);
+        if (p) codePaths.set(app.id, p);
+      }));
       apps.forEach((app, index) => {
         const timeStr = formatTime(app.lastSeenAt);
         const shortId = app.id.substring(0, 8);
@@ -723,14 +733,22 @@ export class ImportantObjectTracker {
           lines.push(`   内容根: ${rootHint}/`);
         }
 
-        // 🔥 附带该项目归属的活跃实例（快照，免调 ssh_instance 查询）
-        if (activeInstances && activeInstances.length > 0) {
-          const owned = activeInstances.filter(it => isSameProjectId(it.app_id, app.id));
-          for (const it of owned) {
-            const addr = it.host ? `${it.username || 'ubuntu'}@${it.host}` : (it.public_ip || '开机中');
-            const status = it.status === 'pending' ? '开机中' : (it.status || '');
-            lines.push(`   实例: ${it.id} (${it.instance_type || '未知规格'}, ${addr}${status ? `, ${status}` : ''})`);
-          }
+        // 🔥 本地落盘地址：shell/python 等本地执行类任务直接用，免全盘搜索
+        const codePath = codePaths.get(app.id);
+        if (codePath) {
+          lines.push(`   本地目录: ${codePath}/`);
+        }
+
+        // 🔥 附带该项目归属的活跃实例（快照，免调 ssh_instance 查询）；无实例也明示"无"——
+        //    这本身是有效信息（LLM 据此知道不能 ssh、应先开机，而非误连或反复查询）
+        const owned = activeInstances ? activeInstances.filter(it => isSameProjectId(it.app_id, app.id)) : [];
+        for (const it of owned) {
+          const addr = it.host ? `${it.username || 'ubuntu'}@${it.host}` : (it.public_ip || '开机中');
+          const status = it.status === 'pending' ? '开机中' : (it.status || '');
+          lines.push(`   实例: ${it.id} (${it.instance_type || '未知规格'}, ${addr}${status ? `, ${status}` : ''})`);
+        }
+        if (owned.length === 0) {
+          lines.push('   实例: 无');
         }
       });
       lines.push('');

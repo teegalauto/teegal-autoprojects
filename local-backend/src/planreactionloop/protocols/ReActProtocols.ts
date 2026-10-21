@@ -287,9 +287,9 @@ function buildExecutionHistory(
   writeNotes?: string,
   maxHistoryChars: number = 36000,
   sessionId?: string
-): string {
+): { text: string; autoArchived: number } {
   if (!toolResults.length && !writeNotes) {
-    return '';
+    return { text: '', autoArchived: 0 };
   }
 
   // 🔥 按 Round 拆分笔记
@@ -385,7 +385,7 @@ function buildExecutionHistory(
   // 🔥 工作笔记集中区：放在 body 之后（每轮新笔记只追加末段，cache 友好）
   const notesSection = buildNotesSection(toolResults, notesByRound, levels[chosenIdx]?.arch ?? baseArch);
 
-  return header + body + notesSection + footer + rhythm;
+  return { text: header + body + notesSection + footer + rhythm, autoArchived: baseArch };
 }
 
 export const ReActProtocols = {
@@ -431,11 +431,11 @@ export const ReActProtocols = {
     systemPrompt: string;
     userPrompt: string;
     /** 🔥 prompt 分项体积（字符）：executionHistory / staticEnv / dynamicEnv，用于每轮体积归因 */
-    parts: { history: number; staticEnv: number; dynamicEnv: number };
+    parts: { history: number; staticEnv: number; dynamicEnv: number; autoArchived: number };
   } => {
     const { roundNumber, maxRounds, userQuery, letAgentTodo, relevantFiles, toolResults, environmentText, staticEnvironmentText, dynamicEnvironmentText, writeNotes, clearWindow = 1, maxHistoryChars = 36000, sessionId } = params;
 
-    const executionHistory = buildExecutionHistory(toolResults, clearWindow, writeNotes, maxHistoryChars, sessionId);
+    const { text: executionHistory, autoArchived } = buildExecutionHistory(toolResults, clearWindow, writeNotes, maxHistoryChars, sessionId);
     const remainingRounds = maxRounds - roundNumber;
 
     // 🔥 letAgentTodo 放在 systemPrompt 中，同一 session 内 Round 1→2→3 的 systemPrompt 完全相同，提高缓存命中率
@@ -469,6 +469,7 @@ export const ReActProtocols = {
         history: executionHistory.length,
         staticEnv: staticEnv.length,
         dynamicEnv: dynamicEnv.length,
+        autoArchived,
       },
     };
   },

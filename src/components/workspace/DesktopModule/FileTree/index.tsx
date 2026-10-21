@@ -492,6 +492,19 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
     setSelectedPath(node.path);
     setSelectedChange(null); // 🔥 点击当前文件 → 清空变更记录选中
     if (node.type === 'file') {
+      const ext = node.path.split('.').pop()?.toLowerCase() || '';
+      // 🔥 媒体/PDF 免门禁：查看器走 teegal-file:// 流式协议（磁盘按需读，支持 seek），
+      // 文件多大都不占渲染进程内存，直接交给查看器
+      const STREAMABLE_EXT = new Set([
+        'mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v',
+        'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac',
+        'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico',
+        'pdf',
+      ]);
+      if (STREAMABLE_EXT.has(ext)) {
+        onFileSelect(node.path, '');
+        return;
+      }
       // 🔥 超大文件不读内容（保命层）：读入几十 MB 的二进制/日志会把渲染进程卡死——
       // 选中高亮 + 提示即可，内容置空；不支持的类型（.pt 等）由上层渲染兜底提示页
       const MAX_PREVIEW_SIZE = 2 * 1024 * 1024; // 2MB

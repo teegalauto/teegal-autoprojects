@@ -71,6 +71,11 @@ interface OccurrenceInfo {
   endPos: number;
 }
 
+// 🔥 行尾统一规范化（\r\n、孤立 \r → \n）：LLM 写的文件常见混合行尾——
+//    textarea/pre 按 \r 渲染换行，但行号计算 split('\n') 不认 \r，
+//    结果行号栏与视觉行错位（选中 196-200 实际标记 194-196）、搜索 mark 落错行
+const normalizeLineEndings = (s: string) => s.replace(/\r\n?/g, '\n');
+
 export const CodeEditor: React.FC<CodeEditorProps> = ({ 
   value, 
   currentCode,
@@ -87,8 +92,8 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 }) => {
   const { t } = useTranslation();
   
-  const [internalValue, setInternalValue] = useState(currentCode || value || '');
-  const [prevCode, setPrevCode] = useState(initialPreviousCode || '');
+  const [internalValue, setInternalValue] = useState(() => normalizeLineEndings(currentCode || value || ''));
+  const [prevCode, setPrevCode] = useState(() => normalizeLineEndings(initialPreviousCode || ''));
   const [localShowDiff, setLocalShowDiff] = useState(showDiff);
   
   // 🔥 选中文本相关状态
@@ -116,15 +121,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   // 🔥 当 currentCode 变化时，更新内部状态
   useEffect(() => {
     if (currentCode !== undefined) {
-      // 🔥 强制更新，不比较 internalValue（避免闭包问题）
-      setInternalValue(currentCode);
+      // 🔥 强制更新，不比较 internalValue（避免闭包问题）；行尾规范化见上方注释
+      setInternalValue(normalizeLineEndings(currentCode));
       console.log('[CodeEditor] currentCode 更新:', currentCode?.substring(0, 50));
     }
   }, [currentCode]);
 
   useEffect(() => {
     if (initialPreviousCode !== undefined) {
-      setPrevCode(initialPreviousCode);
+      // 🔥 prevCode 与 internalValue 同样规范化行尾：否则 \r\n 快照 vs \n 当前内容
+      //    逐行对比时每行行尾都不同 → diff 整文件标红（看起来像 diff 失效）
+      setPrevCode(normalizeLineEndings(initialPreviousCode));
     }
   }, [initialPreviousCode]);
 
@@ -138,6 +145,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       textareaRef.current = editorContainerRef.current.querySelector('textarea');
     }
   }, []);
+
+  // 🔥 惰性获取当前存活的 textarea：diff 切换等场景 Editor 会卸载重挂（textarea 是全新 DOM），
+  //    挂载时一次性捕获的引用指向已卸载节点——selectionStart 恒 0，「添加到对话」按钮不再弹出，
+  //    搜索滚动/定位同样失效。每次使用时校验 isConnected，失效即重查
+  const getActiveTextarea = (): HTMLTextAreaElement | null => {
+    const cur = textareaRef.current;
+    if (cur && cur.isConnected) return cur;
+    const fresh = editorContainerRef.current?.querySelector('textarea') || null;
+    textareaRef.current = fresh;
+    return fresh;
+  };
 
   const getPrismLanguage = (): string => {
     // 🔥 优先按文件扩展名推断（language prop 可能是父组件写死的默认值，如 python）
@@ -346,7 +364,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   // 🔥 获取选中的文本和行号
   const getSelectionInfo = useCallback((): SelectionInfo | null => {
-    const textarea = textareaRef.current;
+    const textarea = getActiveTextarea();
     if (!textarea) return null;
 
     const start = textarea.selectionStart;
@@ -504,12 +522,12 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       const paddingLeft = 12 + 50; // 编辑器左边距 + 行号宽度
       
       // 计算选区起始行的垂直位置（考虑滚动）
-      const textarea = textareaRef.current;
+      const textarea = getActiveTextarea();
       const scrollTop = textarea?.scrollTop || 0;
       const containerWidth = editorContainerRef.current?.clientWidth || 400;
       
-      // 按钮显示在选区起始行的上方
-      const y = paddingTop + (info.startLine - 1) * lineHeight - scrollTop - 35;
+      // 按钮显示在选区结束行的下方（紧贴选中区域；此前在起始行上方 35px，离选中区又远又在上面）
+      const y = paddingTop + info.endLine * lineHeight - scrollTop + 8;
       // 水平居中显示
       const x = (containerWidth - paddingLeft) / 2;
       
@@ -568,30 +586,30 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     setSelection(null);
   }, [selection, appId, filePath, config, language]);
 
-  // 🔥 监听文本选择事件
+  // 🔥 监听文本选择事件：绑到外层容器做事件委托（容器 ref 稳定，不随 diff 切换重挂）——
+  //    此前绑在 textarea 上，diff 切换 Editor 重挂后事件随旧节点一起失效，选中不再触发
   useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
+    const container = editorContainerRef.current;
+    if (!container) return;
 
-    const handleMouseUp = () => {
-      setTimeout(handleSelectionChange, 10);
+    const isTextareaTarget = (e: Event) => (e.target as HTMLElement)?.tagName === 'TEXTAREA';
+    const handleMouseUp = (e: Event) => {
+      if (isTextareaTarget(e)) setTimeout(handleSelectionChange, 10);
     };
-
     const handleKeyUp = (e: KeyboardEvent) => {
       // 只在选择相关的按键后处理
-      if (['Shift', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
+      if (isTextareaTarget(e) && ['Shift', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
         setTimeout(handleSelectionChange, 10);
       }
     };
+    // select 事件不冒泡，委托收不到；鼠标选择由 mouseup 覆盖、键盘选择由 keyup 覆盖，已足够
 
-    textarea.addEventListener('mouseup', handleMouseUp);
-    textarea.addEventListener('keyup', handleKeyUp);
-    textarea.addEventListener('select', handleSelectionChange);
+    container.addEventListener('mouseup', handleMouseUp);
+    container.addEventListener('keyup', handleKeyUp as EventListener);
 
     return () => {
-      textarea.removeEventListener('mouseup', handleMouseUp);
-      textarea.removeEventListener('keyup', handleKeyUp);
-      textarea.removeEventListener('select', handleSelectionChange);
+      container.removeEventListener('mouseup', handleMouseUp);
+      container.removeEventListener('keyup', handleKeyUp as EventListener);
     };
   }, [handleSelectionChange]);
 
@@ -633,7 +651,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   // 🔥 滚动时更新按钮位置
   useEffect(() => {
-    const textarea = textareaRef.current;
+    const textarea = getActiveTextarea();
     if (!textarea || !showAddButton || !selection) return;
 
     const handleScroll = () => {
@@ -689,7 +707,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       behavior: 'smooth'
     });
     
-    const textarea = textareaRef.current;
+    const textarea = getActiveTextarea();
     if (textarea) {
       textarea.focus();
       textarea.setSelectionRange(occurrence.startPos, occurrence.endPos);
@@ -700,7 +718,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const renderOccurrenceMarkers = () => {
     if (occurrences.length === 0) return null;
     
-    const textarea = textareaRef.current;
+    const textarea = getActiveTextarea();
     const totalLines = internalValue.split('\n').length;
     const scrollContainer = editorContentRef.current;
     

@@ -68,7 +68,11 @@ export const REACTOR_STRATEGIES: Record<string, InjectionStrategy> = {
     includeUserPC: true,
     includeUserInjectMessages: true,
     includeKnowledgeBase: false,
-    includeImportantObjects: false,
+    // 🔥 reactor 也注入重要对象：执行轮才是真正 cd/读写文件的角色，「本地目录:」缺席会让
+    //    LLM 猜路径（实测 cd %USERPROFILE% 找不到刚编辑的 llm_scene.py，白白烧两轮）。
+    //    缓存安全：该段归入 dynamicEnvironment（模板中位于 executionHistory 之后），
+    //    内容变化只作废尾部，前缀缓存不破
+    includeImportantObjects: true,
   },
 };
 

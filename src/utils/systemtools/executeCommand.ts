@@ -265,6 +265,38 @@ function detectDangerousCommand(command: string): ErrorMessage | null {
 }
 
 /**
+ * 🔥 工具侧自愈（shell 通道通用）：命令/可执行文件"找不到"类失败附结构化自救指引。
+ * 真实案例：本机无 ffmpeg 时 manim 渲染连续 3 轮 WinError 2 原样重试，最后才想到 imageio-ffmpeg
+ * ——教学错误把这类环境坑压到一轮解决。非"找不到"类失败返回空串，不膨胀其他错误回传。
+ */
+export function buildCommandNotFoundHint(stderrText: string): string {
+  if (!stderrText) return '';
+  const text = stderrText.slice(-8000);
+  const winCmd = /无法将“([^”]+)”项识别为|'([^']+)' is not recognized as/.exec(text);
+  // 🔥 CategoryInfo 行是纯 ASCII：PowerShell 中文报错被编码错配打成乱码时仍可命中
+  const catNotFound = /ObjectNotFound: \(([^:)]+):/.exec(text);
+  const nixCmd = /(?:^|\n)\s*(?:bash: |sh: )?(\S+): command not found/.exec(text);
+  const pySpawn = /FileNotFoundError: \[WinError 2\]/.test(text);
+  const pyCwd = /NotADirectoryError: \[WinError 267\]/.test(text);
+  if (!winCmd && !nixCmd && !pySpawn && !pyCwd && !catNotFound) return '';
+
+  const missing = winCmd?.[1] || winCmd?.[2] || nixCmd?.[1] || catNotFound?.[1] || '';
+  const whichCmd = missing
+    ? (getPlatform() === 'windows' ? 'where.exe ' + missing : 'which ' + missing)
+    : 'where.exe / which 目标命令';
+
+  const lines = [
+    '',
+    '',
+    '💡 环境诊断（命令/可执行文件未找到；同一错误不要原样重试，先诊断再改命令）:',
+    '1. 定位: 先跑 ' + whichCmd + ' 确认是否存在；pip 安装的工具用 pip show <包名> 看 Location',
+    '2. pip 类 CLI 通常没有独立启动器，模块方式调用最稳: python -m <模块名>',
+  ];
+  if (pyCwd) lines.push('3. WinError 267 = cwd 指向不存在的目录: 先 os.path.exists 检查或列举父目录确认真实路径');
+  return lines.join('\n');
+}
+
+/**
  * 🔥 凭据解析（userpc_shell / userpc_run_python 共用）：
  * credentialName → IPC 查凭据 → platform 型走官方租约运行时取值 → {env_var: value} 供环境变量注入
  */
@@ -467,28 +499,13 @@ export interface ExecuteCommandProgress {
 }
 
 /**
- * 🔥 根据命令类型推断超时时间
+ * 🔥 总时长兜底（统一 30 分钟）：判死职责已移交主进程活跃度看门狗
+ * （无输出 120s 判挂起，见 main.ts system:execute-command-stream）。
+ * 不再按命令类型收紧总上限——那会误杀持续输出日志的渲染/训练类长任务
+ * （实测 manim -qh 渲染 6 分钟被 120s 上限击杀）；挂起类由无输出阈值终止
  */
-function inferTimeout(command: string): number {
-  const lowerCmd = command.toLowerCase();
-  
-  // 下载类命令 - 较长超时（10分钟）
-  if (/curl|wget|download|git clone|npm install|pip install/.test(lowerCmd)) {
-    return 600;
-  }
-  
-  // 分析/处理脚本类 - 中等超时（2分钟）
-  if (/python.*\.py|node.*\.js|分析|parse|analyze/.test(lowerCmd)) {
-    return 120;
-  }
-  
-  // 文件操作类 - 短超时（30秒）
-  if (/read|write|cat|copy|move|remove|delete|list/.test(lowerCmd)) {
-    return 30;
-  }
-  
-  // 默认 - 中等超时（3分钟）
-  return 180;
+function inferTimeout(_command: string): number {
+  return 1800;
 }
 
 export async function executeExecuteCommandTool(
@@ -649,6 +666,7 @@ export async function executeExecuteCommandTool(
     let isResolved = false;
     let cancelReason: string | null = null;
     let streamCancel: (() => void) | null = null;
+    const streamStartTime = Date.now(); // 🔥 timeout 路径显示实际耗时（idle 120s 被杀不该显示成总超时 1800s）
 
     if (isElectron) {
       console.log('🖥️ [EXECUTE-COMMAND-TOOL] 使用 Electron 流式执行');
@@ -720,9 +738,13 @@ export async function executeExecuteCommandTool(
 2. 修复公钥免密: 在常驻面板重新绑定该机器（或 ssh_instance action=add），绑定流程会自动注入公钥`)
                 : `\n\n💡 ssh 公钥免密未生效（BatchMode 下立即失败而非挂起等密码）。解法：用 ssh_instance（action=activate 复用 / action=add 绑定）获取当下真实可用的命令模板——activate 会重新探测并自动修复公钥免密，返回的模板直接照抄，不要凭记忆拼 ssh 命令`)
               : '';
+            // 🔥 命令/可执行文件"找不到"类失败：附环境诊断自救配方（工具侧自愈）
+            const notFoundHint = (!isSuccess && data.exitCode !== null)
+              ? buildCommandNotFoundHint(outputLines.join('\n'))
+              : '';
             resolve({
               success: isSuccess,
-              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}`,
+              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}${notFoundHint}`,
               data: {
                 type: 'terminal',
                 command,
@@ -741,16 +763,18 @@ export async function executeExecuteCommandTool(
           } else if (data.type === 'timeout') {
             if (isResolved) return;
             isResolved = true;
+            // 🔥 透传主进程的区分文案：总时长超时 vs 无输出挂起终止（LLM 据此选择不同自救策略）
+            const timeoutMsg = data.error || '命令执行超时';
             resolve({
               success: false,
-              error: '命令执行超时',
+              error: timeoutMsg,
               data: {
                 type: 'terminal',
                 command,
                 outputs: outputLines,
                 exitCode: -1,
-                executionTime: timeout * 1000,
-                error: '命令执行超时',
+                executionTime: Date.now() - streamStartTime,
+                error: timeoutMsg,
               },
               metadata: {
                 toolName: 'userpc_shell'
@@ -991,8 +1015,8 @@ export async function executeRunPythonTool(
                 executionTime: 0,
                 message: 'Python 代码执行完成',
               },
-              error: data.exitCode !== 0 
-                ? `执行失败，退出码: ${data.exitCode}${hasStderr ? '。错误输出: ' + outputLines.filter(l => l.includes('[stderr]')).join('; ') : ''}` 
+              error: data.exitCode !== 0
+                ? `执行失败，退出码: ${data.exitCode}${hasStderr ? '。错误输出: ' + outputLines.filter(l => l.includes('[stderr]')).join('; ') : ''}${buildCommandNotFoundHint(outputLines.join('\n'))}`
                 : undefined,
               metadata: { toolName: 'userpc_run_python' }
             });

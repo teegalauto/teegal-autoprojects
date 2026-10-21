@@ -1,5 +1,15 @@
-import { app, BrowserWindow, ipcMain, Menu, desktopCapturer, screen, dialog, safeStorage, powerSaveBlocker } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, desktopCapturer, screen, dialog, safeStorage, powerSaveBlocker, protocol } from 'electron';
 import path from 'path';
+import { Readable } from 'stream';
+
+// 🔥 流式本地文件协议：必须注册在 app ready 之前。
+// media/PDF 等大文件由 Chromium 按需从磁盘流式读取（支持 Range/seek），
+// 字节不过 IPC、不进渲染进程内存——GB 级视频也能流畅播放（原 base64→atob→Blob 路径内存放大 5 倍+）
+// 🔥 standard 必须开：Chromium 媒体栈的字节范围读取器对非 standard scheme 存在兼容性坑
+// （实测 code=4 PIPELINE_ERROR_READ "FFmpegDemuxer: data source error"，读 moov 后不再发请求）
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'teegal-file', privileges: { standard: true, stream: true, supportFetchAPI: true } },
+]);
 import { spawn, spawnSync, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { initAutoUpdater } from './autoUpdater';
@@ -642,6 +652,72 @@ app.whenReady().then(async () => {
   log('🚀 Teegal 应用启动');
   log(`📁 用户数据目录: ${app.getPath('userData')}`);
 
+  // 🔥 流式本地文件协议处理器：URL 形如 teegal-file://local/<encodeURIComponent(绝对路径)>
+  // 🔥 手工实现 Range/206：net.fetch(file://) 的 Range 行为不可控——媒体栈拿不到标准 206
+  // 语义时直接放弃解码（实测症状"探针能过但视频放不了"）。createReadStream 逐段读内存恒定，
+  // Chromium 媒体栈按标准 206 拉流 + seek。
+  const TEEGAL_FILE_MIME: Record<string, string> = {
+    mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', avi: 'video/x-msvideo',
+    mkv: 'video/x-matroska', m4v: 'video/mp4',
+    mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', flac: 'audio/flac',
+    m4a: 'audio/mp4', aac: 'audio/aac',
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+    webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', ico: 'image/x-icon',
+    pdf: 'application/pdf',
+  };
+  protocol.handle('teegal-file', async (request) => {
+    try {
+      // 解码后逐级剥前缀：兼容 GURL 对非标准 scheme 的解析差异
+      const filePath = decodeURIComponent(request.url)
+        .replace(/^teegal-file:/i, '')
+        .replace(/^\/+local\//, '')
+        .replace(/^\/(?=[a-zA-Z]:)/, '');
+      if (!filePath || !pathModule.isAbsolute(filePath)) {
+        log(`[teegal-file] bad path: ${filePath}`);
+        return new Response('bad path', { status: 400 });
+      }
+      if (!fs.existsSync(filePath)) {
+        log(`[teegal-file] not found: ${filePath}`);
+        return new Response('not found', { status: 404 });
+      }
+      const stat = fs.statSync(filePath);
+      const ext = pathModule.extname(filePath).slice(1).toLowerCase();
+      const baseHeaders: Record<string, string> = {
+        'Content-Type': TEEGAL_FILE_MIME[ext] || 'application/octet-stream',
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+      };
+      const range = request.headers.get('range');
+      if (range) {
+        const m = /bytes=(\d*)-(\d*)/.exec(range);
+        const start = m && m[1] ? parseInt(m[1], 10) : 0;
+        let end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+        if (isNaN(start) || start > end || start >= stat.size) {
+          log(`[teegal-file] 416 range=${range} size=${stat.size}`);
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${stat.size}` } });
+        }
+        end = Math.min(end, stat.size - 1);
+        log(`[teegal-file] 206 ${filePath} bytes=${start}-${end}/${stat.size}`);
+        return new Response(Readable.toWeb(fs.createReadStream(filePath, { start, end })) as any, {
+          status: 206,
+          headers: {
+            ...baseHeaders,
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Content-Length': String(end - start + 1),
+          },
+        });
+      }
+      log(`[teegal-file] 200 ${filePath} size=${stat.size}`);
+      return new Response(Readable.toWeb(fs.createReadStream(filePath)) as any, {
+        status: 200,
+        headers: { ...baseHeaders, 'Content-Length': String(stat.size) },
+      });
+    } catch (e: any) {
+      log(`[teegal-file] error: ${e?.message || e}`);
+      return new Response('not found', { status: 404 });
+    }
+  });
+
   // 设置 IPC 监听器
   setupIPC();
 
@@ -849,7 +925,7 @@ ipcMain.handle('system:execute-command', async (event, { command, timeout = 120,
     
     // Windows 下设置 UTF-8 编码
     const actualCommand = isWindows 
-      ? `chcp 65001 >nul && ${sanitizedCommand}`
+      ? `chcp 65001 >nul; ${convertAndSequence(sanitizedCommand)}`
       : sanitizedCommand;
     
     console.log('⚡ [MAIN] 最终执行命令:', actualCommand);
@@ -873,7 +949,7 @@ ipcMain.handle('system:execute-command', async (event, { command, timeout = 120,
     let proc;
     if (isWindows) {
       // Windows: 显式使用 PowerShell 执行命令，添加 UTF-8 编码设置
-      const encodedCommand = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${sanitizedCommand}`;
+      const encodedCommand = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${convertAndSequence(sanitizedCommand)}`;
       proc = spawn('powershell', ['-NoProfile', '-Command', encodedCommand], {
         ...spawnOptions,
         shell: false
@@ -991,6 +1067,36 @@ function safeSenderSend(sender: any, channel: string, data: any) {
   }
 }
 
+/**
+ * 把引号字符串外的 && 转成 ;（PowerShell 5 兼容）：
+ * PS5 不支持 && 连接符，LLM 受 bash 先验影响高频写出。引号感知，字符串字面量（如 "a && b"）不动
+ */
+function convertAndSequence(cmd: string): string {
+  if (!cmd.includes('&&')) return cmd;
+  let out = '';
+  let quote: string | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) {
+      out += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch === '&' && cmd[i + 1] === '&') {
+      out += ';';
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, workingDir, executionId, env: extraEnv, appId }) => {
   const isWindows = process.platform === 'win32';
 
@@ -1052,11 +1158,19 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   
   let proc;
   if (isWindows) {
+    // 🔥 PowerShell 5 不支持 && 连接符（PS7 才有），LLM 受 bash 先验影响高频写出 → 整条脚本解析报错白烧一轮。
+    //    软提示（环境注入「shell 为 PS5」）拉不回训练先验，实测 LLM 几乎每条长命令都带 &&。
+    //    硬保障：写 ps1 前把引号外的 && 转成 ; —— 对 cd dir && python x 类连接，; 的语义差异
+    //    （前命令失败也继续）远小于整条命令直接报错的代价。字符串字面量不动（引号感知）
+    const andFixed = convertAndSequence(sanitizedCommand);
+    if (andFixed !== sanitizedCommand) {
+      console.log('🔧 [MAIN-STREAM] 检测到 PS5 不支持的 && 连接符，已转换为 ;');
+    }
     // 🔥 优化：检测下载命令，禁用进度条以提高稳定性
-    let optimizedCommand = sanitizedCommand;
+    let optimizedCommand = andFixed;
     if (sanitizedCommand.includes('Invoke-WebRequest')) {
       // 禁用进度条，避免阻塞输出流
-      optimizedCommand = `$ProgressPreference = 'SilentlyContinue'; ${sanitizedCommand}`;
+      optimizedCommand = `$ProgressPreference = 'SilentlyContinue'; ${andFixed}`;
       console.log('🔧 [MAIN-STREAM] 检测到下载命令，已禁用进度条');
     }
     // 🔥 修复：将单引号中的路径转换为使用 $env:USERPROFILE 变量，避免转义问题
@@ -1083,7 +1197,11 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
     fs.writeFileSync(scriptPath, scriptContent, 'utf8');
     console.log('🔧 [MAIN-STREAM] 命令已写入脚本文件:', scriptPath);
     
-    proc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+    // 🔥 编码包装：解析期错误（如 LLM 写了 PS5 不支持的 &&）发生在脚本执行前，
+    //    脚本文件内的 OutputEncoding 行来不及运行，报错按系统默认 GBK 输出 → Node 按 UTF-8 解码成乱码。
+    //    改为 -Command 先设编码再 & 调脚本文件：任何报错（含解析错误）都稳定 UTF-8。
+    const encodingWrapper = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & '${scriptPath}'`;
+    proc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', encodingWrapper], {
       ...spawnOptions,
       shell: false
     });
@@ -1199,6 +1317,7 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   let stdoutDataCount = 0;
   proc.stdout?.on('data', (data) => {
     stdoutDataCount++;
+    armIdleWatch(); // 🔥 活跃度续期：有输出就重置无输出计时
     handleOutput('stdout', data);
   });
 
@@ -1206,6 +1325,7 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   let stderrDataCount = 0;
   proc.stderr?.on('data', (data) => {
     stderrDataCount++;
+    armIdleWatch();
     handleOutput('stderr', data);
   });
 
@@ -1223,6 +1343,11 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
     const processInfo = runningProcesses.get(executionId);
     runningProcesses.delete(executionId);
     streamWatchdogs.delete(executionId); // 🔥 清理超时看门狗（已结束的进程不再需要）
+    const idleWatch = streamIdleWatchdogs.get(executionId);
+    if (idleWatch) {
+      clearTimeout(idleWatch);
+      streamIdleWatchdogs.delete(executionId);
+    }
     // 🔥 计算类脚本自然退出 → 清理 appId 登记（服务类常驻不退出，由重新执行/关窗口释放）
     const appEntry = appId ? appServiceProcesses.get(appId) : undefined;
     if (appId && appEntry?.executionId === executionId) {
@@ -1268,25 +1393,57 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
     });
   });
 
-  // 超时处理（服务类进程可通过 system:detach-command 取消超时，活到被杀为止）
-  const watchdog = setTimeout(() => {
-    streamWatchdogs.delete(executionId);
-    if (!proc.killed) {
-      // 🔥 必须杀整棵进程树：proc.kill() 只杀 powershell 父进程，
-      // python/node 孙进程会变孤儿继续跑（占用 CPU/内存，再也无法管理）
-      try {
-        if (process.platform === 'win32') {
-          spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'], { windowsHide: true });
-        } else {
-          proc.kill('SIGKILL');
-        }
-      } catch (e) {
-        console.warn('⚠️ [MAIN-STREAM] 超时杀进程树失败:', e);
+  // 🔥 双阈值看门狗（通用判死模型：标准是"无输出"而非"跑得久"）：
+  // - 活跃度阈值：每收到 stdout/stderr 就续期，持续打日志的渲染/训练类长任务（manim -qh
+  //   数分钟、pip 大依赖安装）永不误杀；真正挂起的进程（死循环/等输入/卡死）零输出按阈值终止
+  // - 总时长阈值：timeout 参数兜底（防失控成本），LLM 可显式传大值
+  // 服务类常驻进程不受此限：通过 system:detach-command 取消两个看门狗
+  const IDLE_LIMIT_MS = 120 * 1000;
+  const killTree = () => {
+    // 🔥 必须杀整棵进程树：proc.kill() 只杀 powershell 父进程，
+    // python/node 孙进程会变孤儿继续跑（占用 CPU/内存，再也无法管理）
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'], { windowsHide: true });
+      } else {
+        proc.kill('SIGKILL');
       }
+    } catch (e) {
+      console.warn('⚠️ [MAIN-STREAM] 看门狗杀进程树失败:', e);
+    }
+  };
+  const armIdleWatch = () => {
+    const prev = streamIdleWatchdogs.get(executionId);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      streamIdleWatchdogs.delete(executionId);
+      if (proc.exitCode !== null || proc.killed) return;
+      console.warn(`⚠️ [MAIN-STREAM] 命令 ${IDLE_LIMIT_MS / 1000}s 无输出，疑似挂起，杀进程树 PID=${proc.pid}`);
+      killTree();
       safeSenderSend(event.sender, 'system:command-output', {
         executionId,
         type: 'timeout',
-        error: 'Command timeout',
+        error: `Command idle timeout（${IDLE_LIMIT_MS / 1000}s 无输出，疑似挂起已终止。持续输出日志的长任务不会被此机制误杀；确属长耗时且无中间输出时，请显式传大 timeout 或改后台执行+轮询日志）`,
+        timestamp: Date.now()
+      });
+    }, IDLE_LIMIT_MS);
+    streamIdleWatchdogs.set(executionId, timer);
+  };
+  armIdleWatch(); // 启动即武装：初始静默期覆盖零输出即退/立即挂起两类场景
+
+  // 总时长兜底（服务类进程可通过 system:detach-command 取消，活到被杀为止）
+  const watchdog = setTimeout(() => {
+    streamWatchdogs.delete(executionId);
+    if (!proc.killed) {
+      // 🔥 带命令摘要：1800s 兜底被杀的多数是 LLM 前台启动的常驻服务（dev server 等），
+      //    日志不载命令就无法定位是谁白跑 30 分钟
+      const cmdDigest = command.replace(/\s+/g, ' ').slice(0, 100);
+      console.warn(`⚠️ [MAIN-STREAM] 命令超时（${timeout}s），强杀进程树 PID=${proc.pid} | cmd: ${cmdDigest}`);
+      killTree();
+      safeSenderSend(event.sender, 'system:command-output', {
+        executionId,
+        type: 'timeout',
+        error: `Command timeout (${timeout}s): ${cmdDigest}`,
         timestamp: Date.now()
       });
     }
@@ -1298,6 +1455,8 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
  * 🔥 流式命令的超时看门狗（服务类进程检测到启动地址后可"脱管"，不再被超时杀掉）
  */
 const streamWatchdogs = new Map<string, NodeJS.Timeout>();
+// 🔥 活跃度看门狗（无输出判死）：与总时长看门狗分离，detach/收尾需成对清理
+const streamIdleWatchdogs = new Map<string, NodeJS.Timeout>();
 
 /**
  * 🔥 按 appId 登记的项目进程（main 进程持有，不受渲染窗口刷新/重载影响）
@@ -1333,6 +1492,12 @@ ipcMain.on('system:detach-command', (_event, { executionId }) => {
   if (watchdog) {
     clearTimeout(watchdog);
     streamWatchdogs.delete(executionId);
+  }
+  // 🔥 活跃度看门狗一并取消：服务类进程静默运行（无日志期）不该被无输出判死
+  const idleWatch = streamIdleWatchdogs.get(executionId);
+  if (idleWatch) {
+    clearTimeout(idleWatch);
+    streamIdleWatchdogs.delete(executionId);
   }
   for (const entry of appServiceProcesses.values()) {
     if (entry.executionId === executionId) entry.isService = true;

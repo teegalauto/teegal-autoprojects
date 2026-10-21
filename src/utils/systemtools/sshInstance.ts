@@ -637,6 +637,7 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
     }
     target = { id: openData.rentalId, instance_type: instanceType, status: 'pending' };
     localResourceId = openData.resourceId || null;
+    notifyInstancesChanged(); // 开机登记进本地表，图标立即点亮（开机中态）
   }
 
   // 3. 等待就绪
@@ -651,6 +652,7 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ remark: waited.error }),
         }).catch(() => {});
+        notifyInstancesChanged();
       }
       return { ok: false, error: waited.error || '实例未就绪' };
     }
@@ -675,6 +677,7 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
         sshUser: target.ssh_user || 'ubuntu',
       }),
     }).catch(() => {});
+    notifyInstancesChanged(); // running 回写完成，图标转绿
   }
 
   // 6. 🔥 免密探测（仅新开机做）：复用的机子已在跑，探测会白等 90s 拖死 UI/LLM
@@ -692,6 +695,11 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
   }
 
   return { ok: true, instance: target, credentialName, sshReady, authMode, plinkFingerprint, reused, probeDiag };
+}
+
+/** 🔥 实例资源表变更广播：开机登记/就绪回写/关机等节点调用，前端计数图标即时刷新（免等 60s 轮询盲窗） */
+export function notifyInstancesChanged(): void {
+  try { window.dispatchEvent(new CustomEvent('ssh-instances-changed')); } catch { /* 非浏览器环境忽略 */ }
 }
 
 /** 活跃实例清单（本地资源表，带项目归属 app_id；默认查询时云端自愈校正，opts.sync=false 走纯本地表轻量查询） */
@@ -880,6 +888,7 @@ export async function sshCloseInstance(
   // 🔥 关机前先从本地资源表取底层 instanceId / 凭据名 / 来源
   // （LLM 关机传的可能是 rentalId rent-xxx，而凭据名按底层实例 ID 命名 ssh_ins-xxx，直接删会扑空）
   let cloudInstanceId = '';
+  let cloudRentalId = '';
   let credentialName = '';
   let localId = '';
   let source = 'cloud';
@@ -891,6 +900,7 @@ export async function sshCloseInstance(
     );
     if (rec) {
       cloudInstanceId = rec.cloud_instance_id || '';
+      cloudRentalId = rec.cloud_rental_id || '';
       credentialName = rec.credential_name || '';
       localId = rec.id || '';
       source = rec.source || 'cloud';
@@ -910,10 +920,13 @@ export async function sshCloseInstance(
     if (credentialName) {
       await deleteCredentialByInstance(credentialName, userId);
     }
+    notifyInstancesChanged();
     return { ok: true, unbound: true };
   }
 
-  const res = await rentalApi(`/instances/${encodeURIComponent(instanceId)}/close`, {
+  // 🔥 关机 id 必须用云端租赁 id：图标/弹窗传的可能是本地资源表 id（sshres-xxx），直接发云端会 400「租赁实例不存在」
+  const closeTargetId = cloudRentalId || instanceId;
+  const res = await rentalApi(`/instances/${encodeURIComponent(closeTargetId)}/close`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ reason: 'user' }),
@@ -921,7 +934,7 @@ export async function sshCloseInstance(
   if (!res.ok) {
     return { ok: false, error: res.data?.error || `关机失败 (HTTP ${res.status})` };
   }
-  const rentalId = res.data?.rentalId || instanceId;
+  const rentalId = res.data?.rentalId || closeTargetId;
   // 本地资源表收尾 + 凭据同步删除（保证 UI 常驻灯熄灭、凭据不留僵尸）
   await localApi('/api/rental/resources/close-by-key', {
     method: 'POST',
@@ -932,6 +945,7 @@ export async function sshCloseInstance(
   for (const key of [credentialName, cloudInstanceId ? `ssh_${cloudInstanceId}` : '', `ssh_${instanceId}`]) {
     if (key) await deleteCredentialByInstance(key, userId);
   }
+  notifyInstancesChanged(); // 本地表已收尾，图标立即熄灭
   return { ok: true, rentalId };
 }
 

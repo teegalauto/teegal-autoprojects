@@ -35,65 +35,33 @@ export const ImageViewer: React.FC<ImageViewerProps> = ({ filePath, fileName }) 
   const [error, setError] = useState<string>('');
 
   useEffect(() => {
-    let blobUrl: string | null = null;
+    // 🔥 本地文件走 teegal-file:// 流式协议：字节不过 IPC、不做 base64 放大，
+    // 大图片由 Chromium 按需解码，无需大小门禁
+    if (filePath.startsWith('http')) {
+      setSrc(filePath);
+      setLoading(false);
+      return;
+    }
 
-    const loadImage = async () => {
-      setLoading(true);
-      setError('');
-      setSrc('');
+    const electron = (window as any).electron;
+    if (!electron?.userpcFile?.read) {
+      setError('无法读取本地文件');
+      setLoading(false);
+      return;
+    }
 
-      try {
-        // HTTP URL 直接使用
-        if (filePath.startsWith('http')) {
-          setSrc(filePath);
-          setLoading(false);
-          return;
-        }
-
-        // 本地文件：通过 IPC 以 base64 读取
-        const electron = (window as any).electron;
-        if (!electron?.userpcFile?.read) {
-          setError('无法读取本地文件');
-          setLoading(false);
-          return;
-        }
-
-        const result = await electron.userpcFile.read(filePath, 'base64');
-        if (!result?.success) {
-          setError(result?.error || '读取文件失败');
-          setLoading(false);
-          return;
-        }
-
-        const ext = filePath.split('.').pop()?.toLowerCase() || '';
-        const mime = MIME_MAP[ext] || 'image/jpeg';
-        // base64 → Blob → Blob URL
-        const base64 = result.data?.content;
-        if (!base64) {
-          setError('文件内容为空');
-          setLoading(false);
-          return;
-        }
-        const byteChars = atob(base64);
-        const byteArray = new Uint8Array(byteChars.length);
-        for (let i = 0; i < byteChars.length; i++) {
-          byteArray[i] = byteChars.charCodeAt(i);
-        }
-        const blob = new Blob([byteArray], { type: mime });
-        blobUrl = URL.createObjectURL(blob);
-        setSrc(blobUrl);
-        setLoading(false);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : '加载图片失败');
-        setLoading(false);
+    // 先探存再给 src：返回结构为 { success, data: { exists } }，img 元素自身处理解码错误
+    electron.userpcFile.exists(filePath).then((r: any) => {
+      if (!r?.data?.exists) {
+        setError(`文件不存在: ${filePath}`);
+      } else {
+        setSrc(`teegal-file://local/${encodeURIComponent(filePath)}`);
       }
-    };
-
-    loadImage();
-
-    return () => {
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-    };
+      setLoading(false);
+    }).catch(() => {
+      setError('加载图片失败');
+      setLoading(false);
+    });
   }, [filePath]);
 
   if (loading) {

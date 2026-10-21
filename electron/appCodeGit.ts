@@ -24,6 +24,7 @@ function loadProjectIgnores(dir: string): ReturnType<typeof ignore> {
   ig.add([
     'node_modules/', '.git/', '.teegal/', '.bbone-tagalong/', 'history/',
     'dist*/', 'build*/', 'out/', 'release/', 'logs/', 'tmp/', 'temp/', 'data/',
+    'media/', // manim 等渲染管线的标准产物目录（media/videos/、media/texts/...）
     '__pycache__/', '.venv/', 'venv/', '.next/', '.nuxt/', '.cache/',
     '.pytest_cache/', '.mypy_cache/', 'wandb/', 'runs/', 'checkpoints/',
     '*.log', '*.tsbuildinfo', '*.pak', '*.asar', '*.exe', '*.dll',
@@ -47,7 +48,7 @@ function gitDir(dir: string): string {
 const IGNORED_DIRS = new Set([
   'node_modules', 'dist', 'build', 'out', 'release', '__pycache__', '.pytest_cache',
   'venv', '.venv', 'env', '.git', 'history', '.teegal', '.bbone-tagalong',
-  'tmp', 'temp', 'data', 'logs',
+  'tmp', 'temp', 'data', 'logs', 'media',
 ]);
 
 /** 文件名黑名单（敏感/运行时噪音，无论扩展名） */

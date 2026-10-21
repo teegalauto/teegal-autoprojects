@@ -231,8 +231,9 @@ export class EnvironmentBuilder {
       }
       // 🔥 内容根提示（穿透子目录名）：LLM 直接写对 read/push 相对路径前缀，免跑一轮文件树确认
       // （git clone 套层项目的内容根是 apps/{id}/xxx/，相对路径须带 xxx/ 前缀）
+      const convObjects = importantObjectTracker.getConversationObjects(options.conversationId);
       let rootHints: Map<string, string> | undefined;
-      const hintTargets = importantObjectTracker.getConversationObjects(options.conversationId)
+      const hintTargets = convObjects
         .filter((o: any) => o.type === 'app')
         .slice(0, 3);
       if (hintTargets.length > 0) {
@@ -244,8 +245,12 @@ export class EnvironmentBuilder {
         const valid = entries.filter(Boolean) as [string, string][];
         if (valid.length > 0) rootHints = new Map(valid);
       }
-      const importantObjectsText = importantObjectTracker.getFormattedObjects(options.conversationId, activeInstances, rootHints);
+      const importantObjectsText = await importantObjectTracker.getFormattedObjects(options.conversationId, activeInstances, rootHints);
       if (importantObjectsText) {
+        // 🔥 逐轮可观测：注入了哪些对象、体积多少（排查"执行轮不知道本地目录"类问题）
+        console.log(`[ENV-BUILDER] 重要对象注入 role=${loopInfo.role} round=${loopInfo.currentRound}: ` +
+          `${convObjects.map((o: any) => `${o.type}:${String(o.id || o.name || '').slice(0, 12)}`).join(', ') || '(空)'} ` +
+          `| ${importantObjectsText.length} 字符`);
         dynamicSections.push(importantObjectsText);
       }
     }
@@ -387,8 +392,10 @@ ${knowledgeText}`;
     }
 
     const isWin = (window as any).electron?.platform === 'win32';
+    // 🔥 标签明确写"成品"职责：与 ImportantObjectTracker 的「本地目录:」（项目工作文件）分工，
+    //    避免泛化的"文件保存路径"诱导 LLM 把工作文件也塞进 output
     const pathHint = outputPath
-      ? `- 文件保存路径: ${outputPath}${isWin ? '\\' : '/'}filename.png`
+      ? `- 成品输出目录（交付用户的最终文件，如视频/图片/文档）: ${outputPath}${isWin ? '\\' : '/'}filename.png`
       : (isWin
         ? `- 注意: 保存文件请用Windows路径如 C:\\output\\file.png`
         : `- 注意: 保存文件请用绝对路径如 /tmp/output/file.png`);

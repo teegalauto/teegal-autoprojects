@@ -852,15 +852,12 @@ export async function executeReadProjectFileTool(
   const params = step.toolParams || step.parameters || {};
   
   // 🔥 入口日志：记录原始参数
-  console.log(`[READ-FILE] 🔍 入口参数:`, JSON.stringify(params));
   
   // 🔥 提取 appId（支持多种参数名）
   const appId = extractAppId(params, step.appId);
-  console.log(`[READ-FILE] 🔍 提取 appId: ${appId}`);
   
   // 提取 filePath（let：路径定位兜底命中后会被改写为真实相对路径）
   let filePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
-  console.log(`[READ-FILE] 🔍 提取 filePath: ${filePath}`);
 
   // 🔥 提取可选的搜索参数：字符串=单个（正则语义，可写 a|b|c）；数组=多关键词（逐个转义后拼 OR 正则）
   const patternRaw = params?.pattern || params?.search || params?.query;

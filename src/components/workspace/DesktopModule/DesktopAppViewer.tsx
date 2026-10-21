@@ -167,6 +167,13 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
     refreshResidentIndicator();
   }, [refreshResidentIndicator]);
 
+  // 🔥 事件驱动：开机登记/就绪回写/关机节点广播（sshInstance.notifyInstancesChanged），
+  // 指示灯即时刷新——原仅挂载时查一次，开机后绿点要等切项目/刷新才亮
+  useEffect(() => {
+    window.addEventListener('ssh-instances-changed', refreshResidentIndicator);
+    return () => window.removeEventListener('ssh-instances-changed', refreshResidentIndicator);
+  }, [refreshResidentIndicator]);
+
   // 🔥 Kill 训练弹窗状态
   const [showKillDialog, setShowKillDialog] = useState(false);
   const [killReason, setKillReason] = useState('');
@@ -565,7 +572,13 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
       lastFileChangeTimeRef.current = now;
 
       // 🔥 主动从文件树读取当前文件的最新内容（AI 外部修改同步到编辑器）
+      // 🔥 视频/图片/音频/PDF 等非文本文件跳过：编辑器状态不吃二进制，
+      //    也避免把几百 MB 媒体整读进渲染进程
       if (selectedFilePath) {
+        const isNonText = isVideoFile(selectedFilePath) || isImageFile(selectedFilePath)
+          || isAudioFile(selectedFilePath) || isPdfFile(selectedFilePath)
+          || isUnsupportedPreviewFile(selectedFilePath);
+        if (isNonText) return;
         const latestContent = await getCurrentFileContent(appId, selectedFilePath);
         if (latestContent !== null) {
           handleCodeChange(latestContent);

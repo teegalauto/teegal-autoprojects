@@ -25,8 +25,8 @@ export interface SshSpecOption {
 // ===== 长租月租（与云端 RentalService 折扣口径一致：>6月 5/6，1-6月 11/12；月=720 时）=====
 export const PREPAID_MAX_MONTHS = 12;
 const PREPAID_MONTH_HOURS = 720;
-/** 低毛利机型不参与长租折扣（与云端 RentalService.PREPAID_NO_DISCOUNT_TYPES 同口径，预付一律原价） */
-const PREPAID_NO_DISCOUNT_TYPES = new Set(['SA5.LARGE16']);
+/** 低毛利机型不参与长租折扣（与云端 RentalService.PREPAID_NO_DISCOUNT_TYPES 同口径，预付一律原价）——当前无豁免机型（SA5.LARGE16 已下架） */
+const PREPAID_NO_DISCOUNT_TYPES = new Set<string>();
 
 export function prepaidUnitPrice(basePerHour: number, months: number, instanceType?: string): number {
   if (instanceType && PREPAID_NO_DISCOUNT_TYPES.has(instanceType)) return basePerHour;

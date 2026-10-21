@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { ArrowUp, X, StopCircle, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check } from "lucide-react";
+import { ArrowUp, X, StopCircle, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check, Cloud, Power } from "lucide-react";
+import { sshListActive, sshCloseInstance } from "@/utils/systemtools/sshInstance";
 import { FileAttachment } from "../types/ChatTypes";
 import FilePreviewList from "./FilePreviewList";
 import { logger } from "@/utils/logger";
@@ -19,6 +20,27 @@ import { ModelManager } from "@/utils/llm/ModelManager";
 import { syncModelKeyCredentials } from "@/components/workspace/auth/modelKeySync";
 import { SimpleUserModel, isMediaGenerationModel, ModelCategoryIcon, getMediaGenerationKind } from "@/components/profile/CustomModelDialog";
 import { CodeBlockPreview, extractCodeBlockMarkers, CodeBlockData } from "./CodeBlockPreview";
+
+// 🔥 添加到对话：完全相同的选区（同文件同行号范围）直接替换旧块——防手抖重复点击堆积。
+//    同文件不同选区并存是合法需求，不能按 filePath 去重（会误删用户选的多段代码）
+function appendCodeBlockMessage(input: string, message: string): string {
+  let result = input;
+  try {
+    const m = message.match(/\[\[CODE_BLOCK:([A-Za-z0-9+/=]+)\]\]/);
+    if (m) {
+      const incoming = JSON.parse(decodeURIComponent(atob(m[1])));
+      const { markers } = extractCodeBlockMarkers(input);
+      for (const mk of markers) {
+        if (mk.data.filePath === incoming.filePath &&
+            mk.data.startLine === incoming.startLine &&
+            mk.data.endLine === incoming.endLine) {
+          result = result.slice(0, mk.startIndex) + result.slice(mk.endIndex);
+        }
+      }
+    }
+  } catch { /* 标记解析失败按普通追加处理 */ }
+  return `${result} ${message} `;
+}
 import OfflineStatusBadge from "./OfflineStatusBadge";
 import { OfflineCommandDialog } from '@/components/workspace/auth/OfflineCommandDialog';
 
@@ -111,6 +133,33 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
   // 🔥 资源引用相关：Popover 开关 + 凭据列表
   const [isResourcePopoverOpen, setIsResourcePopoverOpen] = useState(false);
+
+  // 🔥 活跃实例计数：常驻/训练实例忘关机会持续计费，输入框常驻可见的计数是最直接的提醒位
+  const [activeInstances, setActiveInstances] = useState<any[]>([]);
+  const [isInstancePopoverOpen, setIsInstancePopoverOpen] = useState(false);
+  const [confirmCloseId, setConfirmCloseId] = useState<string | null>(null); // 关机二次确认（行内，不弹窗）
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      // 🔥 必须带 userId：本地资源表按 user_id 过滤（自绑机子只存在本地表，漏传 = 永远 0 条）
+      sshListActive(userId, { sync: false })
+        .then(r => {
+          // 🔍 排查「开机了但图标不亮」：打印查询结果与实例摘要（rentalId/状态）
+          console.log(`[INSTANCE-ICON] ok=${r.ok} count=${r.instances?.length ?? 0}${r.error ? ` err=${r.error}` : ''} | ${r.instances?.map((i: any) => `${i.cloud_rental_id || i.id}:${i.status}`).join(', ') || '(空)'}`);
+          if (!cancelled && r.ok) setActiveInstances(r.instances || []);
+        })
+        .catch(e => console.warn('[INSTANCE-ICON] 查询异常:', e));
+    };
+    refresh();
+    const interval = setInterval(refresh, 60000);
+    // 🔥 事件驱动：开机/就绪/关机节点广播（notifyInstancesChanged），计数图标即时刷新免等 60s 轮询
+    window.addEventListener('ssh-instances-changed', refresh);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener('ssh-instances-changed', refresh);
+    };
+  }, [userId]);
   const [showOfflineCommand, setShowOfflineCommand] = useState(false); // 离线指挥设置弹窗
   const [credentials, setCredentials] = useState<CredentialMeta[]>([]);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
@@ -549,7 +598,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
     const handleSendToChatInput = (event: CustomEvent) => {
       const message = event.detail;
       if (message) {
-        const newInput = input + ' ' + message + ' ';
+        const newInput = appendCodeBlockMessage(input, message);
         
         // 创建一个模拟的事件对象来更新输入
         const simulatedEvent = {
@@ -570,7 +619,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
         try {
           const { message } = JSON.parse(e.newValue);
           if (message) {
-            const newInput = input + ' ' + message + ' ';
+            const newInput = appendCodeBlockMessage(input, message);
             const simulatedEvent = {
               target: { value: newInput }
             } as React.ChangeEvent<HTMLTextAreaElement>;
@@ -777,6 +826,80 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
                 {selectedResources.length > 0 && (
                   <div className="border-t border-gray-100 px-3 py-1.5 text-[11px] text-gray-400">
                     已选 {selectedResources.length} 项，发送时将提示 AI 优先使用
+                  </div>
+                )}
+              </PopoverContent>
+            </Popover>
+
+            {/* 🔥 活跃实例提醒：常驻/训练实例忘关机持续计费——计数徽标常驻可见，点开看明细 */}
+            <Popover open={isInstancePopoverOpen} onOpenChange={setIsInstancePopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title={activeInstances.length > 0 ? `${activeInstances.length} 个活跃实例（注意关机以免持续计费）` : '无活跃实例'}
+                  className={`relative h-8 w-8 p-0 hover:bg-gray-100 ${activeInstances.length > 0 ? 'text-amber-600' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  <Cloud size={16} />
+                  {activeInstances.length > 0 && (
+                    <span className="absolute -top-0.5 -right-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[9px] font-bold leading-none text-white">
+                      {activeInstances.length}
+                    </span>
+                  )}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="start" className="w-72 p-0">
+                <div className="max-h-[280px] overflow-y-auto py-1">
+                  {activeInstances.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-gray-400">当前没有活跃实例</div>
+                  ) : (
+                    activeInstances.map(it => {
+                      const addr = it.host ? `${it.username || 'ubuntu'}@${it.host}` : (it.public_ip || '开机中');
+                      // 🔥 状态只在非稳态时显示（开机中/错误等）；running 常态不显示，减少噪音
+                      const statusText = it.status === 'pending' ? '开机中' : (it.status && it.status !== 'running' ? it.status : '');
+                      // 🔥 不显示机型（S5.MEDIUM4 之类会暴露云厂商），改显示时价；自绑机显示「自绑」
+                      const isSelf = it.source === 'workstation';
+                      const price = Number(it.price_per_hour) || 0;
+                      return (
+                        <div key={it.id} className="flex items-center gap-2 px-3 py-1.5 text-xs">
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${it.status === 'pending' ? 'bg-yellow-400 animate-pulse' : 'bg-green-500'}`} />
+                          <span className="truncate flex-1 text-gray-700 dark:text-gray-300">{addr}</span>
+                          <span className="shrink-0 text-[10px] text-gray-400">
+                            {isSelf ? '自绑' : (price > 0 ? `${price}积分/时` : '')}{statusText ? ` · ${statusText}` : ''}
+                          </span>
+                          {confirmCloseId === it.id ? (
+                            <button
+                              title="再次点击确认关机"
+                              className="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium text-white bg-red-500 hover:bg-red-600"
+                              onClick={async () => {
+                                setConfirmCloseId(null);
+                                try {
+                                  const r: any = await sshCloseInstance(it.id, userId);
+                                  if (!r?.ok) console.warn('[INSTANCE-ICON] 关机失败:', r?.error);
+                                } catch (e) {
+                                  console.warn('[INSTANCE-ICON] 关机异常:', e);
+                                }
+                              }}
+                            >
+                              确认
+                            </button>
+                          ) : (
+                            <button
+                              title="关机（临时盘数据不保留）"
+                              className="shrink-0 rounded p-0.5 text-gray-400 hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-950"
+                              onClick={() => setConfirmCloseId(it.id)}
+                            >
+                              <Power size={13} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                {activeInstances.length > 0 && (
+                  <div className="border-t border-gray-100 px-3 py-1.5 text-[11px] text-amber-600">
+                    实例运行中会持续计费，长时间不用请及时关机
                   </div>
                 )}
               </PopoverContent>

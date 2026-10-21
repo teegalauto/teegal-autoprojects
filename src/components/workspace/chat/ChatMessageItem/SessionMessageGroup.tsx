@@ -17,9 +17,10 @@ const getLastMessageSummary = (messages: MessageData[]): string => {
   // 同轮其余 callId 的消息 content 为空串——直接取最后一条会经常拿到空摘要
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    // 🔥 根据 apiRole 决定取 content 还是 result
-    // summarizer 优先取 result，reactor 优先取 content
-    const content = (m.apiRole === 'summarizer' ? m.result || m.content : m.content || m.result) || '';
+    // 🔥 summarizer 的正文在 result（总结文本）；reactor 只认 content——
+    //    空 content 的工具回包不回退到 result（那是工具原始输出 JSON，如 {success,type,...}），
+    //    跳过后向后扫描自然落在上一条有 content 的消息上，即"沿用上一个有 content 的"
+    const content = (m.apiRole === 'summarizer' ? m.result || m.content : m.content) || '';
     const trimmed = content.trim();
     if (trimmed) {
       return trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : '');

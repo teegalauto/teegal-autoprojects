@@ -126,6 +126,8 @@ router.get('/resources', async (req: Request, res: Response) => {
       // 🔥 只有云端明确返回成功且是数组才做对账；空列表也允许（用户确实全关干净了）
       if (cloudActive?.success === true && Array.isArray(cloudActive.instances)) {
         const ownRecords = sshResourceDAO.listByUser(userId, false);
+        // 🔍 排查「开机了但图标不亮」：对账视角（云端几台 vs 本地几条）
+        console.log(`[RENTAL-SYNC] 对账: 云端活跃 ${cloudActive.instances.length} 台 [${cloudActive.instances.map((i: any) => `${i.id}:${i.status}`).join(', ') || '无'}] | 本地记录 ${ownRecords.length} 条`);
         if (cloudActive.instances.length === 0 &&
             ownRecords.some(r => r.source === 'cloud' && (r.status === 'running' || r.status === 'booting'))) {
           console.warn('[RENTAL-SYNC] 云端活跃列表为空但本地仍有 running/booting 记录——若用户并未手动全部关机，请检查云端认证视角');

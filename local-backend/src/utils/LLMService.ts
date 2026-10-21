@@ -70,6 +70,7 @@ export interface LLMResponse {
   success: boolean;
   content?: string;
   reasoningContent?: string;  // 🔥 支持 DeepSeek Reasoner 等模型的 reasoning_content
+  finishReason?: string;      // 🔥 stop/length：length=输出撞上 max_tokens 被截断（调用方据此自救）
   error?: string;
   usage?: {
     prompt_tokens: number;
@@ -305,7 +306,10 @@ export class LLMService {
 
       console.log(`📝 [LLM-SERVICE] Responses 响应: model=${config.model}, contentLength=${content.length}, in=${usage?.prompt_tokens}, out=${usage?.completion_tokens}`);
 
-      return { success: true, content, reasoningContent: reasoning || undefined, usage };
+      return {
+        success: true, content, reasoningContent: reasoning || undefined, usage,
+        finishReason: data.status === 'incomplete' ? 'length' : 'stop',
+      };
     } finally {
       clearTimeout(timeoutId);
     }
@@ -643,7 +647,7 @@ export class LLMService {
         }
       }
 
-      return { success: true, content: cleanedContent.trim(), reasoningContent: finalReasoningContent, usage: {
+      return { success: true, content: cleanedContent.trim(), reasoningContent: finalReasoningContent, finishReason, usage: {
         prompt_tokens: data.usage?.prompt_tokens || 0,
         completion_tokens: data.usage?.completion_tokens || 0,
         total_tokens: data.usage?.total_tokens || 0,

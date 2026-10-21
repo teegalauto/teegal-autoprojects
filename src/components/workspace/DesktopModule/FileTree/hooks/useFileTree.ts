@@ -29,7 +29,7 @@ interface FileTreeCache {
 }
 const fileTreeCache = new Map<string, FileTreeCache>();
 
-const CACHE_TTL = 30 * 1000; // 30秒内不重复加载
+const CACHE_TTL = 10 * 1000; // 10秒内不重复加载（无感刷新上线后重扫无视觉副作用，频率可提高）
 
 /**
  * 🔥 变更列表独立缓存：listAppCodeChanges 是全树逐文件 readFile+hash 的重操作
@@ -43,6 +43,23 @@ interface ChangesCache {
 }
 const changesCache = new Map<string, ChangesCache>();
 const CHANGES_TTL = 10 * 1000; // 10秒内复用变更列表
+
+/**
+ * 🔥 按绝对路径把旧树中已加载的 children 继承到新扫描结果上。
+ * read-directory 是单层扫描：root 重扫若直接整树替换，展开目录的 children 会被清空，
+ * 视觉上就是"整树收起再重新展开"（有感刷新）。继承旧 children 后，
+ * 随后的 loadSubDirectory 仍会刷新这些目录的内容。
+ */
+function mergePrevChildren(fresh: FileNode[], prev: FileNode[] | undefined): FileNode[] {
+  // 🔥 prev 可为 undefined（未加载过的目录 node.children 就是 undefined）或空数组，无旧可继承
+  if (!prev || prev.length === 0) return fresh;
+  const prevMap = new Map(prev.map(n => [n.path, n]));
+  return fresh.map(n => {
+    if (n.type !== 'directory') return n;
+    const old = prevMap.get(n.path);
+    return old?.children ? { ...n, children: old.children } : n;
+  });
+}
 
 export function useFileTree(appId: string) {
   const [state, setState] = useState<FileTreeState>(() => {
@@ -92,12 +109,12 @@ export function useFileTree(appId: string) {
   /**
    * 加载文件树
    */
-  const loadFileTree = useCallback(async (silent = false, forceChanges = false) => {
+  const loadFileTree = useCallback(async (silent = false, forceChanges = false, freshScan = false) => {
     if (!appId) return;
 
-    // 🔥 检查缓存是否未过期，未过期则跳过
+    // 🔥 检查缓存是否未过期，未过期则跳过（freshScan=强制重扫，绕过 TTL 但保留旧缓存作 diff 基准）
     const cached = fileTreeCache.get(appId);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL && !forceChanges) {
+    if (!freshScan && cached && Date.now() - cached.timestamp < CACHE_TTL && !forceChanges) {
       console.log('[FileTree] 使用缓存，跳过加载:', appId);
       setState({
         files: cached.files,
@@ -124,18 +141,31 @@ export function useFileTree(appId: string) {
       const allFiles = await scanDirectory(filesDir);
       const files = allFiles.filter(f => f.name !== 'history'); // 🔥 兼容：隐藏旧版 history 目录残留
 
+      // 🔥 继承旧树的已展开 children，避免整树替换造成"收起再展开"的有感刷新
+      const prevCache = fileTreeCache.get(appId);
+      const mergedFiles = prevCache ? mergePrevChildren(files, prevCache.files) : files;
+
       // 🔥 加载相对 HEAD 的变更文件列表（git status）；短 TTL 内复用，forceChanges 强刷
       const changes = await loadChanges(forceChanges);
 
-      const sortedFiles = sortFileNodes(filterFileNodes(files));
+      const sortedFiles = sortFileNodes(filterFileNodes(mergedFiles));
       const sortedChanges = changes;
 
-      setState({
-        files: sortedFiles,
-        changes: sortedChanges,
-        loading: false,
-        error: '',
-      });
+      // 🔥 静默 diff：树结构与变更列表均无变化时完全不 setState（零重渲染）；
+      // 有变化才更新——节点按 path 复用 DOM，只有新增/删除的条目有视觉变化
+      const filesJson = JSON.stringify(sortedFiles);
+      const changesJson = JSON.stringify(sortedChanges);
+      const unchanged = !!prevCache
+        && JSON.stringify(prevCache.files) === filesJson
+        && JSON.stringify(prevCache.changes) === changesJson;
+      if (!unchanged) {
+        setState({
+          files: sortedFiles,
+          changes: sortedChanges,
+          loading: false,
+          error: '',
+        });
+      }
 
       // 🔥 写入缓存
       fileTreeCache.set(appId, {
@@ -144,7 +174,11 @@ export function useFileTree(appId: string) {
         timestamp: Date.now(),
       });
 
-      console.log('[FileTree] 加载完成:', { filesCount: sortedFiles.length, changesCount: sortedChanges.length });
+      console.log('[FileTree] 加载完成:', {
+        filesCount: sortedFiles.length,
+        changesCount: sortedChanges.length,
+        silent: !!unchanged,
+      });
 
     } catch (error: any) {
       console.error('[FileTree] 加载失败:', error);
@@ -264,6 +298,9 @@ export function useFileTree(appId: string) {
         newSet.add(absPath);
         return newSet;
       });
+      // 🔥 一致性兜底：子树中"标记展开但内容为空"的目录递归补载，
+      // 让 expandedDirs 状态与树数据保持一致（历史假态/意外清空的自愈）
+      await ensureExpandedChildrenLoaded(children);
     }
   }, [expandedDirs]);
 
@@ -291,11 +328,18 @@ export function useFileTree(appId: string) {
       })));
 
       // 找到对应的节点并添加 children
+      let mergedChildren = children;
       setState(prev => {
         const updateNodeChildren = (nodes: FileNode[]): FileNode[] => {
           return nodes.map(node => {
             if (node.path === dirPath) {
-              return { ...node, children };
+              // 🔥 继承旧树中已加载的深层 children：read-directory 是单层扫描，fresh 的
+              // 嵌套目录 children 是空 []；直接替换会清掉深层已加载内容，而 expandedDirs
+              // 仍标记展开 → 出现"图标展开但内容为空"的假态（收起上级再展开必现）
+              mergedChildren = mergePrevChildren(children, node.children);
+              return JSON.stringify(node.children) === JSON.stringify(mergedChildren)
+                ? node
+                : { ...node, children: mergedChildren };
             }
             if (node.children) {
               return {
@@ -313,10 +357,27 @@ export function useFileTree(appId: string) {
         };
       });
 
-      return children;
+      return mergedChildren;
     } catch (error) {
       console.error('[FileTree] 加载子目录失败:', dirPath, error);
       return null;
+    }
+  };
+
+  /**
+   * 🔥 递归补载"标记展开但内容为空"的目录，恢复 expandedDirs 与树数据的一致性。
+   * 正常路径靠 loadSubDirectory 的深层 children 继承即可恢复；本兜底覆盖
+   * 数据意外丢失的场景（继承源本身为空等）。
+   */
+  const ensureExpandedChildrenLoaded = async (nodes: FileNode[]): Promise<void> => {
+    for (const n of nodes) {
+      if (n.type !== 'directory') continue;
+      if (expandedDirsRef.current.has(n.path) && (!n.children || n.children.length === 0)) {
+        const sub = await loadSubDirectory(n.path);
+        if (sub) await ensureExpandedChildrenLoaded(sub);
+      } else if (n.children?.length) {
+        await ensureExpandedChildrenLoaded(n.children);
+      }
     }
   };
 
@@ -335,14 +396,12 @@ export function useFileTree(appId: string) {
    * 🔥 使用 ref 读取 expandedDirs，避免函数依赖 expandedDirs 导致重建
    */
   const refresh = useCallback(async (opts?: { forceChanges?: boolean }) => {
-    // 🔥 强制刷新前清除缓存
-    fileTreeCache.delete(appId);
+    // 🔥 强制重扫（freshScan 绕过 TTL），但绝不能删缓存：prevCache 是 children 继承与
+    //    静默 diff 的基准，删了它 diff 永远 miss → 每次刷新整树重挂（有感刷新）
+    await loadFileTree(true, opts?.forceChanges ?? false, true);
 
     // 🔥 保存当前展开的目录（从 ref 读取）
     const currentExpandedDirs = new Set(expandedDirsRef.current);
-
-    // 🔥 静默刷新：不设 loading: true，避免 ChangeList 被卸载丢失 diffStats
-    await loadFileTree(true, opts?.forceChanges ?? false);
 
     // 🔥 重新加载已展开目录的子目录；读取失败的目录（被删/瞬时不可用）从展开态移除，
     // 避免"展开图标但无内容"的残留假亮
@@ -455,12 +514,13 @@ export function useFileTree(appId: string) {
 
   // 🔥 窗口聚焦时静默刷新：用户在系统文件管理器新建/删除文件后切回应用即可看到，
   // 不需要重新导入/重进项目（refresh 自带清缓存 + 保展开态）
-  // 🔥 节流：拖动文件/切窗口会连续触发 focus，每次全量刷新连环重算直接卡死，5s 内只刷一次
+  // 🔥 60s 新鲜度阈值：alt-tab 切窗口（几分钟内）不重扫，离开较久才刷新——
+  //    每次聚焦全量重扫所有展开目录既卡又造成目录"不稳定"的观感；应用内改动走事件刷新不受影响
   const lastFocusRefreshRef = useRef(0);
   useEffect(() => {
     const onFocus = () => {
       const now = Date.now();
-      if (now - lastFocusRefreshRef.current < 5000) return;
+      if (now - lastFocusRefreshRef.current < 60000) return;
       lastFocusRefreshRef.current = now;
       refreshRef.current();
     };

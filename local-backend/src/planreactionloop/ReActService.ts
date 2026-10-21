@@ -138,10 +138,12 @@ export class ReActService {
       const noteSegs = (writeNotes || '').split('\n---\n').filter(s => s.trim());
       const noteMax = noteSegs.length ? Math.max(...noteSegs.map(s => s.length)) : 0;
       const archivedCount = (toolResults || []).filter(t => t.archived).length;
-      console.log(`[REACT-SERVICE] Round ${roundNumber} prompt: ${promptKB.toFixed(1)}KB (~${Math.round(totalChars / 3)} tokens) | 历史${(p.history / 1024).toFixed(1)}KB 归档${archivedCount}条 笔记${((writeNotes || '').length / 1024).toFixed(1)}KB/${noteSegs.length}条(max${noteMax}) 固定${(p.staticEnv / 1024).toFixed(1)}KB 动态${(p.dynamicEnv / 1024).toFixed(1)}KB`);
+      // 🔥 两个归档口径分开显示：自动归档=批次边界折叠（ReActProtocols 计算），
+      // 主动归档=LLM 传 archive:true 的条目——此前混用"归档N条"造成"没在归档"的误判
+      console.log(`[REACT-SERVICE] Round ${roundNumber} prompt: ${promptKB.toFixed(1)}KB (~${Math.round(totalChars / 3)} tokens) | 历史${(p.history / 1024).toFixed(1)}KB 自动归档${p.autoArchived ?? 0}条 主动归档${archivedCount}条 笔记${((writeNotes || '').length / 1024).toFixed(1)}KB/${noteSegs.length}条(max${noteMax}) 固定${(p.staticEnv / 1024).toFixed(1)}KB 动态${(p.dynamicEnv / 1024).toFixed(1)}KB`);
 
       // 调用 LLM
-      const llmResponse = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber);
+      let llmResponse = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber);
 
       if (!llmResponse.success) {
         return {
@@ -154,8 +156,26 @@ export class ReActService {
       }
 
       // 解析 letMeDo、writeNotes、completeReport 和 Tools
-      const content = llmResponse.data || '';
-      const { letMeDo, writeNotes: parsedWriteNotes, completeReport, tools, archive } = this.parseReActResponse(content);
+      const parsed = this.parseReActResponse(llmResponse.data || '');
+
+      // 🔥 输出触顶救援：finish_reason=length 且 JSON 解析失败 = 内容型大输出（如整文件重写的
+      //    save_project_file content）撞上 max_tokens 硬闸被拦腰截断，整轮白烧。去掉上限重试一次。
+      //    硬闸默认保留（防镜像失控）；思维链失控场景（content 为空）由 LLMService 自带兜底先行处理
+      let effective = { llmResponse, parsed };
+      if (parsed.parseError && llmResponse.finishReason === 'length') {
+        console.warn(`[REACT-SERVICE] Round ${roundNumber} 输出触顶截断（max_tokens=6000 且 JSON 解析失败），去掉上限重试一次`);
+        const retry = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber, true);
+        if (retry.success) {
+          const retryParsed = this.parseReActResponse(retry.data || '');
+          if (!retryParsed.parseError) {
+            effective = { llmResponse: retry, parsed: retryParsed };
+          } else {
+            console.warn(`[REACT-SERVICE] Round ${roundNumber} 放宽重试后仍解析失败，沿用首轮结果`);
+          }
+        }
+      }
+
+      const { letMeDo, writeNotes: parsedWriteNotes, completeReport, tools, archive } = effective.parsed;
 
       // 🔥 如果有 completeReport，在末尾添加提示：report 内容对用户不可见
       const finalCompleteReport = completeReport
@@ -195,8 +215,9 @@ export class ReActService {
     userPrompt: string,
     userId?: string,
     sessionId?: string,
-    roundNumber?: number
-  ): Promise<{ success: boolean; data?: string; error?: string }> {
+    roundNumber?: number,
+    noOutputCap?: boolean
+  ): Promise<{ success: boolean; data?: string; finishReason?: string; error?: string }> {
     try {
       // 获取用户的 LLM 配置
       const resolvedModel = unifiedModelRegistry.getModelForSubCategory(
@@ -218,10 +239,11 @@ export class ReActService {
           // 🔥 reactor 是工具调用循环，不需要深度思考——低思考档省输出 token
           //（实测 deepseek 系不控时单轮 reasoning 可达 1.8 万字符）。summarizer 不传，保留默认思考强度
           reasoningEffort: 'low',
-          // 🔥 输出硬闸：reactor 正常输出（writeNotes+letMeDo+tools）< 2000 token，思考参数失效时
-          //   防止模型把 prompt 长度镜像成长输出（实测 glm-5.3-flash 思考 26100 字符/轮 197s）。
-          //   思考耗尽预算时 LLMService 自带兜底：去除 max_tokens 并追加收敛提示重试一次
-          max_tokens: 6000,
+          // 🔥 输出硬闸（默认 6000）：reactor 正常输出（writeNotes+letMeDo+tools）< 2000 token，
+          //   思考参数失效时防止模型把 prompt 长度镜像成长输出（实测 glm-5.3-flash 思考 26100 字符/轮 197s）。
+          //   两类兜底：思维链耗尽预算（content 为空）→ LLMService 去限重试；
+          //   内容型大输出触顶截断（JSON 解析失败）→ executeRound 去限重试一次（noOutputCap）
+          ...(noOutputCap ? {} : { max_tokens: 6000 }),
         },
         resolvedModel.callConfig,
         600000  // 🔥 10分钟超时，前沿模型如 K2.6 响应较慢
@@ -232,7 +254,10 @@ export class ReActService {
       }
 
       if (response.usage) {
-        // 🔥 缓存命中率日志
+        // 🔥 缓存命中率。字段来源：GLM=usage.prompt_tokens_details.cached_tokens（嵌套），
+        // DeepSeek=prompt_cache_hit_tokens（顶层）——LLMService 归一化层已统一映射为后者。
+        // 归档边界轮（每 clearWindow 轮一次）前 5 条折叠重构，0% 属设计内断点，
+        // 判断缓存健康要看边界之间的轮次（纯追加轮应命中 50%+）
         const cacheHit = response.usage.prompt_cache_hit_tokens || 0;
         const promptTotal = response.usage.prompt_tokens || 0;
         const cacheRate = promptTotal > 0 ? ((cacheHit / promptTotal) * 100).toFixed(1) : '0.0';
@@ -250,7 +275,7 @@ export class ReActService {
 
       // 提取 content
       const content = response.content || '';
-      return { success: true, data: content };
+      return { success: true, data: content, finishReason: response.finishReason };
     } catch (error) {
       return {
         success: false,

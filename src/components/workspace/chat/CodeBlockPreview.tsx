@@ -55,9 +55,10 @@ export function extractCodeBlockMarkers(text: string): {
     }
   }
   
-  // 🔥 从显示文本中移除标记
+  // 🔥 从显示文本中移除标记：必须用副本降序排序（从后往前删避免索引位移）——
+  //    原地 sort 会翻转 markers 顺序，导致输入框重建标记时块顺序每键翻转一次（UI 上下互换）
   let displayText = text;
-  markers.sort((a, b) => b.startIndex - a.startIndex).forEach(marker => {
+  markers.slice().sort((a, b) => b.startIndex - a.startIndex).forEach(marker => {
     displayText = displayText.slice(0, marker.startIndex) + displayText.slice(marker.endIndex);
   });
   
