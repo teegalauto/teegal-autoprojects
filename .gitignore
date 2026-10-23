@@ -25,3 +25,8 @@ tmp/
 Thumbs.db
 .idea/
 .vscode/
+
+# Python 缓存与测试产物
+__pycache__/
+*.pyc
+src/utils/systemtools/computeruse/tests/_out/
