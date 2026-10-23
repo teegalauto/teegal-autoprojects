@@ -305,6 +305,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
+      // 🔥 启用 webview 标签：项目服务页面（如 http://localhost:5173）可渲染进 DesktopModule，
+      //    其 console 经 console-message 事件入运行日志池（[trace] 埋点采集）
+      webviewTag: true,
       // 启用 Web Workers 和 SharedArrayBuffer 支持
       webSecurity: true
     },
@@ -532,12 +535,14 @@ function setupIPC() {
   });
 
   // 🔥 项目查看器独立窗口（浏览器式多 tab）：单窗口复用，新项目发给已有窗口加 tab
-  ipcMain.handle('open-app-viewer-window', (_, { appId, name }) => {
-    if (!appId) return { success: false, error: 'missing appId' };
+  // 🔥 url 型：本地服务预览（run_project_onlocal 拉起的服务地址收进应用内 webview，
+  //    不跳系统浏览器——跳出去 console-message 埋点断流，日志池少一路数据源）
+  ipcMain.handle('open-app-viewer-window', (_, { appId, url, name }) => {
+    if (!appId && !url) return { success: false, error: 'missing appId or url' };
 
     // 已有 viewer 窗口：通知其新增 tab（页面自行去重）并置前
     if (appViewerWindow && !appViewerWindow.isDestroyed()) {
-      appViewerWindow.webContents.send('app-viewer:add-tab', { appId, name });
+      appViewerWindow.webContents.send('app-viewer:add-tab', { appId, url, name });
       // 🔥 Windows 下 focus() 常不提升 Z 序（多屏场景窗口被压在其他窗口下面，最小化时更是无效）：
       // 先恢复最小化，再 show + focus + moveTop，确保窗口真正跑到前台
       if (appViewerWindow.isMinimized()) appViewerWindow.restore();
@@ -588,7 +593,10 @@ function setupIPC() {
         preload: path.join(__dirname, 'preload.cjs'),
         nodeIntegration: false,
         contextIsolation: true,
-        webSecurity: true
+        webSecurity: true,
+        // 🔥 必须显式启用：ServicePreview（url 型 tab）用 <webview> 渲染本地服务页，
+        //    不开的话 webview 是惰性自定义元素，整个 tab 空白（与主窗口 L310 同款配置）
+        webviewTag: true
       },
       // 🔥 窗口标题固定（项目名在 tab 和 viewer 内显示，可改名不受影响）
       title: 'WorkBees',
@@ -597,7 +605,9 @@ function setupIPC() {
     });
 
     // 🔥 与主窗口相同的加载策略（dev: vite server / prod: index.html + hash 路由）
-    const route = `#/app-viewer?appId=${encodeURIComponent(appId)}${name ? `&name=${encodeURIComponent(name)}` : ''}`;
+    const route = appId
+      ? `#/app-viewer?appId=${encodeURIComponent(appId)}${name ? `&name=${encodeURIComponent(name)}` : ''}`
+      : `#/app-viewer?url=${encodeURIComponent(url!)}${name ? `&name=${encodeURIComponent(name)}` : ''}`;
     if (process.env.NODE_ENV === 'development') {
       viewerWin.loadURL(`http://localhost:8080/${route}`);
     } else {
@@ -651,6 +661,7 @@ app.whenReady().then(async () => {
   initLogFile();
   log('🚀 Teegal 应用启动');
   log(`📁 用户数据目录: ${app.getPath('userData')}`);
+  sweepAppOrphans(); // 🔥 启动即清扫上一世代孤儿服务（fire-and-forget，不阻塞窗口创建）
 
   // 🔥 流式本地文件协议处理器：URL 形如 teegal-file://local/<encodeURIComponent(绝对路径)>
   // 🔥 手工实现 Range/206：net.fetch(file://) 的 Range 行为不可控——媒体栈拿不到标准 206
@@ -997,6 +1008,20 @@ ipcMain.handle('system:execute-command', async (event, { command, timeout = 120,
       stderr += data.toString();
     });
     
+    // 🔥 完成判定以 exit 为主（powershell 退出 = 脚本完成）：命令内 Start-Process 起的
+    // 常驻孙进程持有 stdio 管道写端时 close 永不触发 → Promise 永远 pending。
+    // exit 后宽限 300ms 收管道残留输出再 finish；close 保留为自然 EOF 兜底（finish 幂等）。
+    proc.on('exit', (code) => {
+      setTimeout(() => {
+        finish({
+          success: code === 0,
+          output: stdout.trim(),
+          error: stderr.trim(),
+          exitCode: code,
+        });
+      }, 300);
+    });
+
     proc.on('close', (code) => {
       console.log('⚡ [MAIN] 命令执行完成，退出码:', code);
       finish({
@@ -1068,11 +1093,16 @@ function safeSenderSend(sender: any, channel: string, data: any) {
 }
 
 /**
- * 把引号字符串外的 && 转成 ;（PowerShell 5 兼容）：
- * PS5 不支持 && 连接符，LLM 受 bash 先验影响高频写出。引号感知，字符串字面量（如 "a && b"）不动
+ * 把引号字符串外的 && 和裸 & 转成 ;（PowerShell 5 兼容）：
+ * - && 连接符：LLM 受 bash 先验影响高频写出
+ * - 裸 & 顺序符（两侧空格）：LLM 受 cmd.exe 先验影响写出（tasklist ... & tasklist ...）
+ *   语义与 ; 一致（顺序执行不管成败）。2>&1 的 & 紧贴字符不匹配 → 重定向语法不受影响（PS 原生支持）
+ * 引号感知，字符串字面量（如 "a && b"）不动
  */
 function convertAndSequence(cmd: string): string {
-  if (!cmd.includes('&&')) return cmd;
+  if (!cmd.includes('&&') && !/\s&\s/.test(cmd)) return cmd;
+  // 🔥 引号感知遍历：&& 分段（短路语义保留），裸 & 顺序符原地转 ;（顺序语义本就等价）
+  const segments: string[] = [];
   let out = '';
   let quote: string | null = null;
   for (let i = 0; i < cmd.length; i++) {
@@ -1088,21 +1118,214 @@ function convertAndSequence(cmd: string): string {
       continue;
     }
     if (ch === '&' && cmd[i + 1] === '&') {
-      out += ';';
+      segments.push(out);
+      out = '';
       i++;
+      continue;
+    }
+    // 裸 & 顺序符：前空格后空格才认定是分隔符（2>&1、tasklist /FI"x"&y 等紧贴形态不动）
+    if (ch === '&' && out.endsWith(' ') && cmd[i + 1] === ' ') {
+      out += ';';
       continue;
     }
     out += ch;
   }
-  return out;
+  segments.push(out);
+  if (segments.length === 1) return segments[0];
+  // 🔥 PS5 无 &&：转 if ($?) 短路链——A && B && C → A; if ($?) { B }; if ($?) { C }
+  // $? = 最近一次操作成败（native exe 看 exit code）：A 失败 → B 不执行且 $? 保持 false → C 也不执行。
+  // 之前无条件转 ; 会破坏短路：如 "npm run build && echo BUILD_OK" 在 build 失败时 BUILD_OK 照打，
+  // 给 LLM "构建成功"的假信号（真实案例：tsc 报错 + BUILD_OK 并存，LLM 被矛盾输出带偏）
+  const [first, ...rest] = segments;
+  return first + rest.map(s => `; if ($?) { ${s.trim()} }`).join('');
 }
 
-ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, workingDir, executionId, env: extraEnv, appId }) => {
+// 🔥 常驻服务命令识别：前台起 dev server 永不返回，只能空等到 idle/总超时被强杀（白白烧掉一整轮），
+//    或被 LLM 用 Start-Process 脱管后强杀不到、留下脏进程占端口干扰后续轮次（真实案例：vite 两次
+//    "启动"实为第一次残留，日志文件 PermissionError 即占用铁证）。工具层直接拒绝并指路
+//    run_project_onlocal（服务进程管理 + 日志池 + 探活，既定专用通道），LLM 决策空间归零。
+//    已自带后台姿势（Start-Process / Start-Job / start /b）的命令不拦；node 直接跑脚本不拦
+//    （脚本可能自行退出，误伤率高）。
+function detectResidentServiceCommand(cmd: string): string | null {
+  if (/start-[\s-]?process|start-[\s-]?job|start\s+\/b/i.test(cmd)) return null;
+  const patterns: Array<[RegExp, string]> = [
+    [/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|preview)\b/i, 'dev/start/serve/preview'],
+    [/\bvite\b(?!\s+(?:build|optimize))/i, 'vite dev server'],
+    [/\bnext\s+(?:dev|start)\b/i, 'next dev/start'],
+    [/python\s+-m\s+http\.server\b/i, 'http.server'],
+    [/\buvicorn\b/i, 'uvicorn'],
+    [/\bflask\s+run\b/i, 'flask run'],
+  ];
+  for (const [re, label] of patterns) {
+    if (re.test(cmd)) return label;
+  }
+  return null;
+}
+
+// 🔥 宿主自杀防护：taskkill /IM node.exe 按映像名杀进程，会把本系统自身的后台 node
+//    （local-backend、dev vite）一锅端（真实案例：LLM 想清项目残留进程，宿主 teegal
+//    整个被杀掉）。运行时宿主映像名（node/python/java/pwsh...）下永远混着宿主自己的
+//    进程，按名杀必误伤——只拦"按映像名杀"，按 PID / 端口 / 命令行过滤的精确杀不受限。
+//    回执直接给出可复制的精确杀模板，LLM 下一轮就能改对。
+function detectHosticideCommand(cmd: string): string | null {
+  const byImage = cmd.match(/taskkill[^;&|]*\/IM\s+"?([\w]+\.exe)"?/i)
+    || cmd.match(/stop-process\s+[^;&|]*-name\s+["']?([\w]+)/i)
+    || cmd.match(/get-process\s+["']?([\w]+)["']?[^;&|]*\|\s*(?:stop-process|kill)/i);
+  if (!byImage) return null;
+  const image = byImage[1].toLowerCase().replace(/\.exe$/, '');
+  if (/^(node|python3?|java|powershell|pwsh|cmd|deno|bun|dotnet)$/.test(image)) {
+    return byImage[1];
+  }
+  return null;
+}
+
+// 🔥 孤儿清扫器：electron 死亡会让上一世代的 run_project_onlocal 服务变孤儿——
+//    Windows 下 Node 的 stdout 是"管道即同步写"，管道读端随旧主进程消失后，
+//    64KB 缓冲写满后的第一条 console.log 永久阻塞 → 事件循环冻死，TCP 能握手但永不响应
+//    （真实事故：LLM 每轮工具打这具冻尸卡满 120s，新拉起 EADDRINUSE 当场暴毙）。
+//    启动时 + run_project_onlocal 拉起前各扫一次：命令行落在 teegal/apps 下的 node，
+//    沿父链上溯——链断（父进程不存在）= 孤儿，全树杀掉；链根是活进程（用户自己的
+//    终端 / 另一个 electron 实例）= foreign 不动，绝不误杀人工起的 dev 服务。
+const sweepAppOrphans = async (): Promise<void> => {
+  if (process.platform !== 'win32') return;
+  try {
+    const { execFile, spawn: sp } = require('child_process');
+    const selfExe = (process.execPath.split(/[\\/]/).pop() || 'electron').toLowerCase();
+    const script = [
+      "$fam = @('node.exe','cmd.exe','powershell.exe','pwsh.exe','npm.exe','sh.exe','bash.exe','" + selfExe + "')",
+      "function Test-Chain($start) {",
+      "  $cur = $start; $d = 0",
+      "  while ($d -lt 12) {",
+      "    $p = Get-CimInstance Win32_Process -Filter \"ProcessId=$cur\" -ErrorAction SilentlyContinue",
+      "    if (-not $p) { return 'dead' }",
+      "    $nm = $p.Name.ToLower()",
+      "    if ($nm -eq '" + selfExe + "') { return 'live' }",
+      "    if ($fam -notcontains $nm) { return 'foreign' }",
+      "    $cur = $p.ParentProcessId; $d++",
+      "  }",
+      "  return 'foreign'",
+      "}",
+      "$hits = @()",
+      "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | ForEach-Object {",
+      "  if ($_.CommandLine -and ($_.CommandLine -match 'teegal[\\\\/]apps[\\\\/]')) {",
+      "    if ((Test-Chain $_.ParentProcessId) -eq 'dead') { $hits += [string]$_.ProcessId }",
+      "  }",
+      "}",
+      "$hits -join ','",
+    ].join('\r\n');
+    const out = await new Promise<string>((resolve, reject) => {
+      execFile('powershell', ['-NoProfile', '-Command', script], { timeout: 20000, windowsHide: true } as any, (err: any, stdout: any) => err ? reject(err) : resolve(String(stdout || '')));
+    });
+    const pids = out.trim().split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n) && n > 0);
+    if (pids.length > 0) {
+      console.log('🧹 [ORPHAN-SWEEP] 发现上一世代孤儿服务进程，杀树:', pids);
+      for (const pid of pids) sp('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true } as any);
+    }
+  } catch (e) {
+    console.warn('⚠️ [ORPHAN-SWEEP] 清扫失败（放行，不阻塞启动）:', e);
+  }
+};
+
+// 🔥 托管服务自杀护栏：userpc_shell 手动 taskkill /PID 或 Stop-Process -Id 打向生成项目的
+//    服务进程（CommandLine 含 teegal\apps\）时拦截——run_project_onlocal 重拉会自动杀旧
+//    拉新，手动杀托管服务永远没必要（真实事故：LLM 验证脚本打错 URL 拿到 SPA 兜底 HTML，
+//    误诊"旧静态服务占用端口"，把自己刚拉起的好服务杀了准备重开，白烧数轮）
+const guardManagedServiceKill = async (command: string): Promise<number | null> => {
+  const m = command.match(/taskkill[^\r\n]*?\/PID\s+(\d+)/i) || command.match(/Stop-Process\s+[^\r\n]*?-Id\s+(\d+)/i);
+  if (!m) return null;
+  try {
+    const { execFile } = require('child_process');
+    const out = await new Promise<string>((resolve, reject) => {
+      execFile('powershell', ['-NoProfile', '-Command',
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${m[1]}" -ErrorAction SilentlyContinue).CommandLine`],
+        { timeout: 10000, windowsHide: true } as any, (err: any, so: any) => err ? reject(err) : resolve(String(so || '')));
+    });
+    const cl = out.trim();
+    if (cl && /teegal[\\/]apps[\\/]/i.test(cl)) return parseInt(m[1], 10);
+  } catch { /* 身份查询失败放行，不阻塞正常命令 */ }
+  return null;
+};
+
+ipcMain.on('system:execute-command-stream', async (event, { command, timeout = 120, workingDir, executionId, env: extraEnv, appId }) => {
   const isWindows = process.platform === 'win32';
 
   // 🔥 修复：处理包含换行符的命令
   // 注意：保留换行符，因为 PowerShell 需要多行命令（如 userpc_run_python）
   let sanitizedCommand = command || '';
+
+  // 🔥 宿主自杀防护：按映像名杀运行时宿主必误伤本系统自身，命中即拒并给精确杀模板
+  const hosticide = detectHosticideCommand(sanitizedCommand);
+  if (hosticide) {
+    console.warn(`🚫 [MAIN-STREAM] 检测到按映像名杀宿主进程（${hosticide}），拒绝执行`);
+    safeSenderSend(event.sender, 'system:command-output', {
+      executionId,
+      type: 'error',
+      error: `拒绝执行：taskkill /IM（按映像名杀 ${hosticide}）会连带杀掉本系统自身的后台服务（宿主自杀）。请按端口或命令行精确杀：\n1) netstat -ano | findstr :<端口>   拿最后一列 PID\n2) taskkill /PID <pid> /F /T      杀整棵进程树\n3) 或按命令行过滤：Get-CimInstance Win32_Process -Filter "Name='${hosticide}'" | Where-Object { $_.CommandLine -match '<项目目录名>' } | ForEach-Object { taskkill /PID $_.ProcessId /F /T }`,
+      timestamp: Date.now()
+    });
+    safeSenderSend(event.sender, 'system:command-output', {
+      executionId,
+      type: 'close',
+      exitCode: -1,
+      success: false,
+      cancelled: false,
+      outputTruncated: false,
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  // 🔥 常驻服务防呆：命中即拒（不 spawn、不杀旧进程），error + close 两连发与超时路径同构，
+  //    渲染端工具回执正常收束，LLM 下一轮改道 run_project_onlocal
+  // 🔥 死局修复：run_project_onlocal 内部就是 npm run dev（CpuExecutionService 自动探测
+  //    package.json scripts.dev），走同一通道会被本防呆再拦一次——指路指到自己头上，
+  //    工具卡"已取消"，服务永远起不来（真实案例）。appId 是托管通道的精确标识（全仓仅
+  //    run_project_onlocal 传）：进程已按 appId 登记（重跑杀旧/关窗释放/可 detach 脱管），
+  //    防呆要防的"脱管前台挂死"在托管通道不存在，放行。
+  const residentSvc = appId ? null : detectResidentServiceCommand(sanitizedCommand);
+  if (residentSvc) {
+    console.warn(`🚫 [MAIN-STREAM] 检测到前台常驻服务命令（${residentSvc}），拒绝执行并指路 run_project_onlocal`);
+    safeSenderSend(event.sender, 'system:command-output', {
+      executionId,
+      type: 'error',
+      error: `拒绝执行：检测到前台启动常驻服务命令（${residentSvc}）。该命令永不返回，只会空等到超时被强杀，还可能留下脱管进程占端口。请改用 run_project_onlocal(projectId='xxx') 启动服务（自动脱管、日志进运行日志池、可探活、可停止）；确需临时后台进程时用 Start-Process -WindowStyle Hidden。`,
+      timestamp: Date.now()
+    });
+    safeSenderSend(event.sender, 'system:command-output', {
+      executionId,
+      type: 'close',
+      exitCode: -1,
+      success: false,
+      cancelled: false,
+      outputTruncated: false,
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  // 🔥 托管服务自杀护栏：手动 taskkill/Stop-Process 打向托管的项目服务 → 拒绝并指路 run_project_onlocal
+  if (!appId) {
+    const victim = await guardManagedServiceKill(sanitizedCommand);
+    if (victim) {
+      console.warn(`🛡️ [MAIN-STREAM] 拦截手动击杀托管服务 PID=${victim}，指路 run_project_onlocal`);
+      safeSenderSend(event.sender, 'system:command-output', {
+        executionId,
+        type: 'error',
+        error: `拒绝执行：PID ${victim} 是 run_project_onlocal 托管的项目服务进程。重跑 run_project_onlocal(projectId='xxx') 会自动杀旧拉新，无需手动杀；若服务行为异常，先检查验证命令本身（如 API 路径前缀 /api 是否写对、SPA 兜底路由会为未知路径返回 HTML）。`,
+        timestamp: Date.now()
+      });
+      safeSenderSend(event.sender, 'system:command-output', {
+        executionId,
+        type: 'close',
+        exitCode: -1,
+        success: false,
+        cancelled: false,
+        outputTruncated: false,
+        timestamp: Date.now()
+      });
+      return;
+    }
+  }
 
   // 🔥 同一 appId 的服务类进程（dev server）重新启动前，先杀旧的进程树：
   // 避免端口一路顺延（8080→8081→...）和多进程叠加。
@@ -1158,13 +1381,13 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   
   let proc;
   if (isWindows) {
-    // 🔥 PowerShell 5 不支持 && 连接符（PS7 才有），LLM 受 bash 先验影响高频写出 → 整条脚本解析报错白烧一轮。
-    //    软提示（环境注入「shell 为 PS5」）拉不回训练先验，实测 LLM 几乎每条长命令都带 &&。
-    //    硬保障：写 ps1 前把引号外的 && 转成 ; —— 对 cd dir && python x 类连接，; 的语义差异
+    // 🔥 PowerShell 5 不支持 && / 裸 & 连接符（PS7 才有），LLM 受 bash/cmd 先验影响高频写出 → 整条脚本解析报错白烧一轮。
+    //    软提示（环境注入「shell 为 PS5」）拉不回训练先验。
+    //    硬保障：写 ps1 前把引号外的 && / 裸 & 转成 ; —— 对 cd dir && python x 类连接，; 的语义差异
     //    （前命令失败也继续）远小于整条命令直接报错的代价。字符串字面量不动（引号感知）
     const andFixed = convertAndSequence(sanitizedCommand);
     if (andFixed !== sanitizedCommand) {
-      console.log('🔧 [MAIN-STREAM] 检测到 PS5 不支持的 && 连接符，已转换为 ;');
+      console.log('🔧 [MAIN-STREAM] 检测到 PS5 不支持的 &&/& 连接符，已转换为 ;');
     }
     // 🔥 优化：检测下载命令，禁用进度条以提高稳定性
     let optimizedCommand = andFixed;
@@ -1172,6 +1395,19 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       // 禁用进度条，避免阻塞输出流
       optimizedCommand = `$ProgressPreference = 'SilentlyContinue'; ${andFixed}`;
       console.log('🔧 [MAIN-STREAM] 检测到下载命令，已禁用进度条');
+    }
+    // 🔥 防弹窗：Start-Process 起控制台程序（node/npm 等）默认弹新窗口——真实案例：用户桌面
+    //    凭空弹出两个 cmd 窗口，观感惊悚。自动注入 -WindowStyle Hidden：后台化意图不变，
+    //    窗口不可见。已显式指定窗口样式（-WindowStyle/-NoNewWindow）的不动；段内判断（;|&\n 边界）
+    {
+      const beforePopupFix = optimizedCommand;
+      optimizedCommand = optimizedCommand.replace(
+        /Start-Process(?![^\r\n;|&]*(?:-WindowStyle|-NoNewWindow))/gi,
+        'Start-Process -WindowStyle Hidden'
+      );
+      if (optimizedCommand !== beforePopupFix) {
+        console.log('🔧 [MAIN-STREAM] 检测到 Start-Process 未指定窗口样式，已注入 -WindowStyle Hidden');
+      }
     }
     // 🔥 修复：将单引号中的路径转换为使用 $env:USERPROFILE 变量，避免转义问题
     // 将 'C:\Users\xxx\.teegal\...' 转换为 "$env:USERPROFILE\.teegal\..."
@@ -1187,6 +1423,9 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       optimizedCommand = `$job = Start-Job { ${bgCommand} }; Write-Host "后台进程已启动 (Job ID: $($job.Id))"; Start-Sleep -Milliseconds 500; exit 0`;
       console.log('🔧 [MAIN-STREAM] 检测到后台启动命令，转换为 Start-Job');
     }
+    // 🔥 拉起前孤儿清扫：上一世代 electron 遗留的冻尸/EADDRINUSE 幽灵先清掉（仅托管通道，PS 查询约几百毫秒）
+    if (appId) await sweepAppOrphans();
+
     // 🔥 使用 -File 参数执行脚本文件，避免命令行长度限制
     const fs = require('fs');
     const path = require('path');
@@ -1229,6 +1468,8 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
     // 🔥 新执行开始：上一次的后台结果/缓冲已无意义（记录要么已更新要么已被放弃），清掉
     appPendingResults.delete(appId);
     appOutputBuffers.delete(appId);
+    // 🔥 运行日志池开新会话（旧会话未送完的埋点丢弃——全量在 executionlog 可查）
+    newTraceSession(appId);
   }
 
   // 🔥 诊断：记录进程启动信息
@@ -1249,9 +1490,14 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   const MAX_OUTPUT_BYTES = 1 * 1024 * 1024; // 1MB 上限（正常输出足够，异常 traceback 通常 50-200KB）
   let totalOutputBytes = 0;
   let outputTruncated = false;
+  // 🔥 错误回执增强：只留 stderr 尾部（特征词都在错误块附近），finishStream 时做特征检测
+  let stderrTail = '';
 
   // 🔥 统一输出处理：检查缓冲区，超限时丢弃后续数据（保持管道畅通），但进程继续运行
   const handleOutput = (type: 'stdout' | 'stderr', data: Buffer) => {
+    // 🔥 收尾后（powershell 已退出）仅 drain：listener 保留防管道满阻塞孙进程写，
+    // 但不再转发（close 已发）、不再触发"渲染进程已销毁→杀树"（会误杀后台服务）
+    if (streamFinished) return;
     totalOutputBytes += data.length;
 
     // 🔥 超过上限：只发一次截断提示，后续数据静默丢弃（仍需读取，否则管道满会卡死进程）
@@ -1273,12 +1519,16 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
 
     const output = data.toString();
     console.log(`📤 [MAIN-STREAM] ${type}:`, output.substring(0, 50));
+    if (type === 'stderr') stderrTail = (stderrTail + output).slice(-2000);
 
     // 🔥 项目进程的输出进缓冲（封顶 512KB）：窗口关闭后脚本继续跑，
     // 输出留在这里，跑完连同退出码存入 appPendingResults 等待下次打开窗口时认领
     if (appId) {
       const prev = appOutputBuffers.get(appId) || '';
       appOutputBuffers.set(appId, (prev + output).slice(-MAX_APP_BUFFER));
+      // 🔥 [trace] 埋点行进运行日志池（意图过滤）+ 识别服务地址（探活/注入用）
+      appendTraceText(appId, 'srv', output);
+      rememberAppUrl(appId, output);
     }
 
     if (!isSenderValid()) {
@@ -1331,32 +1581,42 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
 
   // 命令退出（进程已退出，但流可能未关闭）
   let exitCode: number | null = null;
-  proc.on('exit', (code, signal) => {
-    console.log('⚡ [MAIN-STREAM] 命令退出:', { exitCode: code, signal, executionId });
-    exitCode = code;
-  });
 
-  // 命令完成（流已关闭）
-  proc.on('close', (code, signal) => {
-    console.log('⚡ [MAIN-STREAM] 命令执行完成:', { exitCode: code, signal, stdoutCount: stdoutDataCount, stderrCount: stderrDataCount, executionId });
+  // 🔥 完成收尾（幂等）：powershell 退出 = 脚本已执行完，不依赖 close。
+  // 原因：命令内 Start-Process 起的常驻孙进程（dev server 等）会持有 stdout/stderr
+  // 管道写端 → 流永不 EOF → close 永不触发 → 前端永远"等待输出"，最后被 idle/总超时
+  // 强杀——连带把用户要起的后台服务一起杀掉。
+  // 改为 exit 后宽限 500ms 收管道残留输出，然后主动收尾（后台服务继续存活不受影响）；
+  // close 保留为自然 EOF 的兜底（幂等，先到先得）。
+  let streamFinished = false;
+  const finishStream = (finalExitCode: number | null) => {
+    if (streamFinished) return;
+    streamFinished = true;
+    console.log('⚡ [MAIN-STREAM] 命令执行完成:', { exitCode: finalExitCode, stdoutCount: stdoutDataCount, stderrCount: stderrDataCount, executionId });
     // 🔥 清理进程记录
     const processInfo = runningProcesses.get(executionId);
     runningProcesses.delete(executionId);
+    // 🔥 必须 clearTimeout：只 delete 不清定时器，看门狗仍会在 timeout 秒后开火——
+    //    此时进程早已正常退出，若 PID 被系统复用会误杀无辜新进程（真实案例：
+    //    npm --version exit 0 close 后 10s 仍报"命令超时强杀 PID=37872"）
+    const staleWatch = streamWatchdogs.get(executionId);
+    if (staleWatch) clearTimeout(staleWatch);
     streamWatchdogs.delete(executionId); // 🔥 清理超时看门狗（已结束的进程不再需要）
     const idleWatch = streamIdleWatchdogs.get(executionId);
     if (idleWatch) {
       clearTimeout(idleWatch);
       streamIdleWatchdogs.delete(executionId);
     }
+    detachedExecutions.delete(executionId); // 🔥 收尾清脱管身份，防集合泄漏
     // 🔥 计算类脚本自然退出 → 清理 appId 登记（服务类常驻不退出，由重新执行/关窗口释放）
     const appEntry = appId ? appServiceProcesses.get(appId) : undefined;
     if (appId && appEntry?.executionId === executionId) {
       appServiceProcesses.delete(appId);
     }
-    // 使用 exit 事件的 code 如果 close 事件的 code 为 null
-    const finalExitCode = code !== null ? code : exitCode;
     // 🔥 检查是否被用户取消
     const wasCancelled = processInfo?.cancelled || false;
+    // 🔥 记录退出码（ImportantObjectTracker 注入"已停(exit N)"用）
+    if (appId) appLastExitCode.set(appId, finalExitCode);
     // 🔥 项目进程执行完毕：输出缓冲连同退出码存入待认领结果。
     // 正常路径（窗口开着）渲染进程自己更新记录，这里的备份会被下次认领时丢弃；
     // 窗口已关闭/重载（sender 失效，promise 已丢）→ 下次打开项目窗口认领补写进 executionlog
@@ -1370,6 +1630,27 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       });
       appOutputBuffers.delete(appId);
     }
+    // 🔥 错误回执增强（工具自愈）：命令失败且 stderr 命中典型特征时，在 close 前附加固定
+    //    PS5 提示，LLM 下一轮直接改对（数据：shell 引号泥潭每条轨迹稳定烧 3-5 轮）。
+    //    固定文案封闭集不穷举；取消/成功不提示；渲染端把 stderr 拼进工具回执，LLM 必看到
+    if ((finalExitCode ?? 1) !== 0 && !wasCancelled && stderrTail) {
+      const hints: string[] = [];
+      if (/CommandNotFoundException|is not recognized/i.test(stderrTail)) {
+        hints.push('💡 [PS5] 无 Unix 命令，等价写法：tail/head → Select-Object -Last/-First N；grep → Select-String');
+      }
+      if (/ParameterBindingException|ParserError|ExpectedValueExpression|UnrecognizedToken|CannotConvertArgument/i.test(stderrTail)) {
+        hints.push('💡 [PS5] curl 是 Invoke-WebRequest 别名（不认 -X/-d/-H），JSON POST 用 Invoke-RestMethod 或 curl.exe；引号易被破坏，复杂请求建议改用 userpc_run_python 直接发');
+      }
+      if (hints.length && isSenderValid()) {
+        console.warn(`💡 [MAIN-STREAM] 附加 PS5 自愈提示: ${hints.length} 条`);
+        safeSenderSend(event.sender, 'system:command-output', {
+          executionId,
+          type: 'stderr',
+          data: `\n${hints.join('\n')}\n`,
+          timestamp: Date.now()
+        });
+      }
+    }
     console.log('📤 [MAIN-STREAM] 发送 close 消息:', { executionId, finalExitCode, wasCancelled, senderDestroyed: event.sender?.isDestroyed() });
     safeSenderSend(event.sender, 'system:command-output', {
       executionId,
@@ -1380,6 +1661,18 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       outputTruncated, // 🔥 标记输出是否被截断
       timestamp: Date.now()
     });
+  };
+
+  proc.on('exit', (code, signal) => {
+    console.log('⚡ [MAIN-STREAM] 命令退出:', { exitCode: code, signal, executionId });
+    exitCode = code;
+    // 宽限期收管道残留输出后收尾；close（自然 EOF）先到则幂等跳过
+    setTimeout(() => finishStream(code), 500);
+  });
+
+  // 命令完成（流已关闭）——自然 EOF 兜底（正常情况 exit 宽限先到）
+  proc.on('close', (code) => {
+    finishStream(code !== null ? code : exitCode);
   });
 
   // 错误处理
@@ -1391,6 +1684,10 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       error: error.message,
       timestamp: Date.now()
     });
+    // 🔥 spawn 失败（cwd 无效/ENOENT 等）时 Node 只发 error，不发 exit/close——
+    //    不在此收尾，双看门狗会挂满 timeout 强杀一个从未存在的进程（真实案例：
+    //    LLM 写坏路径 C:\Userrs\... → spawn ENOENT → 1800s 后"强杀"空 PID）
+    finishStream(-1);
   });
 
   // 🔥 双阈值看门狗（通用判死模型：标准是"无输出"而非"跑得久"）：
@@ -1398,7 +1695,11 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   //   数分钟、pip 大依赖安装）永不误杀；真正挂起的进程（死循环/等输入/卡死）零输出按阈值终止
   // - 总时长阈值：timeout 参数兜底（防失控成本），LLM 可显式传大值
   // 服务类常驻进程不受此限：通过 system:detach-command 取消两个看门狗
-  const IDLE_LIMIT_MS = 120 * 1000;
+  // 🔥 依赖安装类命令（npm/pnpm/yarn install 等）下载解压期间天然静默超 120s，
+  //    自动放宽 idle 阈值 ×3——工具层防呆，LLM 不用学"install 要传大 timeout"
+  const isInstallCmd = /(?:^|[;&]\s*)(?:npm|pnpm|yarn|bun)\s+(?:install|ci|i|add|update)\b/i.test(sanitizedCommand)
+    || /(?:^|[;&]\s*)pip\d?\s+install\b/i.test(sanitizedCommand);
+  const IDLE_LIMIT_MS = (isInstallCmd ? 360 : 120) * 1000;
   const killTree = () => {
     // 🔥 必须杀整棵进程树：proc.kill() 只杀 powershell 父进程，
     // python/node 孙进程会变孤儿继续跑（占用 CPU/内存，再也无法管理）
@@ -1413,6 +1714,8 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
     }
   };
   const armIdleWatch = () => {
+    // 🔥 已脱管的服务进程不再武装：stdout 持续流入也不复装（防复装竞态杀常驻服务）
+    if (detachedExecutions.has(executionId)) return;
     const prev = streamIdleWatchdogs.get(executionId);
     if (prev) clearTimeout(prev);
     const timer = setTimeout(() => {
@@ -1420,6 +1723,14 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
       if (proc.exitCode !== null || proc.killed) return;
       console.warn(`⚠️ [MAIN-STREAM] 命令 ${IDLE_LIMIT_MS / 1000}s 无输出，疑似挂起，杀进程树 PID=${proc.pid}`);
       killTree();
+      // 🔥 杀树重试：taskkill 偶发失败（真实案例：看门狗开火并发 timeout 事件，但进程未死、
+      //    close 永远不来，渲染层干转到用户手动终止）——15s 后复查仍存活则再杀一次
+      setTimeout(() => {
+        if (proc.exitCode === null && !proc.killed) {
+          console.warn('⚠️ [MAIN-STREAM] 看门狗杀树后进程仍存活，重试 taskkill:', executionId);
+          killTree();
+        }
+      }, 15000);
       safeSenderSend(event.sender, 'system:command-output', {
         executionId,
         type: 'timeout',
@@ -1434,6 +1745,9 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
   // 总时长兜底（服务类进程可通过 system:detach-command 取消，活到被杀为止）
   const watchdog = setTimeout(() => {
     streamWatchdogs.delete(executionId);
+    // 🔥 已自然退出/已被杀则不开火：定时器可能因竞态漏清，此时强杀的是已死 PID，
+    //    若 PID 被系统复用会误杀无辜进程
+    if (proc.exitCode !== null || proc.killed) return;
     if (!proc.killed) {
       // 🔥 带命令摘要：1800s 兜底被杀的多数是 LLM 前台启动的常驻服务（dev server 等），
       //    日志不载命令就无法定位是谁白跑 30 分钟
@@ -1457,6 +1771,11 @@ ipcMain.on('system:execute-command-stream', (event, { command, timeout = 120, wo
 const streamWatchdogs = new Map<string, NodeJS.Timeout>();
 // 🔥 活跃度看门狗（无输出判死）：与总时长看门狗分离，detach/收尾需成对清理
 const streamIdleWatchdogs = new Map<string, NodeJS.Timeout>();
+// 🔥 已脱管的流式执行：服务类进程 detach 后 stdout 仍会流入（vite 请求日志/HMR 持续吐行），
+//    若不设防，每行输出都会把 idle 看门狗重新武装（复装竞态）——静默 120s 后 taskkill /T
+//    杀树，"已脱管"的服务照样被杀（真实案例：dev.log 里 ^C/终止批处理操作(Y/N)? 即杀树
+//    痕迹，localhost 断连）。detach 时加入此集合，armIdleWatch 见集合即不再武装
+const detachedExecutions = new Set<string>();
 
 /**
  * 🔥 按 appId 登记的项目进程（main 进程持有，不受渲染窗口刷新/重载影响）
@@ -1484,10 +1803,135 @@ const MAX_APP_BUFFER = 512 * 1024;
 const appPendingResults = new Map<string, { exitCode: number; output: string; duration?: number }>();
 
 /**
+ * 🔥 运行日志池（[trace] 埋点采集，意图过滤）
+ * LLM 代码里 console.log('[trace] ...') / print('[trace] ...') 才会被采集进池——
+ * LLM 自己声明关心点，无标记输出不进池，收端零噪音。
+ * 前端（webview console-message）与后端（服务进程 stdout）双入口，同一池统一时间线。
+ * get_task_detail(appId) 拉增量（水位线），单次 ≤4000 字符；进程重启即新会话清池。
+ */
+interface TracePoolEntry {
+  lines: string[];        // 已格式化日志行（[时间][来源] 内容）
+  readOffset: number;     // 水位线：下次增量起点（行索引）
+  sessionStartedAt: number;
+}
+const TRACE_TAG = '[trace]';
+const TRACE_MAX_LINES = 500;         // 池容量（行，环形）
+const TRACE_TAKE_MAX_CHARS = 4000;   // 单次增量上限（字）
+const tracePools = new Map<string, TracePoolEntry>();
+
+/** 进程重启 → 新会话清池（旧日志全量在 executionlog 里，可查） */
+function newTraceSession(appId: string): void {
+  tracePools.set(appId, { lines: [], readOffset: 0, sessionStartedAt: Date.now() });
+}
+
+/** 文本按 [trace] 标记筛行入池（source: srv=后端 stdout / web=前端 console） */
+function appendTraceText(appId: string, source: 'srv' | 'web', text: string): void {
+  if (!appId || !text || !text.includes(TRACE_TAG)) return;
+  let pool = tracePools.get(appId);
+  if (!pool) { newTraceSession(appId); pool = tracePools.get(appId)!; }
+  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  for (const raw of text.split(/\r?\n/)) {
+    if (!raw.includes(TRACE_TAG)) continue;
+    const msg = raw.split(TRACE_TAG).slice(1).join(TRACE_TAG).trim();
+    pool.lines.push(`[${time}][${source}] ${msg || raw.trim()}`);
+  }
+  if (pool.lines.length > TRACE_MAX_LINES) {
+    const cut = pool.lines.length - TRACE_MAX_LINES;
+    pool.lines.splice(0, cut);
+    pool.readOffset = Math.max(0, pool.readOffset - cut);
+  }
+}
+
+/** 允许短 id：精确命中或前 8 字符前缀命中 */
+function resolveTraceAppId(input: string): string | null {
+  if (!input) return null;
+  if (tracePools.has(input)) return input;
+  for (const key of tracePools.keys()) {
+    if (key.substring(0, 8) === input.substring(0, 8)) return key;
+  }
+  return null;
+}
+
+/** 拉增量（水位线推进到最新），单次封顶 */
+function takeTraces(inputAppId: string): { found: boolean; content: string; totalNew: number; sessionStartedAt?: number } {
+  const appId = resolveTraceAppId(inputAppId);
+  if (!appId) return { found: false, content: '', totalNew: 0 };
+  const pool = tracePools.get(appId)!;
+  const fresh = pool.lines.slice(pool.readOffset);
+  pool.readOffset = pool.lines.length;
+  let content = fresh.join('\n');
+  if (content.length > TRACE_TAKE_MAX_CHARS) {
+    content = `（超过 ${TRACE_TAKE_MAX_CHARS} 字，已截断保留最新部分）\n` + content.slice(-TRACE_TAKE_MAX_CHARS);
+  }
+  return { found: fresh.length > 0, content, totalNew: fresh.length, sessionStartedAt: pool.sessionStartedAt };
+}
+
+/**
+ * 🔥 服务地址记忆（appId → 最近从输出中识别的 localhost URL，最多 3 个）
+ * handleOutput 实时提取、ImportantObjectTracker 注入与探活使用
+ */
+const appLastUrls = new Map<string, string[]>();
+const appLastExitCode = new Map<string, number | null>();
+function rememberAppUrl(appId: string, output: string): void {
+  const matches = output.match(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+(?:\/[^\s"']*)?/g);
+  if (!matches || !appId) return;
+  const prev = appLastUrls.get(appId) || [];
+  for (const u of matches.reverse()) { // 保留最新顺序
+    if (!prev.includes(u)) prev.unshift(u);
+  }
+  appLastUrls.set(appId, prev.slice(0, 3));
+}
+
+/**
+ * 🔥 运行日志池 IPC：webview 前端 console 埋点入口 / LLM 增量拉取 / 运行时摘要（注入+探活）
+ */
+ipcMain.on('app:trace:append', (_event, { appId, message }: { appId: string; message: string }) => {
+  appendTraceText(String(appId || ''), 'web', String(message || ''));
+});
+
+ipcMain.handle('app:trace:take', (_event, appId: string) => {
+  return takeTraces(String(appId || ''));
+});
+
+ipcMain.handle('app:runtime:summary', async (_event, appIds: string[]) => {
+  const ids = Array.isArray(appIds) ? appIds.map(String) : [];
+  return ids.map((id) => {
+    const entry = appServiceProcesses.get(id);
+    const alive = !!entry;
+    const urls = appLastUrls.get(id) || [];
+    return {
+      appId: id,
+      alive,
+      durationMs: entry?.startedAt ? Date.now() - entry.startedAt : undefined,
+      lastExitCode: appLastExitCode.get(id),
+      url: urls[0] || null,
+    };
+  });
+});
+
+/**
+ * 🔥 运行中服务探活（主进程发 HTTP，绕开渲染进程跨源限制），单次 ≤1s
+ */
+ipcMain.handle('app:probe:url', async (_event, url: string) => {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+    const started = Date.now();
+    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    clearTimeout(timer);
+    return { ok: true, status: res.status, ms: Date.now() - started };
+  } catch (e: any) {
+    return { ok: false, status: 0, error: String(e?.message || e).slice(0, 60) };
+  }
+});
+
+/**
  * 🔥 IPC 通信：取消流式命令的超时（服务器类进程常驻运行，由用户关窗口/重新 Run 时终止）
  * 同时把该进程标记为服务类（isService）：Stop 按钮 / 关窗释放只对服务类生效
  */
 ipcMain.on('system:detach-command', (_event, { executionId }) => {
+  // 🔥 登记脱管身份：此后该执行的 stdout 复燃不再重新武装看门狗（armIdleWatch 复装竞态）
+  detachedExecutions.add(executionId);
   const watchdog = streamWatchdogs.get(executionId);
   if (watchdog) {
     clearTimeout(watchdog);
@@ -1569,9 +2013,46 @@ ipcMain.on('system:cancel-command', (event, { executionId }) => {
     } else {
       processInfo.proc.kill('SIGTERM');
     }
+    // 🔥 取消必达兜底：taskkill 后 5s 复查，若进程仍存活（杀失败）也强制回补 close——
+    //    渲染层立即弃轮顺延下一轮，绝不允许取消请求石沉大海把整轮卡死；
+    //    残留进程交给空闲看门狗后续清理
+    setTimeout(() => {
+      const still = runningProcesses.get(executionId);
+      if (still && still.proc.exitCode === null) {
+        console.warn('🛑 [MAIN-STREAM] taskkill 后进程仍存活，强制回补 close 弃轮:', executionId);
+        safeSenderSend(event.sender, 'system:command-output', {
+          executionId,
+          type: 'close',
+          exitCode: -1,
+          success: false,
+          cancelled: true,
+          outputTruncated: false,
+          timestamp: Date.now()
+        });
+      }
+    }, 5000);
     // 不要立即删除，让 close 事件处理
     // runningProcesses.delete(executionId);
+    return;
   }
+  if (!processInfo) {
+    // 🔥 注册表无此执行（已被看门狗收走并清理）：立即回补 close 终结事件弃轮——
+    //    真实事故：看门狗 120s 收走进程清了注册表，但渲染层轮次未推进，用户点终止
+    //    两次全部石沉大海，卡片永久"执行中"，整轮卡死
+    console.warn('🛑 [MAIN-STREAM] 取消目标不在运行注册表（已结束或已被看门狗清理），立即回补 close 弃轮:', executionId);
+    safeSenderSend(event.sender, 'system:command-output', {
+      executionId,
+      type: 'close',
+      exitCode: -1,
+      success: false,
+      cancelled: true,
+      outputTruncated: false,
+      timestamp: Date.now()
+    });
+    return;
+  }
+  // killed=true：kill 已被调用（看门狗处理中），自然 close 即将到达，不重复发
+  console.log('🛑 [MAIN-STREAM] 取消目标已被 kill（看门狗处理中），等待自然 close:', executionId);
 });
 
 /**

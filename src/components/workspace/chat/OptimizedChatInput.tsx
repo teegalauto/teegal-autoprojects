@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { ArrowUp, X, StopCircle, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check, Cloud, Power } from "lucide-react";
+import { ArrowUp, X, StopCircle, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check, Cloud, Power, Brain } from "lucide-react";
 import { sshListActive, sshCloseInstance } from "@/utils/systemtools/sshInstance";
 import { FileAttachment } from "../types/ChatTypes";
 import FilePreviewList from "./FilePreviewList";
@@ -130,6 +130,25 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
   const [customModels, setCustomModels] = useState<SimpleUserModel[]>([]);
   const [agentModelId, setAgentModelId] = useState<string>('');
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+
+  // 🔥 推理强度（用户级偏好，localStorage 持久化）：reactor 写代码质量与思考档强相关
+  //    （glm-5.3 low 档写代码明显弱）。三档声明意图（低/中/高，对齐 Codex/DeepSeek 惯例），
+  //    各模型族由 LLMService 映射注入。执行链路不传参——ReActExecutor 发请求时直接读
+  //    localStorage，砍掉整条中间传参链
+  const [reasoningEffort, setReasoningEffort] = useState<'low' | 'medium' | 'high'>(() => {
+    const saved = localStorage.getItem('reactReasoningEffort');
+    return saved === 'low' || saved === 'medium' || saved === 'high' ? saved : 'medium';
+  });
+  const cycleReasoningEffort = () => {
+    const next = reasoningEffort === 'low' ? 'medium' : reasoningEffort === 'medium' ? 'high' : 'low';
+    setReasoningEffort(next);
+    localStorage.setItem('reactReasoningEffort', next);
+  };
+  const effortMeta = {
+    low: { label: '低', title: '低思考（最快最省）' },
+    medium: { label: '中', title: '中思考（平衡）' },
+    high: { label: '高', title: '高思考（写代码更强，耗时更久）' },
+  } as const;
 
   // 🔥 资源引用相关：Popover 开关 + 凭据列表
   const [isResourcePopoverOpen, setIsResourcePopoverOpen] = useState(false);
@@ -906,8 +925,19 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
             </Popover>
           </div>
 
-          {/* 🔥 模型选择下拉 + 发送按钮 */}
+          {/* 🔥 模型选择下拉 + 推理强度 + 发送按钮 */}
           <div className="flex items-center gap-2 flex-shrink-0">
+            {/* 🔥 推理强度三档切换（Codex 风格：Brain 图标 + 低/中/高），点按循环，localStorage 持久化 */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={cycleReasoningEffort}
+              title={effortMeta[reasoningEffort].title}
+              className="h-8 px-2 text-xs text-gray-600 hover:text-gray-900 hover:bg-gray-100 flex items-center gap-1"
+            >
+              <Brain className={`h-3.5 w-3.5 ${reasoningEffort === 'high' ? 'text-violet-600' : reasoningEffort === 'medium' ? 'text-sky-500' : 'text-gray-300'}`} />
+              <span>思考·{effortMeta[reasoningEffort].label}</span>
+            </Button>
             {/* 🔥 模型选择下拉菜单 - 始终显示，processing 时禁用 */}
             <DropdownMenu open={isModelMenuOpen} onOpenChange={setIsModelMenuOpen}>
               <DropdownMenuTrigger asChild>

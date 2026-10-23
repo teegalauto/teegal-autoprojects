@@ -20,16 +20,29 @@ export function useLinkInterceptor() {
         if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
           e.preventDefault();
           e.stopPropagation();
-          
-          // 使用 Electron 打开外部链接
+
           const electron = (window as any).electron;
+
+          // 🔥 本地服务地址收编：localhost/127.0.0.1/[::1] → 应用内 viewer 窗口（webview），
+          // 不跳系统浏览器——跳出去后 console-message 埋点断流，日志池少一路数据源
+          try {
+            const u = new URL(href);
+            if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]') {
+              if (electron?.openAppViewerWindow) {
+                electron.openAppViewerWindow({ url: href, name: u.host });
+                return false;
+              }
+            }
+          } catch { /* URL 解析失败按普通外链走 */ }
+
+          // 使用 Electron 打开外部链接
           if (electron?.openExternal) {
             electron.openExternal(href);
           } else {
             // 降级处理：在新窗口打开
             window.open(href, '_blank', 'noopener,noreferrer');
           }
-          
+
           return false;
         }
         

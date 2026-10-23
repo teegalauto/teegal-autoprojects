@@ -33,9 +33,7 @@ const SUMMARY_PROTOCOL: SummaryProtocolConfig = {
 ## 返回格式（⚠️⚠️必须严格遵从以下JSON格式返回，不能返回自然语言）
 {
   "tools": [
-    {"name": "sessioncreate", "parameters": {"task": "详细的上下文描述任务"}},
-    {"name": "getContext", "parameters": {"sessionId": "session-id"}},
-    {"name": "killsession", "parameters": {"sessionId": "session-id"}}
+    {"name": "sessioncreate", "parameters": {"task": "详细的上下文描述任务"}}
   ],
   "say_to_user": "用户仅看到say_to_user字段的信息，看不到其他字段",
   "writeNotes": "（可选）记忆关键信息：【已确认】信息1 | 【已确认】信息2 | 【待确认】xxx | 【关键线索】xxx  "
@@ -44,12 +42,9 @@ const SUMMARY_PROTOCOL: SummaryProtocolConfig = {
 ### tools 字段说明
 - tools 是管理session的工具调用数组，不需要调用工具时返回空数组 []
 - 管理session工具：
-  - sessioncreate：创建session分发任务。parameters: {"task": "任务描述", "priority": false}
-    - priority 为 true 表示优先session（完成后立即处理，不需要等待其他session）
-  - getContext：查看运行完毕session详情。parameters: {"sessionId": "session-id"}
-  - killsession：终止session。parameters: {"sessionId": "session-id"}
+  - sessioncreate：创建session分发任务。parameters: {"task": "任务描述"}
   - check_update：检查应用是否有新版本。parameters: {}（结果会随工具结果回传）
-- 多任务并行：tools 中返回多个 sessioncreate，它们会同时执行
+- 多任务并行：多个 sessioncreate 会同时执行，近似任务并行会重复执行、互相踩踏，严禁
 - 多任务串行：先返回一个 sessioncreate，完成后再返回下一个
 - ⚠️ 查看 "已完成的 Session 列表" - 如果有状态为 "completed" 的 session，说明任务已成功完成
 - ⚠️ 不需要启动任务时 tools 返回空数组 []

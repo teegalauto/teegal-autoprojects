@@ -144,6 +144,18 @@ const ErrorMessages = {
     ]
   }),
 
+  // 🔥 本地路径但不是图片：web_url_reader 只对本地图片做视觉理解（后端读盘），其余文件走专门工具
+  LOCAL_PATH_NOT_IMAGE: (url: string): ErrorMessage => ({
+    title: '📁 本地文件不支持直接阅读',
+    reason: `路径 "${url}" 是本地文件但不是图片。web_url_reader 对本地文件仅支持图片视觉理解`,
+    suggestion: '按文件类型换用专门工具',
+    examples: [
+      '项目内文件: read_project_file（文本）或 teegal_file_analyze_toabstract（分析）',
+      '本地图片: 直接传图片完整路径（如 C:\\shot.png）+ instruction 即可视觉理解',
+      '需要 URL 交付: uploadfiletooss 上传后用返回的 URL 调用本工具'
+    ]
+  }),
+
   // 使用指南
   USAGE_GUIDE: (): ErrorMessage => ({
     title: '📖 URL Reader 使用指南',
@@ -276,8 +288,19 @@ export async function executeUrlReaderTool(
       };
     }
 
-    // 🔥 验证 URL 格式
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    // 🔥 验证 URL 格式：http(s) 或本地图片路径（图片走后端直接读盘视觉理解，截图自证免上传 OSS）。
+    // 本地音视频不支持（视觉模型按 URL 在线拉取读不到本地盘），其他本地文件引导用专门工具
+    const looksLocalPath = /^[a-zA-Z]:[\\/]/.test(url) || /^\/[^/]/.test(url) || /^(file|teegal-file):\/\//i.test(url);
+    if (looksLocalPath) {
+      if (!/\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(url)) {
+        const error = ErrorMessages.LOCAL_PATH_NOT_IMAGE(url);
+        return {
+          success: false,
+          error: formatErrorMessage(error),
+          metadata: { toolName: 'url_reader' },
+        };
+      }
+    } else if (!url.startsWith('http://') && !url.startsWith('https://')) {
       const error = ErrorMessages.INVALID_URL(url);
       return {
         success: false,

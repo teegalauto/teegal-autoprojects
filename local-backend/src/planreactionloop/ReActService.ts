@@ -56,6 +56,8 @@ export interface ReActRoundRequest {
   staticEnvironmentText?: string; // 🔥 固定部分环境文本（ExecutionTools、UserPC 等，每轮不变）
   dynamicEnvironmentText?: string; // 🔥 动态部分环境文本（ImportantObjects、UserInjectMessages 等）
   writeNotes?: string; // 🔥 工作笔记，防止遗忘
+  /** 🔥 推理强度（'low'|'high'）：前端 UI 用户偏好，缺省用默认档。glm-5.3 low 档写代码明显弱 */
+  reasoningEffort?: string;
 }
 
 export interface ReActRoundResponse {
@@ -101,6 +103,7 @@ export class ReActService {
       staticEnvironmentText,
       dynamicEnvironmentText,
       writeNotes,
+      reasoningEffort,
     } = request;
 
     // 从 environmentText 中提取 userQuery（第一行通常是用户查询）
@@ -143,7 +146,7 @@ export class ReActService {
       console.log(`[REACT-SERVICE] Round ${roundNumber} prompt: ${promptKB.toFixed(1)}KB (~${Math.round(totalChars / 3)} tokens) | 历史${(p.history / 1024).toFixed(1)}KB 自动归档${p.autoArchived ?? 0}条 主动归档${archivedCount}条 笔记${((writeNotes || '').length / 1024).toFixed(1)}KB/${noteSegs.length}条(max${noteMax}) 固定${(p.staticEnv / 1024).toFixed(1)}KB 动态${(p.dynamicEnv / 1024).toFixed(1)}KB`);
 
       // 调用 LLM
-      let llmResponse = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber);
+      let llmResponse = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber, false, reasoningEffort);
 
       if (!llmResponse.success) {
         return {
@@ -163,8 +166,8 @@ export class ReActService {
       //    硬闸默认保留（防镜像失控）；思维链失控场景（content 为空）由 LLMService 自带兜底先行处理
       let effective = { llmResponse, parsed };
       if (parsed.parseError && llmResponse.finishReason === 'length') {
-        console.warn(`[REACT-SERVICE] Round ${roundNumber} 输出触顶截断（max_tokens=6000 且 JSON 解析失败），去掉上限重试一次`);
-        const retry = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber, true);
+        console.warn(`[REACT-SERVICE] Round ${roundNumber} 输出触顶截断（max_tokens=20000 且 JSON 解析失败），去掉上限重试一次`);
+        const retry = await this.callLLM(systemPrompt, userPrompt, userId, sessionId, roundNumber, true, reasoningEffort);
         if (retry.success) {
           const retryParsed = this.parseReActResponse(retry.data || '');
           if (!retryParsed.parseError) {
@@ -177,6 +180,19 @@ export class ReActService {
 
       const { letMeDo, writeNotes: parsedWriteNotes, completeReport, tools, archive } = effective.parsed;
 
+      // 🔥 截断丢失显式告知：解析失败（含宽救命中）且本轮没有任何工具执行时，
+      //    必须让 LLM 知道「tools 没有执行」——否则它会基于 letMeDo 的承诺记成"已保存"，
+      //    与事实分裂后归因"工具回执不可信"，陷入重写-验证死循环。
+      //    ⚠️ 注入 writeNotes 而非 letMeDo：letMeDo 是纯 UI 展示文案（executor 只挂工具卡片，
+      //    下一轮 prompt 不喂它，LLM 根本看不见）；writeNotes 会被 executor 累加回传下一轮，
+      //    是 LLM-only 通道。放头部确保在笔记窗口截断时仍可见
+      const systemNotice = (!completeReport && tools.length === 0 && effective.parsed.parseError)
+        ? `【系统提示】上轮 JSON 输出被截断/损坏，tools 数组丢失，未执行任何工具（letMeDo 里的保存承诺均未发生）。请每轮只保存 1 个文件（content 完整），逐轮把文件存下来。`
+        : '';
+      const finalWriteNotes = systemNotice
+        ? `${systemNotice}\n---\n${parsedWriteNotes || ''}`
+        : parsedWriteNotes;
+
       // 🔥 如果有 completeReport，在末尾添加提示：report 内容对用户不可见
       const finalCompleteReport = completeReport
         ? `${completeReport}\n\n【注意：报告结果对用户不可见】`
@@ -186,7 +202,7 @@ export class ReActService {
         success: true,
         roundNumber,
         letMeDo,
-        writeNotes: parsedWriteNotes,
+        writeNotes: finalWriteNotes,
         completeReport: finalCompleteReport,
         tools,
         // 🔥 主动归档：LLM 声明 archive=true 时连同 clearWindow 一起返回，
@@ -216,7 +232,8 @@ export class ReActService {
     userId?: string,
     sessionId?: string,
     roundNumber?: number,
-    noOutputCap?: boolean
+    noOutputCap?: boolean,
+    reasoningEffort?: string
   ): Promise<{ success: boolean; data?: string; finishReason?: string; error?: string }> {
     try {
       // 获取用户的 LLM 配置
@@ -236,14 +253,15 @@ export class ReActService {
             { role: 'user', content: userPrompt },
           ],
           temperature: 0.3,
-          // 🔥 reactor 是工具调用循环，不需要深度思考——低思考档省输出 token
-          //（实测 deepseek 系不控时单轮 reasoning 可达 1.8 万字符）。summarizer 不传，保留默认思考强度
-          reasoningEffort: 'low',
-          // 🔥 输出硬闸（默认 6000）：reactor 正常输出（writeNotes+letMeDo+tools）< 2000 token，
-          //   思考参数失效时防止模型把 prompt 长度镜像成长输出（实测 glm-5.3-flash 思考 26100 字符/轮 197s）。
-          //   两类兜底：思维链耗尽预算（content 为空）→ LLMService 去限重试；
+          // 🔥 推理强度：前端 UI 用户偏好（localStorage 持久化，随 /react/round 请求透传），
+          //   缺省 low。glm-5.3 low 档写代码明显弱——用户可在输入框切「深度思考」
+          reasoningEffort: reasoningEffort === 'high' ? 'high' : 'low',
+          // 🔥 输出硬闸（20000）：reactor 正常输出（writeNotes+letMeDo+tools）< 2000 token，
+          //   20000 保证单轮内嵌 2-3 个大文件保存不触顶；输入侧预算一直在收紧控制，输出放宽无碍。
+          //   仍防两类失控（历史实测：glm-5.3-flash 思考 26100 字符/轮 197s，失控 reasoning 可达 20 万字符）：
+          //   思维链耗尽预算（content 为空）→ LLMService 去限重试；
           //   内容型大输出触顶截断（JSON 解析失败）→ executeRound 去限重试一次（noOutputCap）
-          ...(noOutputCap ? {} : { max_tokens: 6000 }),
+          ...(noOutputCap ? {} : { max_tokens: 20000 }),
         },
         resolvedModel.callConfig,
         600000  // 🔥 10分钟超时，前沿模型如 K2.6 响应较慢
@@ -341,6 +359,10 @@ export class ReActService {
           writeNotes: salvage.writeNotes,
           completeReport: salvage.completeReport,
           tools: [],
+          // 🔥 必须带 parseError：宽救命中的 JSON 整体仍是坏的（典型：tools 数组带大文件 content
+          //    被截断丢失）。不暴露它，executeRound 的「输出触顶→去限重试」救援永不触发，
+          //    LLM 会以为工具已提交（口径分裂：自述"保存了三次"，实际一次都没执行）
+          parseError: 'JSON 整体解析失败（已抢救字符串字段，tools 数组丢失）',
         };
       }
       return {

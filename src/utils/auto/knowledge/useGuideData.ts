@@ -319,6 +319,14 @@ return { success: true, data: { greeting: '你好，' + name } };
     category: "platform"
   },
   {
+    question: "怎么采集运行日志/执行轨迹？",
+    answer: `写代码时把想跟踪的输出加 [trace] 标记（如 JS: console.log('[trace] 提交结果:', res)；Python: print('[trace] 提交结果:', res)），只有带标记的日志会被采集进运行日志池（前端 console 与后端 stdout 统一采集，无标记不采集）。
+查看轨迹：get_task_detail(projectId) 返回自上次读取以来的新日志（增量，单次≤4000字），运行中的服务重启后日志池会开新会话。
+排查"为什么没日志"：大概率是代码里没埋 [trace] 标记，补埋点后重跑。`,
+    keywords: ["日志", "轨迹", "trace", "调试", "埋点", "运行日志", "get_task_detail", "console", "排查"],
+    category: "platform"
+  },
+  {
     question: "怎么查看账户余额？",
     answer: `用get_account_info工具查询账户信息和积分余额（一次调用返回邮箱、昵称、余额、预估可调用次数等）。`,
     keywords: ["余额", "账户", "多少钱", "get_account_info", "teegal_get_account_info", "查询余额", "账户信息", "check_user_credits", "积分"],

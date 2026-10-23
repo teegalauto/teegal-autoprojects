@@ -408,9 +408,10 @@ export class LLMService {
     {
       // 🔥 GLM-5.3（含 flash）：仅支持 reasoning_effort 的 low/high/max 档（官网文档），
       // 无法关闭思考；thinking.type 是 4.x 参数会被静默忽略 → 思考跑默认 max 档（实测单轮 2.6 万字符）
+      // medium 档上折到 high（业界 medium 语义 ≈ 本模型 high，fold 到 low 会反向失真）
       match: (m) => /glm-5\.3/.test(m),
       apply: (body, effort) => {
-        const v = ['low', 'high', 'max'].includes(effort) ? effort : 'low';
+        const v = effort === 'low' ? 'low' : 'high';
         body.reasoning_effort = v;
         return `reasoning_effort=${v}（5.3 仅支持 low/high/max，无法关闭思考）`;
       },

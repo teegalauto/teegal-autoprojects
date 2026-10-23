@@ -45,6 +45,12 @@ contextBridge.exposeInMainWorld('electron', {
    */
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
+  // 🔥 运行日志池（[trace] 埋点）：webview console 入口 / LLM 增量拉取 / 运行时摘要与探活
+  appendAppTrace: (appId: string, message: string) => ipcRenderer.send('app:trace:append', { appId, message }),
+  takeAppTraces: (appId: string) => ipcRenderer.invoke('app:trace:take', appId),
+  getAppRuntimeSummary: (appIds: string[]) => ipcRenderer.invoke('app:runtime:summary', appIds),
+  probeAppUrl: (url: string) => ipcRenderer.invoke('app:probe:url', url),
+
   /**
    * 检查是否在 Electron 环境中运行
    */
@@ -135,15 +141,17 @@ contextBridge.exposeInMainWorld('electron', {
 
   /**
    * 🔥 打开项目查看器独立窗口（同一 appId 复用已有窗口）
+   * 🔥 url 型：本地服务预览（run_project_onlocal 拉起的服务地址收进应用内 webview，
+   *    不跳系统浏览器——跳出去后 console-message 埋点断流，日志池少一路数据源）
    */
-  openAppViewerWindow: (opts: { appId: string; name?: string }) =>
+  openAppViewerWindow: (opts: { appId?: string; url?: string; name?: string }) =>
     ipcRenderer.invoke('open-app-viewer-window', opts),
 
   /**
    * 🔥 监听主进程发来的"新增项目 tab"（viewer 窗口已存在时，新项目以 tab 加入）
    */
-  onAddAppTab: (callback: (data: { appId: string; name?: string }) => void) => {
-    const listener = (_e: unknown, data: { appId: string; name?: string }) => callback(data);
+  onAddAppTab: (callback: (data: { appId?: string; url?: string; name?: string }) => void) => {
+    const listener = (_e: unknown, data: { appId?: string; url?: string; name?: string }) => callback(data);
     ipcRenderer.on('app-viewer:add-tab', listener);
     return () => ipcRenderer.removeListener('app-viewer:add-tab', listener);
   },
@@ -517,10 +525,10 @@ declare global {
         getSize: () => Promise<[number, number]>;
         setSize: (width: number, height: number) => void;
       };
-      // 🔥 打开项目查看器独立窗口
-      openAppViewerWindow: (opts: { appId: string; name?: string }) => Promise<{ success: boolean; reused?: boolean; error?: string }>;
+      // 🔥 打开项目查看器独立窗口（appId 型=项目 / url 型=本地服务预览）
+      openAppViewerWindow: (opts: { appId?: string; url?: string; name?: string }) => Promise<{ success: boolean; reused?: boolean; error?: string }>;
       // 🔥 监听主进程"新增项目 tab"
-      onAddAppTab: (callback: (data: { appId: string; name?: string }) => void) => () => void;
+      onAddAppTab: (callback: (data: { appId?: string; url?: string; name?: string }) => void) => () => void;
       // 🔥 基础项目工具目录监视（fs.watch 热重载，appId 多账号隔离）
       watchBaseTools: (appId?: string) => Promise<{ success: boolean; reused?: boolean; error?: string }>;
       onBaseToolsChanged: (callback: () => void) => () => void;

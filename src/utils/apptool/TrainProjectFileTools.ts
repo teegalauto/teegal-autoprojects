@@ -1152,7 +1152,13 @@ export async function executeReadProjectFileTool(
 
       const endLine = Math.min(lines.length, startLine + lineCount);
       // 🔥 续读游标：LLM 不用自己算下一页从哪开始（忘了算就得从头读，白费一轮）
-      lineInfo = `（第 ${startLine + 1}-${endLine} 行，共 ${lines.length} 行${endLine < lines.length ? `。续读: offset=${endLine + 1}` : '，已到文件末尾'}）`;
+      // 🔥 反小步爬行：LLM（训练先验）常保守传 limit=60 逐页爬，600 行文件要烧 10 轮。
+      //    仅当"页太小且剩余过半"时提示一次可一次读完，LLM 放大 limit 后此提示自然消失
+      const remaining = lines.length - endLine;
+      const crawlHint = lineCount < 150 && remaining > lineCount
+        ? `；也可传 limit=${lines.length} 或不传 limit 一次读完（整读上限约12000字符）`
+        : '';
+      lineInfo = `（第 ${startLine + 1}-${endLine} 行，共 ${lines.length} 行${remaining > 0 ? `。续读: offset=${endLine + 1}${crawlHint}` : '，已到文件末尾'}）`;
 
       console.log(`[READ-FILE] 按行号截取: ${startLine + 1}-${endLine} 行`);
     }

@@ -16,3 +16,4 @@ export type { GetAccountInfoResult, AccountInfo } from './getUserProfile.js';
 export { handleGetAccountInfo, executeGetAccountInfoTool } from './getUserProfile.js';
 export { executeListCredentialsTool } from './listCredentials.js';
 export { executeSshInstanceTool } from './sshInstance.js';
+export { executeComputerUseTool } from './computeruse/computerUseTool.js';

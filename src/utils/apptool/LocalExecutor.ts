@@ -41,9 +41,21 @@ export async function executeLocalCode(
   const logId = crypto.randomUUID();
 
   // 🔥 根据语言类型设置 execution_mode（默认值）
+  // 🔥 默认值不能盲写 'python'：执行被中断时（应用重启/进程丢失），日志永远停在创建时的
+  //    默认值——Node 项目会一直显示 python 标（真实案例：electron 重启打断 onlocalrun，
+  //    日志被僵尸清理为已取消，图标却是 python）。创建前快速探测 package.json，对齐
+  //    CpuExecutionService 的 npm 优先判定；正常跑完仍会被实际 executionType 纠正
   let executionMode: 'python' | 'npm' | 'shell' = 'python';
   if (language === 'node') executionMode = 'npm';
   else if (language === 'shell') executionMode = 'shell';
+  else if (options.isMultiFile) {
+    try {
+      const electron = (window as any).electron;
+      const basePath = await getAppBasePath(options.appId);
+      const pkg = await electron?.userpcFile?.read?.(`${basePath}\\package.json`);
+      if (pkg?.success && pkg?.data?.content) executionMode = 'npm';
+    } catch { /* 探测失败保持默认，跑完后仍会被实际类型纠正 */ }
+  }
 
   // 1. 创建执行日志（status=running）
   await executionLogStorage.create({

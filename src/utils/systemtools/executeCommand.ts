@@ -970,11 +970,13 @@ export async function executeRunPythonTool(
   if (isWindows) {
     // Windows: 使用 PowerShell 语法
     tempFilePath = `$env:TEMP\\${tempFileName}`;
-    command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); python "${tempFilePath}"`;
+    // 🔥 python -u：管道模式下 stdout 默认块缓冲，脚本不退出一个字都出不来（LLM 写长循环/
+    //    递归扫描时全程零输出像挂死，最后还被空闲看门狗连有用输出一起杀掉）——关缓冲实时流
+    command = `Remove-Item -Path "${tempFilePath}" -ErrorAction SilentlyContinue; [System.IO.File]::WriteAllText("${tempFilePath}", [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${codeBase64}"))); python -u "${tempFilePath}"`;
   } else {
     // macOS/Linux: 使用 Bash 语法
     tempFilePath = `/tmp/${tempFileName}`;
-    command = `rm -f "${tempFilePath}" && echo '${codeBase64}' | base64 -d > "${tempFilePath}" && python3 "${tempFilePath}"`;
+    command = `rm -f "${tempFilePath}" && echo '${codeBase64}' | base64 -d > "${tempFilePath}" && python3 -u "${tempFilePath}"`;
   }
 
   console.log('📋 [RUN-PYTHON-TOOL] 执行 Python 代码:', {
@@ -989,19 +991,52 @@ export async function executeRunPythonTool(
   try {
     const result = await new Promise<AutoToolResult>((resolve) => {
       const outputLines: string[] = [];
-      
+
+      // 🔥 渲染层第二道空闲判死：只杀"不动的"（150s 无任何输出），在动的永不误杀。
+      //    正常时主进程 120s 空闲看门狗先开火并发 timeout 事件（本函数已处理），此定时器
+      //    仅在事件丢失/taskkill 失败/close 不来时兜底；有输出就续期
+      let rendererIdle: ReturnType<typeof setTimeout> | undefined;
+      const armRendererIdle = () => {
+        if (rendererIdle) clearTimeout(rendererIdle);
+        rendererIdle = setTimeout(() => {
+          try { streamResult.cancel(); } catch { /* 已结束则忽略 */ }
+          resolve({
+            success: false,
+            error: '命令 150s 无输出，判定挂起，已被本地兜底终止',
+            data: {
+              type: 'terminal',
+              command: `python ${tempFileName}`,
+              outputs: [...outputLines, '[timeout] 本地兜底：150s 无输出，判定挂起已中止'],
+              exitCode: -1,
+              executionTime: 0,
+              executionId: streamResult.executionId,
+            },
+            metadata: { toolName: 'userpc_run_python' }
+          });
+        }, 150000);
+      };
+
       const streamResult = executeCommandStream({
         command,
         timeout,
         env: credentialEnv, // 🔥 注入凭据环境变量（与 userpc_shell 同通道）
         onOutput: (data) => {
-          if (data.type === 'stdout' && data.data) {
+          // 🔥 进度事件携带 executionId：前端流式卡片的"终止"按钮依赖它发 system:cancel-command
+          //    （userpc_shell 一路都带，本工具此前全程漏带 → run_python 执行中无法手工终止）
+          if (data.type === 'start') {
+            // start 即首推：静默脚本（python 未开 -u 时代/纯 sleep）也能立刻出现带终止按钮的卡片
+            onProgress?.({ type: 'start', data: '命令开始执行...', executionId: streamResult.executionId });
+            armRendererIdle();
+          } else if (data.type === 'stdout' && data.data) {
             outputLines.push(data.data);
-            onProgress?.({ type: 'stdout', data: data.data });
+            onProgress?.({ type: 'stdout', data: data.data, executionId: streamResult.executionId });
+            armRendererIdle(); // 🔥 有输出就续期：在动的永不误杀
           } else if (data.type === 'stderr' && data.data) {
             outputLines.push(`[stderr] ${data.data}`);
-            onProgress?.({ type: 'stderr', data: data.data });
+            onProgress?.({ type: 'stderr', data: data.data, executionId: streamResult.executionId });
+            armRendererIdle(); // 🔥 有输出就续期：在动的永不误杀
           } else if (data.type === 'close') {
+            if (rendererIdle) clearTimeout(rendererIdle);
             const hasStderr = outputLines.some(line => line.includes('[stderr]'));
             if (sshHint) outputLines.push(sshHint);
             onProgress?.({ type: 'complete', exitCode: data.exitCode });
@@ -1014,10 +1049,31 @@ export async function executeRunPythonTool(
                 exitCode: data.exitCode,
                 executionTime: 0,
                 message: 'Python 代码执行完成',
+                executionId: streamResult.executionId,
               },
               error: data.exitCode !== 0
                 ? `执行失败，退出码: ${data.exitCode}${hasStderr ? '。错误输出: ' + outputLines.filter(l => l.includes('[stderr]')).join('; ') : ''}${buildCommandNotFoundHint(outputLines.join('\n'))}`
                 : undefined,
+              metadata: { toolName: 'userpc_run_python' }
+            });
+          } else if (data.type === 'timeout') {
+            if (rendererIdle) clearTimeout(rendererIdle);
+            // 🔥 主进程空闲看门狗开火回执：killTree 异步、close 可能延迟——渲染层立即按超时
+            //    落账弃轮，绝不等 close（此前该事件被 switch 静默忽略，看门狗杀了进程渲染层
+            //    也不知道，干等到自己的兜底超时）
+            outputLines.push(`[timeout] ${data.error || '命令无输出，已被看门狗终止'}`);
+            onProgress?.({ type: 'complete', exitCode: -1, executionId: streamResult.executionId });
+            resolve({
+              success: false,
+              error: data.error || '命令无输出，已被看门狗终止',
+              data: {
+                type: 'terminal',
+                command: `python ${tempFileName}`,
+                outputs: outputLines,
+                exitCode: -1,
+                executionTime: 0,
+                executionId: streamResult.executionId,
+              },
               metadata: { toolName: 'userpc_run_python' }
             });
           } else if (data.type === 'error') {
@@ -1026,21 +1082,8 @@ export async function executeRunPythonTool(
         }
       });
 
-      setTimeout(() => {
-        resolve({
-          success: false,
-          error: 'Python 代码执行超时',
-          data: {
-            type: 'terminal',
-            command: `python ${tempFileName}`,
-            outputs: outputLines,
-            exitCode: -1,
-            executionTime: timeout * 1000,
-            error: 'Python 代码执行超时',
-          },
-          metadata: { toolName: 'userpc_run_python' }
-        });
-      }, timeout * 1000 + 5000);
+      armRendererIdle(); // 🔥 启动即武装：覆盖"零输出直接挂死"场景（此前硬顶 timeout 秒会误杀在动的长任务）
+
     });
 
     return result;

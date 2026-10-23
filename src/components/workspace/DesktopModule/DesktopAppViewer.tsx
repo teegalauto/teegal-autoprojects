@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { DesktopApp, DesktopAppExecutionResult, CodeVersion } from './types/DesktopAppTypes';
 import {CodeEditor} from './CodeEditor';
 import {PreviewViewer} from './PreviewViewer';
+import { ServicePreview } from './ServicePreview';
 import {
   CadPreview, isCadFile,
   ImageViewer, isImageFile,
@@ -126,8 +127,25 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
   const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
 
   // 🚀 核心状态：切换预览模式
-  const [previewTab, setPreviewTab] = useState<'live' | 'history' | 'logs'>('live');
+  const [previewTab, setPreviewTab] = useState<'live' | 'history' | 'logs' | 'service'>('live');
   const [selectedTask, setSelectedTask] = useState<TrainingTask | null>(null);
+
+  // 🔥 服务实时预览：viewer 打开时查运行时摘要，服务活着且有地址才显示"服务"tab
+  const [serviceUrl, setServiceUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen || !isElectron) { setServiceUrl(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await (window as any).electron.getAppRuntimeSummary([appId]);
+        const info = Array.isArray(list) ? list[0] : null;
+        if (!cancelled && info?.alive && info?.url) setServiceUrl(info.url);
+        else if (!cancelled) setServiceUrl(null);
+      } catch { /* 非 Electron 或查询失败：无服务预览 */ }
+    })();
+    return () => { cancelled = true; };
+  }, [isOpen, appId, isElectron]);
 
   // 🔥 历史任务列表 ref（用于调用子组件方法）
   const historyListRef = useRef<HistoryTaskListRef>(null);
@@ -1274,6 +1292,15 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
                 <Terminal className="w-3 h-3" />
                 {t('workspace.desktopModule.desktopAppViewer.executionLog', { count: executionLogCount })}
               </button>
+              {serviceUrl && (
+                <button
+                  onClick={() => setPreviewTab('service')}
+                  className={`px-3 py-1 rounded flex items-center gap-1 transition-all ${previewTab === 'service' ? 'bg-white dark:bg-gray-600 shadow-sm text-green-600' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  <Server className="w-3 h-3" />
+                  服务
+                </button>
+              )}
             </div>
             <div className="flex items-center gap-1">
               {previewTab === 'history' && selectedTask && (
@@ -1296,7 +1323,12 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
           </div>
 
           <div className="flex-1 min-h-0 overflow-hidden relative">
-            <div className={(previewTab === 'live' || (previewTab !== 'logs' && selectedTask)) ? 'h-full' : 'hidden'}>
+            {previewTab === 'service' && serviceUrl && (
+              <div className="h-full">
+                <ServicePreview appId={appId} url={serviceUrl} />
+              </div>
+            )}
+            <div className={(previewTab === 'live' || (previewTab !== 'logs' && previewTab !== 'service' && selectedTask)) ? 'h-full' : 'hidden'}>
               <PreviewViewer 
                 content={selectedTask ? selectedTask.stdout_output : previewContent}
                 isLoading={selectedTask ? false : (isRunning || isGpuTaskRunning)}

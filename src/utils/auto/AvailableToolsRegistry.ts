@@ -172,7 +172,7 @@ export function getAllToolIds(): number[] {
 export const AVAILABLE_TOOLS: ToolDefinition[] = [
   // 🔥 信息获取类
   { id: 1, name: "web_search", displayName: "智能搜索", tokens: ["gather", "execution"], params: "query" },
-  { id: 2, name: "web_url_reader", displayName: "网页/图片/视频阅读", tokens: ["gather", "execution"], params: "url, instruction(媒体URL必传:想了解什么,如\"描述这张图\";普通网页可省)" },
+  { id: 2, name: "web_url_reader", displayName: "网页/图片/视频阅读", tokens: ["gather", "execution"], params: "url, instruction(想了解什么,如\"描述这张图\";普通网页可省;图片支持本地绝对路径,截图后直接传路径即可看图)" },
   { id: 3, name: "list_projects", displayName: "列出项目", tokens: ["gather", "execution"], params: "" },
   { id: 4, name: "get_account_info", displayName: "获取账户信息", tokens: ["gather", "execution"], params: "" },
   // 🔥 check_user_credits 已合并到 get_account_info（一次调用返回账户信息+积分余额）
@@ -187,14 +187,14 @@ export const AVAILABLE_TOOLS: ToolDefinition[] = [
   { id: 11, name: "delete_project_file", displayName: "删除项目文件", tokens: ["gather", "execution"], params: "projectId, filePath" },
 
   // 🔥 代码执行工具（local=本地 / cloud=云端）
-  { id: 12, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(只传=自动探测入口执行整个项目), mainFile?(指定入口，须已存在), code?(临时脚本，探路请用userpc_shell)" },
-  { id: 13, name: "run_project_oncloud", displayName: "云端运行项目代码", tokens: ["gather", "execution"], params: "projectId, instanceType(S5.*=CPU，GN*/ecs.*=GPU), wait?(默认true，false=稍后用户自己看结果)" },
+  { id: 12, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(只传=自动探测入口执行整个项目), mainFile?(指定入口，须已存在), code?(临时脚本，探路请用userpc_shell)。服务类(npm dev等)自动脱管常驻,不随任务结束终止,直至项目窗口关闭" },
+  { id: 13, name: "run_project_oncloud", displayName: "云端运行项目代码", tokens: ["gather", "execution"], params: "projectId, instanceType(S5.*=CPU，GN*/ecs.*=GPU，非常驻), wait?(默认true，false=稍后用户自己看结果)" },
   { id: 14, name: "userpc_shell", displayName: "执行shell命令", tokens: ["gather", "execution"], params: "command, credentialName?" },
-  { id: 15, name: "userpc_run_python", displayName: "运行Python脚本", tokens: ["gather", "execution"], params: "code" },
+  { id: 15, name: "userpc_run_python", displayName: "运行Python脚本", tokens: ["gather", "execution"], params: "code(联网必带timeout≤30)" },
 
   // 🔥 任务历史工具（合并版：云端训练 train + 本地执行 localrun 双源，见 TaskHistoryTools）
   { id: 16, name: "list_tasks", displayName: "列出任务/日志", tokens: ["gather", "execution"], params: "projectId, type?(train=云端训练|localrun=本地执行|缺省=两源合并), morePage?(如'11-20')" },
-  { id: 17, name: "get_task_detail", displayName: "获取任务/日志详情", tokens: ["gather", "execution"], params: "taskId(双源自动命中:先查训练任务再查本地执行日志,回执带来源标签)" },
+  { id: 17, name: "get_task_detail", displayName: "获取任务/日志详情", tokens: ["gather", "execution"], params: "taskId(双源命中:先训练后本地执行,回执带来源) | appId(运行日志池:[trace]埋点增量,单次≤4000字)" },
   { id: 18, name: "stop_gpu_train", displayName: "停止GPU训练", tokens: ["gather", "execution"], params: "taskId" },
   { id: 19, name: "update_train_task_remark", displayName: "更新训练备注", tokens: ["gather", "execution"], params: "taskId, remark" },
 
@@ -215,6 +215,9 @@ export const AVAILABLE_TOOLS: ToolDefinition[] = [
   { id: 25, name: "uploadfiletooss", displayName: "上传文件到云端", tokens: ["gather", "execution"], params: "localPath（或任意包含本地文件路径的参数）" },
   // 🔥 实例直连：执行命令 / 写文件 / 推文件（Node spawn 免转义；细节报错自解释，完整用法见 use_guide）
   { id: 26, name: "ssh_remote", displayName: "实例直连执行", tokens: ["execution"], params: "instanceId, command | remotePath+content | filePath 或 filePaths[](批量) 或 localPath + remotePath, timeout?" },
+  // 🔥 电脑操作（Windows）：感知屏幕返回编号候选表 → 选号执行，坐标由定位层产出（LLM 只选号不碰坐标）
+  // 暂停注册：实战 7 轮暴露 LLM 操作成功率低（乱跑/幻觉编号/时序错位），定位层与工具本体保留待改进后再启用
+  // { id: 27, name: "computeruse", displayName: "电脑操作", tokens: ["execution"], params: "action(focus窗口置前|perceive感知屏幕|click点id|type输text|key按键|seq多步编排), window?(窗口名筛,perceive/focus用,如\"微信\"), filter?(perceive文字筛), annotated?(图标无文字时出编号标注图,web_url_reader认编号再click), id?(click编号来自最近感知), expect?(click防呆:预期文字如\"李佩琦\",不符拒点), text?(type支持中文), key?(enter/esc/ctrl+s等), steps?(seq一轮跑完:[{do:type,text:x},{do:key,key:enter}]); click/key/focus执行后自动回传最新感知(弹新窗时自动全屏兜底)无需单独perceive,核验只看sense; 严禁pyautogui模拟坐标点击" },
 ];
 
 // 🔥 扩展工具存储（动态添加）

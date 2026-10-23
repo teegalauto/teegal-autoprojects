@@ -3,7 +3,7 @@ import { AutoStep, AutoToolResult } from "@/utils/auto/types";
 
 import { executeSimpleSearchTool } from "@/utils/webshell/simpleSearchTool";
 import { executeUrlReaderTool } from "@/utils/webshell/urlReaderTool";
-import { executeExecuteCommandTool, executeRunPythonTool, executeGetAccountInfoTool, executeGetLocalAppTool, executeListCredentialsTool, ExecuteCommandProgress } from "@/utils/systemtools";
+import { executeExecuteCommandTool, executeRunPythonTool, executeGetAccountInfoTool, executeGetLocalAppTool, executeListCredentialsTool, executeComputerUseTool, ExecuteCommandProgress } from "@/utils/systemtools";
 import { executeGetAppCodeTool } from '@/utils/apptool/GetAppCodeTool';
 import { executeRunGpuTrainTool } from '@/utils/apptool/RunGpuTrainTool';
 import { executeCheckCreditsTool } from '@/utils/apptool/CheckCreditsTool';
@@ -254,6 +254,8 @@ export class ToolHandler {
     this.registerTool("ssh_remote", (step, sessionId, onProgress) => executeSshRemoteTool(step, sessionId, onProgress, { userId: this.userId }));
     // 🔥 传入 userId，支持 credentialName 参数注入环境变量（与 userpc_shell 同通道）
     this.registerTool("userpc_run_python", (step, sessionId, onProgress) => executeRunPythonTool(step, sessionId, onProgress, { userId: this.userId }));
+    // 🔥 电脑操作（Windows）：定位层产编号候选表 → LLM 选号 → 原子执行，LLM 永不接触坐标
+    this.registerTool("computeruse", (step, sessionId, onProgress) => executeComputerUseTool(step, sessionId, onProgress));
     this.registerTool("get_account_info", (step, sessionId) => executeGetAccountInfoTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId }));
     // 🔥 云端运行项目（GPU 训练 + CPU 普通计算，instanceType 显式区分）
     this.registerTool("run_project_oncloud", (step, _sessionId) => executeRunGpuTrainTool(step, this.sessionId || '', { userId: this.userId, conversationId: this.conversationId, sessionId: this.sessionId }));

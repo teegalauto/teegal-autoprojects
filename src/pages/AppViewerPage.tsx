@@ -10,23 +10,38 @@ import { useSearchParams } from 'react-router-dom';
 import { X, Minus, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DesktopAppViewer } from '@/components/workspace/DesktopModule/DesktopAppViewer';
+import { ServicePreview } from '@/components/workspace/DesktopModule/ServicePreview';
 import { useAuth } from '@/context/AuthContext';
 
+/**
+ * 🔥 tab 双形态：
+ * - app 型：项目查看器（DesktopAppViewer，带工具栏），key=appId
+ * - url 型：本地服务预览（ServicePreview 裸 webview，console 埋点入日志池），key=url
+ */
 interface AppTab {
-  appId: string;
+  type: 'app' | 'url';
+  appId?: string;
+  url?: string;
   name: string;
 }
+
+const tabKey = (t: { appId?: string; url?: string }) => t.appId || t.url || '';
 
 const AppViewerPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const initAppId = searchParams.get('appId') || '';
+  const initUrl = searchParams.get('url') || '';
   const initName = searchParams.get('name') || '';
   const conversationId = searchParams.get('conversationId') || null;
   const { user } = useAuth();
 
   // 🔥 多 tab 状态：初始 tab 来自 URL，后续 tab 来自主进程 IPC
-  const [tabs, setTabs] = useState<AppTab[]>(initAppId ? [{ appId: initAppId, name: initName }] : []);
-  const [activeAppId, setActiveAppId] = useState<string>(initAppId);
+  const [tabs, setTabs] = useState<AppTab[]>(
+    initAppId ? [{ type: 'app', appId: initAppId, name: initName }]
+    : initUrl ? [{ type: 'url', url: initUrl, name: initName }]
+    : []
+  );
+  const [activeKey, setActiveKey] = useState<string>(initAppId || initUrl);
 
   const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
   const isMac = isElectron && (window as any).electron?.platform === 'darwin';
@@ -45,18 +60,22 @@ const AppViewerPage: React.FC = () => {
     return () => clearInterval(interval);
   }, [isElectron]);
 
-  // 🔥 监听主进程"新增 tab"（点击另一个项目卡片时）
+  // 🔥 监听主进程"新增 tab"（点击另一个项目卡片 / 收编 localhost 链接时）
   useEffect(() => {
     const electron = (window as any).electron;
     if (!electron?.onAddAppTab) return;
-    return electron.onAddAppTab(({ appId, name }: { appId: string; name?: string }) => {
+    return electron.onAddAppTab(({ appId, url, name }: { appId?: string; url?: string; name?: string }) => {
+      const incoming: AppTab = appId
+        ? { type: 'app', appId, name: name || '' }
+        : { type: 'url', url, name: name || '' };
+      const key = tabKey(incoming);
       setTabs(prev => {
-        if (prev.some(t => t.appId === appId)) {
-          return prev; // 已打开：仅激活（下方 setActiveAppId）
+        if (prev.some(t => tabKey(t) === key)) {
+          return prev; // 已打开：仅激活（下方 setActiveKey）
         }
-        return [...prev, { appId, name: name || '' }];
+        return [...prev, incoming];
       });
-      setActiveAppId(appId);
+      setActiveKey(key);
     });
   }, []);
 
@@ -68,35 +87,35 @@ const AppViewerPage: React.FC = () => {
   }, []);
 
   // 关闭单个 tab：全部关闭则关窗口
-  const closeTab = useCallback((appId: string) => {
+  const closeTab = useCallback((key: string) => {
     setTabs(prev => {
-      const idx = prev.findIndex(t => t.appId === appId);
-      const next = prev.filter(t => t.appId !== appId);
-      if (appId === activeAppId) {
+      const idx = prev.findIndex(t => tabKey(t) === key);
+      const next = prev.filter(t => tabKey(t) !== key);
+      if (key === activeKey) {
         // 激活相邻 tab；没有 tab 则关窗口
         if (next.length === 0) {
           (window as any).electron?.window?.close();
         } else {
           const fallback = next[Math.min(idx, next.length - 1)];
-          setActiveAppId(fallback.appId);
+          setActiveKey(tabKey(fallback));
         }
       }
-      notifyMainWindow(appId); // 关 tab 也刷新主窗口列表（项目可能被改过）
+      notifyMainWindow(key); // 关 tab 也刷新主窗口列表（项目可能被改过）
       return next;
     });
-  }, [activeAppId, notifyMainWindow]);
+  }, [activeKey, notifyMainWindow]);
 
   // 窗口关闭前通知主窗口刷新
   useEffect(() => {
-    const handler = () => tabs.forEach(t => notifyMainWindow(t.appId));
+    const handler = () => tabs.forEach(t => notifyMainWindow(tabKey(t)));
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [tabs, notifyMainWindow]);
 
-  if (!initAppId) {
+  if (!initAppId && !initUrl) {
     return (
       <div className="flex items-center justify-center h-screen text-gray-400">
-        缺少 appId 参数
+        缺少 appId 或 url 参数
       </div>
     );
   }
@@ -116,31 +135,36 @@ const AppViewerPage: React.FC = () => {
           className="flex items-end gap-1 min-w-0 overflow-x-auto shrink"
           style={isElectron ? { WebkitAppRegion: 'no-drag' } as any : {}}
         >
-          {tabs.map(tab => (
-            <div
-              key={tab.appId}
-              onClick={() => setActiveAppId(tab.appId)}
-              className={`group flex items-center gap-1.5 px-3 py-1.5 rounded-t-lg cursor-pointer text-xs max-w-44 min-w-0 transition-colors ${
-                tab.appId === activeAppId
-                  ? 'bg-white text-gray-800 border border-b-0 border-gray-200 font-medium'
-                  : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
-              }`}
-            >
-              <span className="truncate select-none">{tab.name || tab.appId.slice(0, 8)}</span>
-              {/* 🔥 常显 ghost 关闭按钮（不依赖 hover，避免用户找不到） */}
-              <button
-                onClick={(e) => { e.stopPropagation(); closeTab(tab.appId); }}
-                className={`shrink-0 flex items-center justify-center h-4 w-4 rounded transition-colors ${
-                  tab.appId === activeAppId
-                    ? 'text-gray-400 hover:bg-gray-200 hover:text-gray-600'
-                    : 'text-gray-400 hover:bg-gray-300 hover:text-gray-600'
+          {tabs.map(tab => {
+            const key = tabKey(tab);
+            return (
+              <div
+                key={key}
+                onClick={() => setActiveKey(key)}
+                className={`group flex items-center gap-1.5 px-3 py-1.5 rounded-t-lg cursor-pointer text-xs max-w-44 min-w-0 transition-colors ${
+                  key === activeKey
+                    ? 'bg-white text-gray-800 border border-b-0 border-gray-200 font-medium'
+                    : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
                 }`}
-                title="关闭"
               >
-                <X className="h-3 w-3" />
-              </button>
-            </div>
-          ))}
+                {/* 🔥 url 型加服务标记，与项目 tab 视觉区分 */}
+                {tab.type === 'url' && <span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" title="本地服务预览" />}
+                <span className="truncate select-none">{tab.name || key.slice(0, 12)}</span>
+                {/* 🔥 常显 ghost 关闭按钮（不依赖 hover，避免用户找不到） */}
+                <button
+                  onClick={(e) => { e.stopPropagation(); closeTab(key); }}
+                  className={`shrink-0 flex items-center justify-center h-4 w-4 rounded transition-colors ${
+                    key === activeKey
+                      ? 'text-gray-400 hover:bg-gray-200 hover:text-gray-600'
+                      : 'text-gray-400 hover:bg-gray-300 hover:text-gray-600'
+                  }`}
+                  title="关闭"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
         </div>
 
         {/* 🔥 drag 垫片：tab 右侧空白区拖动窗口（Chrome 式），最少留 80px 保证抓得到 */}
@@ -172,19 +196,26 @@ const AppViewerPage: React.FC = () => {
 
       {/* Viewer 主体：全部保持挂载（keep-alive），激活的显示，其余隐藏——切换 tab 不丢编辑状态 */}
       <div className="flex-1 min-h-0 relative">
-        {tabs.map(tab => (
-          <div key={tab.appId} className="absolute inset-0" style={{ display: tab.appId === activeAppId ? 'block' : 'none' }}>
-            <DesktopAppViewer
-              appId={tab.appId}
-              userId={user?.id || ''}
-              isOpen={tab.appId === activeAppId}
-              onClose={() => closeTab(tab.appId)}
-              onAppUpdated={() => notifyMainWindow(tab.appId)}
-              conversationId={conversationId}
-              embedded
-            />
-          </div>
-        ))}
+        {tabs.map(tab => {
+          const key = tabKey(tab);
+          return (
+            <div key={key} className="absolute inset-0" style={{ display: key === activeKey ? 'block' : 'none' }}>
+              {tab.type === 'app' ? (
+                <DesktopAppViewer
+                  appId={tab.appId!}
+                  userId={user?.id || ''}
+                  isOpen={key === activeKey}
+                  onClose={() => closeTab(key)}
+                  onAppUpdated={() => notifyMainWindow(key)}
+                  conversationId={conversationId}
+                  embedded
+                />
+              ) : (
+                <ServicePreview appId={tab.appId || ''} url={tab.url!} bare />
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

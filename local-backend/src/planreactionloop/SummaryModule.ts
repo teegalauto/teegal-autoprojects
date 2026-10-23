@@ -568,8 +568,11 @@ export class SummaryModule {
           const trimmed = s.trim();
           if (trimmed.startsWith('session++')) {
             const task = trimmed.replace(/^session\+\+/, '').trim();
-            const isPriority = task.startsWith('[priority]');
-            return { name: 'sessioncreate', parameters: { task: isPriority ? task.replace(/^\[priority\]\s*/, '') : task, priority: isPriority } };
+            // 🔥 priority 已禁用（用户拍板）：优先 session 插队会导致多 SubAgent 并行抢跑、
+            //    干近似的事互相踩踏，且前端无取消通道时卡死无法挽回。协议层已删说明，
+            //    这里硬忽略 [priority] 前缀兜底（LLM 从旧笔记/历史学到的写法也无效）
+            const taskClean = task.replace(/^\[priority\]\s*/, '');
+            return { name: 'sessioncreate', parameters: { task: taskClean } };
           }
           if (trimmed.startsWith('getContext++')) {
             return { name: 'getContext', parameters: { sessionId: trimmed.replace(/^getContext\+\+/, '').trim() } };

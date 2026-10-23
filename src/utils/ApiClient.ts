@@ -203,6 +203,8 @@ export const ApiClient = {
       staticEnvironmentText?: string;
       dynamicEnvironmentText?: string;
       writeNotes?: string;
+      /** 🔥 推理强度（用户级偏好）：声明意图，LLMService 按模型族映射注入；缺省 backend 用默认档 */
+      reasoningEffort?: 'low' | 'medium' | 'high';
     }) => request<any>(ApiRoutes.REACT.ROUND, { body }),
   },
 

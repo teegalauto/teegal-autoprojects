@@ -225,7 +225,9 @@ export class EnvironmentBuilder {
       let activeInstances: any[] = [];
       if (strategy.includeExecutionTools) {
         try {
-          const r = await sshListActive(undefined, { sync: false });
+          // 🔥 sync:true 与云端自愈校正（sshListActive 内部 60s TTL 缓存，每轮构建不会真打云端）——
+          // 之前 sync:false 只读本地表，实例关机后状态过期，注入"运行中"快照误导 LLM
+          const r = await sshListActive(undefined, { sync: true });
           if (r.ok) activeInstances = r.instances;
         } catch { /* 查询失败不影响重要对象段 */ }
       }

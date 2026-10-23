@@ -820,6 +820,9 @@ export class ReActExecutor {
         staticEnvironmentText: environmentResult.staticText,
         dynamicEnvironmentText: environmentResult.dynamicText,
         writeNotes,
+        // 🔥 推理强度（用户级偏好）：UI 写 localStorage，这里直接读——不经过 UI→Panel→Handler
+        //    的长传参链。未设置时 undefined，backend 用默认档。三档声明意图，LLMService 按模型族映射
+        reasoningEffort: (localStorage.getItem('reactReasoningEffort') as 'low' | 'medium' | 'high' | null) || undefined,
       });
 
       return response;

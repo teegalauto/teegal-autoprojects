@@ -101,6 +101,27 @@ export async function executeGetTaskDetailTool(
   );
   if (local.success) return withSourcePrefix(local, SOURCE_LABEL.localrun);
 
+  // 🔥 运行日志池兜底（appId）：[trace] 埋点增量（前端 console + 后端 stdout 统一池），
+  //    水位线在主进程，每次调用返回新行、单次 ≤4000 字——传 taskId 轮询即得增量轨迹
+  const electronApi = (typeof window !== 'undefined') ? (window as any).electron : null;
+  if (electronApi?.takeAppTraces) {
+    try {
+      const r = await electronApi.takeAppTraces(taskId);
+      if (r && (r.found || r.sessionStartedAt)) {
+        const sessionTime = r.sessionStartedAt
+          ? new Date(r.sessionStartedAt).toLocaleTimeString('zh-CN', { hour12: false })
+          : '';
+        const message = r.found
+          ? `【来源：运行日志池】会话 ${sessionTime} 起，${r.totalNew} 条新日志：\n${r.content}`
+          : `【来源：运行日志池】无新日志（会话 ${sessionTime} 起）。代码中用 [trace] 标记的 console/print 日志才会被采集，如 console.log('[trace] 提交结果:', res)`;
+        return {
+          success: true,
+          data: { type: 'tracePool', message },
+        };
+      }
+    } catch { /* 非 Electron 环境或池查询失败：落入下方双源错误汇总 */ }
+  }
+
   return {
     success: false,
     error: `taskId 在两个来源中均未命中：\n- 云端训练: ${train.error || '未找到'}\n- 本地执行: ${local.error || '未找到'}`,

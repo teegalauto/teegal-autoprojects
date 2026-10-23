@@ -52,8 +52,9 @@ const STANDARD_REACT_PROTOCOL: ReActProtocolConfig = {
 省轮次规则:
 - 无依赖的操作同轮并行（tools 一次传多个，单轮≤5个），有依赖才等下一轮
 - 大体积结果（文件整读/搜索列表等）：关键结论立即记入笔记 → 传 "archive": true 归档旧轮腾预算，历史仅剩索引摘要，需要原文重新调用即可
-- 多文件修改合并为一轮：edit_project_file 的 edits 每项必带 filePath（一个 edit 声明一个文件的修改）
-- oldText 必须从 read 结果逐字复制（含缩进）；失败时按返回的最接近片段+行号照抄重试`,
+- 多文件修改合并为一轮（edit_project_file 一次传多文件 edits，参数结构见工具清单）
+- oldText 必须从 read 结果逐字复制（含缩进）；失败时按返回的最接近片段+行号照抄重试
+- 写操作幂等：发送/提交/创建类操作执行一次后，若验证手段不可用，只能用无副作用方式核验（截图/读状态/读回显）`,
 
   // 🔥 排列顺序优化缓存命中率：固定前缀尽可能长
   // staticEnvironment（固定）→ executionHistory（早期round可命中）→ dynamicEnvironment（动态）→ 轮次（动态）

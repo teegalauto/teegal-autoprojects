@@ -703,6 +703,23 @@ export class ImportantObjectTracker {
         const p = await getAppBasePath(app.id).catch(() => null);
         if (p) codePaths.set(app.id, p);
       }));
+
+      // 🔥 运行状态（每项目 ≤20 字）：服务进程存活 + 探活状态码 + 运行时长。
+      //    数据源 = 主进程运行日志池配套的 runtime:summary（进程登记/URL 记忆/退出码）
+      const runtimeByApp = new Map<string, any>();
+      try {
+        const electronApi = (typeof window !== 'undefined') ? (window as any).electron : null;
+        if (electronApi?.getAppRuntimeSummary) {
+          const summaries: any[] = await electronApi.getAppRuntimeSummary(apps.map(a => a.id)) || [];
+          for (const s of summaries) runtimeByApp.set(s.appId, s);
+          // 并发探活（≤1s/个，仅活着且带地址的服务）
+          await Promise.all([...runtimeByApp.values()].map(async (s: any) => {
+            if (s.alive && s.url && electronApi.probeAppUrl) {
+              try { s.probe = await electronApi.probeAppUrl(s.url); } catch { s.probe = { ok: false, status: 0 }; }
+            }
+          }));
+        }
+      } catch { /* 非 Electron 环境：跳过运行状态 */ }
       apps.forEach((app, index) => {
         const timeStr = formatTime(app.lastSeenAt);
         const shortId = app.id.substring(0, 8);
@@ -737,6 +754,25 @@ export class ImportantObjectTracker {
         const codePath = codePaths.get(app.id);
         if (codePath) {
           lines.push(`   本地目录: ${codePath}/`);
+        }
+
+        // 🔥 运行状态一行（≤20 字）：活/停 + 端口探活 + 时长。格式如 "运行: 5173 (200, 3m)"
+        const rt = runtimeByApp.get(app.id);
+        if (rt) {
+          let runLine = '';
+          if (rt.alive) {
+            const mins = rt.durationMs ? Math.floor(rt.durationMs / 60000) : 0;
+            if (rt.url) {
+              const port = rt.url.replace(/^https?:\/\//, '').split('/')[0].split(':')[1] || '';
+              const status = rt.probe ? (rt.probe.ok ? String(rt.probe.status) : '不通') : '';
+              runLine = `${port}${status ? ` (${status}` : ''}${mins > 0 ? `, ${mins}m` : ''}${status ? ')' : ''}`;
+            } else {
+              runLine = `运行中${mins > 0 ? ` ${mins}m` : ''}`;
+            }
+          } else if (rt.lastExitCode !== undefined && rt.lastExitCode !== null) {
+            runLine = `已停: exit ${rt.lastExitCode}`;
+          }
+          if (runLine) lines.push(`   运行: ${runLine}`);
         }
 
         // 🔥 附带该项目归属的活跃实例（快照，免调 ssh_instance 查询）；无实例也明示"无"——

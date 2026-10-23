@@ -699,7 +699,17 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
 
 /** 🔥 实例资源表变更广播：开机登记/就绪回写/关机等节点调用，前端计数图标即时刷新（免等 60s 轮询盲窗） */
 export function notifyInstancesChanged(): void {
+  invalidateActiveCache(); // 状态变了，TTL 缓存立即失效（避免环境注入过期"运行中"快照）
   try { window.dispatchEvent(new CustomEvent('ssh-instances-changed')); } catch { /* 非浏览器环境忽略 */ }
+}
+
+/** 🔥 活跃实例 TTL 缓存：ReAct 每轮 build 环境都查一次，60s 内复用免高频打云端同步。
+ * 实例开关机经 notifyInstancesChanged 失效，最多滞后一个 TTL */
+let _activeCache: { at: number; instances: any[] } | null = null;
+const ACTIVE_CACHE_TTL = 60_000;
+
+export function invalidateActiveCache(): void {
+  _activeCache = null;
 }
 
 /** 活跃实例清单（本地资源表，带项目归属 app_id；默认查询时云端自愈校正，opts.sync=false 走纯本地表轻量查询） */
@@ -709,13 +719,19 @@ export async function sshListActive(
 ): Promise<{ ok: boolean; instances: any[]; error?: string }> {
   const uid = userId || '';
   const sync = opts?.sync !== false;
+  // TTL 内复用上次同步结果（无论本次请求 sync 与否）：新鲜度 ≤60s，换来每轮环境构建零额外同步
+  if (_activeCache && Date.now() - _activeCache.at < ACTIVE_CACHE_TTL) {
+    return { ok: true, instances: _activeCache.instances };
+  }
   const res = await localApi(
     `/api/rental/resources?userId=${encodeURIComponent(uid)}&active=1${sync ? '&sync=1' : ''}`
   ).catch(() => ({ ok: false, status: 0, data: null }));
   if (!res.ok) {
     return { ok: false, instances: [], error: res.data?.error || `查询失败 (HTTP ${res.status})` };
   }
-  return { ok: true, instances: res.data?.resources || [] };
+  const instances = res.data?.resources || [];
+  if (sync) _activeCache = { at: Date.now(), instances }; // 仅同步结果入缓存（纯本地表查询可能过期，不污染缓存）
+  return { ok: true, instances };
 }
 
 /** 直连连接信息（ssh_remote 工具用；按 id/rentalId/instanceId 三路命中本地资源表） */

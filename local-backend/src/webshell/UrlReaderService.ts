@@ -9,6 +9,7 @@ import { userModelRegistry, SimpleUserModel } from '../utils/llm/UserModelRegist
 import { modelBindingRegistry } from '../utils/llm/ModelBindingRegistry';
 import { llmService, ContentPart, LLMMessage } from '../utils/LLMService';
 import { isMultimodalModel, isVideoCapableModel } from '../shared/visionModels';
+import * as fs from 'fs';
 
 export interface UrlReaderRequest {
   url: string;
@@ -554,6 +555,10 @@ export class UrlReaderService {
         }
         content.push({ type: 'image_url', image_url: { url: dataUrl } });
       } else {
+        // 🔥 本地视频文件无法在线理解（视觉模型按 URL 在线拉取，读不到本地盘）→ 明确引导，不瞎试
+        if (this.extractLocalPath(url)) {
+          return { success: false, url, error: '本地视频暂不支持直接视觉理解（视觉模型按 URL 在线拉取）。请先用 uploadfiletooss 上传获取 URL，再调用本工具阅读' };
+        }
         // 🔥 视频直接传 URL，由视觉模型在线理解
         content.push({ type: 'video_url', video_url: { url } });
       }
@@ -627,10 +632,43 @@ export class UrlReaderService {
   }
 
   /**
+   * 🔥 识别本地绝对路径（X:\...\xx.png、/abs/path、file://、teegal-file:// 均可）
+   * 与 Electron main.ts teegal-file handler 的剥前缀规则保持一致
+   */
+  private extractLocalPath(url: string): string | null {
+    let p = url.trim();
+    if (/^(teegal-file|file):\/\//i.test(p)) {
+      try { p = decodeURIComponent(p.replace(/^(teegal-file|file):\/\//i, '')); } catch { /* 解码失败保持原样 */ }
+      p = p.replace(/^\/+local\//, '').replace(/^\/(?=[a-zA-Z]:)/, '');
+    }
+    if (/^[a-zA-Z]:[\\/]/.test(p) || /^\/[^/]/.test(p)) return p;
+    return null;
+  }
+
+  /**
    * 🔥 下载图片并转为 base64 data URL（复用 SummaryModule 的多模态模式）
+   * 本地绝对路径直接读盘（截图自证类任务免上传 OSS）：local-backend 跑在用户本机，有文件系统权限
    */
   private async downloadImageAsDataUrl(url: string): Promise<string | null> {
     try {
+      // 🔥 本地路径分支：X:\... / /abs / file:// / teegal-file://
+      const localPath = this.extractLocalPath(url);
+      if (localPath) {
+        const buffer = await fs.promises.readFile(localPath);
+        if (buffer.length > 20 * 1024 * 1024) {
+          console.warn(`⚠️ [URL-READER-SERVICE] 本地图片过大: ${(buffer.length / 1024 / 1024).toFixed(1)}MB`);
+          return null;
+        }
+        const extMatch = localPath.toLowerCase().match(/\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i);
+        const EXT_TO_MIME: Record<string, string> = {
+          jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+          gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+        };
+        const mimeType = extMatch ? EXT_TO_MIME[extMatch[1]] : 'image/png';
+        console.log(`🖼️ [URL-READER-SERVICE] 本地图片直接读取: ${localPath} (${(buffer.length / 1024).toFixed(0)}KB)`);
+        return `data:${mimeType};base64,${buffer.toString('base64')}`;
+      }
+
       const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
       if (!response.ok) {
         console.warn(`⚠️ [URL-READER-SERVICE] 图片下载失败: HTTP ${response.status}`);

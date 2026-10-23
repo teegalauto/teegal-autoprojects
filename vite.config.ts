@@ -12,6 +12,9 @@ export default defineConfig(({ mode }) => ({
   server: {
     host: "::",
     port: 8080,
+    // 🔥 端口被占直接报错退出（fail fast），不静默顺延——Electron 开发模式写死加载
+    //    http://localhost:8080（electron/main.ts），顺延到 8081 会导致白屏
+    strictPort: true,
     // 🔥 COEP 策略：改为 'credentialless' 而非 'require-corp'
     // 原因：require-corp 会阻止加载无 CORP 头的跨域资源（如 OSS 图片、视频、Excel）
     // credentialless 既保持 SharedArrayBuffer 支持，又允许加载 OSS 等跨域资源
