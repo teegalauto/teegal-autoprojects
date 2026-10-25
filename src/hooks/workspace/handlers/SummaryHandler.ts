@@ -99,6 +99,7 @@ interface SessionContext {
   lastCheckResult?: SummaryOutput;
   killed: boolean; // 🔥 是否被 kill
   abortManager: AbortManager; // 🔥 用于中断执行
+  conversationId: string; // 🔥 kill/abort 需要——静态方法无实例上下文，从 context 取
 }
 
 interface PendingInteraction {
@@ -114,12 +115,14 @@ export class SummaryHandler {
   private conversationId: string;
   private userEmail?: string;
   private callbacks: SummaryHandlerCallbacks;
-  private sessionContexts: Map<string, SessionContext> = new Map();
-  private sessionList: SessionInfo[] = [];
-  private maxSessions = 50;
+  // 🔥 账本类级共享（static）：每轮 new SummaryHandler，但 UI 组件（SessionMessageGroup）与顶层
+  //    设值的 useWorkspace 是各自独立的 useWorkspace 实例——实例字段会让 UI 永远拿到 null handler，
+  //    计时器永远走兜底（0s/假活跃窗口）。static 后任何组件直接 SummaryHandler.xxx() 查账。
+  private static sessionContexts: Map<string, SessionContext> = new Map();
+  private static sessionList: SessionInfo[] = [];
+  private static pendingInteractions: Map<string, PendingInteraction> = new Map();
+  private static maxSessions = 50;
   private sessionId: string;
-  // 🔥 使用 Map 存储每个 sessionId 的 pendingInteraction，避免冲突
-  private pendingInteractions: Map<string, PendingInteraction> = new Map();
   // 🔥 存储当前对话历史（供所有方法使用）- 由调用方提供，不自动更新
   private conversationHistory?: Array<{ role: string; content: string; sessionId?: string; apiRole?: string; timestamp?: number }>;
   // 🔥 回调函数，用于获取最新的对话历史
@@ -227,28 +230,28 @@ export class SummaryHandler {
   }
 
   hasPendingInteraction(): boolean {
-    const result = this.pendingInteractions.size > 0;
-    console.log('[SUMMARY-HANDLER] hasPendingInteraction:', result, this.pendingInteractions.size);
+    const result = SummaryHandler.pendingInteractions.size > 0;
+    console.log('[SUMMARY-HANDLER] hasPendingInteraction:', result, SummaryHandler.pendingInteractions.size);
     return result;
   }
 
   getPendingInteraction(): PendingInteraction | null {
     // 返回第一个 pendingInteraction（兼容旧代码）
-    const first = this.pendingInteractions.values().next().value;
+    const first = SummaryHandler.pendingInteractions.values().next().value;
     return first || null;
   }
 
   clearPendingInteraction(): void {
-    this.pendingInteractions.clear();
+    SummaryHandler.pendingInteractions.clear();
   }
 
   /**
    * 🔥 Kill 指定 session
    */
-  killSession(sessionId: string): boolean {
+  static killSession(sessionId: string): boolean {
     console.log('🛑 [SUMMARY-HANDLER] Kill session:', sessionId);
 
-    const context = this.sessionContexts.get(sessionId);
+    const context = SummaryHandler.sessionContexts.get(sessionId);
     if (!context) {
       console.warn('[SUMMARY-HANDLER] Session 不存在:', sessionId);
       return false;
@@ -263,21 +266,26 @@ export class SummaryHandler {
     context.killed = true;
     context.status = 'killed';
     context.sessionInfo.status = 'killed';
+    // 🔥 kill 瞬间落账终态（completedAt + 终态快照）：此前只在 executeSession 检查点落账，
+    //    但 abort 打断时检查点被跳过 → endTime 恒空 → UI 兜底只剩启动 running 条目，
+    //    计时器定格不了真实终止时刻，且下一轮消息触发重查时误入 unknown 活跃窗口假走字
+    context.sessionInfo.completedAt = new Date();
+    SummaryHandler.sessionList.push({ ...context.sessionInfo });
 
-    // 🔥 通知 ReActExecutor 停止
+    // 🔥 通知 ReActExecutor 停止（静态方法无实例上下文，conversationId 从 context 取）
     const reActExecutor = ReActExecutor.getInstance();
-    reActExecutor.abort(this.conversationId);
-    context.abortManager.abort(this.conversationId);
+    reActExecutor.abort(context.conversationId);
+    context.abortManager.abort(context.conversationId);
 
     // 🔥 清理 agentCommunication
     agentCommunicationService.clearSession(sessionId);
 
     // 🔥 resolve 等待该 session 的 pendingInteraction
-    const pendingInteraction = this.pendingInteractions.get(sessionId);
+    const pendingInteraction = SummaryHandler.pendingInteractions.get(sessionId);
     if (pendingInteraction?.resolve) {
       console.log('🛑 [SUMMARY-HANDLER] Resolve pending interaction for killed session:', sessionId);
       pendingInteraction.resolve('KILLED');
-      this.pendingInteractions.delete(sessionId);
+      SummaryHandler.pendingInteractions.delete(sessionId);
     }
 
     console.log('✅ [SUMMARY-HANDLER] Session 已 kill:', sessionId);
@@ -287,12 +295,12 @@ export class SummaryHandler {
   /**
    * 🔥 Kill 所有 running session
    */
-  killAllSessions(): void {
+  static killAllSessions(): void {
     console.log('🛑 [SUMMARY-HANDLER] Kill 所有 sessions');
-    
-    for (const [sessionId, context] of this.sessionContexts) {
+
+    for (const [sessionId, context] of SummaryHandler.sessionContexts) {
       if (context.status === 'running') {
-        this.killSession(sessionId);
+        SummaryHandler.killSession(sessionId);
       }
     }
   }
@@ -300,22 +308,22 @@ export class SummaryHandler {
   /**
    * 🔥 检查 session 是否被 kill
    */
-  isSessionKilled(sessionId: string): boolean {
-    const context = this.sessionContexts.get(sessionId);
+  static isSessionKilled(sessionId: string): boolean {
+    const context = SummaryHandler.sessionContexts.get(sessionId);
     return context?.killed ?? false;
   }
 
   /**
    * 🔥 获取 session 状态（供 UI 组件使用）
    */
-  getSessionStatus(sessionId: string): { status: 'running' | 'completed' | 'failed' | 'killed' | 'unknown'; startTime?: Date; endTime?: Date } {
-    const context = this.sessionContexts.get(sessionId);
+  static getSessionStatus(sessionId: string): { status: 'running' | 'completed' | 'failed' | 'killed' | 'unknown'; startTime?: Date; endTime?: Date } {
+    const context = SummaryHandler.sessionContexts.get(sessionId);
     if (!context) {
       // 🔥 sessionCompleted 时 context 会被删除（phase 编排清理），但 sessionList 保留终态——
       //    兜底查 sessionList，让 UI 拿到真实 startTime/endTime（否则计时器冻结后跳变）。
       //    ⚠️ 必须取最后一条：启动时 push 过一条 running、完成时再 push 一条 completed（L599/L657 双条并存），
       //    find() 会命中 running 那条（无 completedAt）→ endTime 空 → UI 活跃窗口误判"仍活跃"，计时器走满 5 分钟
-      const info = [...this.sessionList].reverse().find(s => s.sessionId === sessionId);
+      const info = [...SummaryHandler.sessionList].reverse().find(s => s.sessionId === sessionId);
       if (info) {
         // pending（已登记未启动）此时 context 已不在，按 unknown 走；running 说明 promise 已终结（完成后才删 context），按 completed 走
         const mapped = info.status === 'running' ? 'completed' as const
@@ -355,28 +363,28 @@ export class SummaryHandler {
   }
 
   getPendingInteractionSessionId(): string | undefined {
-    const first = this.pendingInteractions.values().next().value;
+    const first = SummaryHandler.pendingInteractions.values().next().value;
     return first?.sessionId;
   }
 
   async handleUserInteractionResponse(response: string): Promise<SummaryOutput> {
     console.log('[SUMMARY-HANDLER] handleUserInteractionResponse 被调用:', response);
-    console.log('[SUMMARY-HANDLER] pendingInteractions count:', this.pendingInteractions.size);
+    console.log('[SUMMARY-HANDLER] pendingInteractions count:', SummaryHandler.pendingInteractions.size);
     
-    if (this.pendingInteractions.size === 0) {
+    if (SummaryHandler.pendingInteractions.size === 0) {
       console.log('[SUMMARY-HANDLER] 没有待处理的交互请求');
       return { thinkingResult: { say_to_user: '' } };
     }
 
     // 🔥 resolve 所有等待的 interaction
-    const resolvedCount = this.pendingInteractions.size;
-    for (const [sessionId, interaction] of this.pendingInteractions) {
+    const resolvedCount = SummaryHandler.pendingInteractions.size;
+    for (const [sessionId, interaction] of SummaryHandler.pendingInteractions) {
       if (interaction.resolve) {
         console.log('[SUMMARY-HANDLER] resolve Promise for session:', sessionId, 'with:', response);
         interaction.resolve(response);
       }
     }
-    this.pendingInteractions.clear();
+    SummaryHandler.pendingInteractions.clear();
 
     console.log('[SUMMARY-HANDLER] 已 resolve', resolvedCount, '个 pending interactions');
     return { thinkingResult: { say_to_user: '' } };
@@ -389,7 +397,11 @@ export class SummaryHandler {
 
     const MAX_DEPTH = 30;
     let depth = 0;
-    this.sessionList = [];
+    // 🔥 账本静态化后绝不能在这里清 sessionList：它已是跨轮共享的历史账，
+    //    清掉 = 上一轮所有 session 终态蒸发 → UI 查账落空变 unknown → 计时器假复活走字。
+    //    并发上限由 sessionContexts（maxSessions）控制，与 sessionList 无关。
+    //    喂给 LLM 的上下文用本轮切片（sessionListRoundStart 起），保持"本轮 session 记录"的原语义。
+    const sessionListRoundStart = SummaryHandler.sessionList.length;
     const callHistory: Array<{ depth: number; actions: string[]; result: string }> = [];
     let accumulatedWriteNotes = '';
     let sessionContext: Array<{ apiRole?: string; content?: string; result?: string }> | undefined;
@@ -427,14 +439,14 @@ export class SummaryHandler {
           });
         } else if (event.type === 'sessionCompleted') {
           this.runningSessionPromises.delete(event.sessionId);
-          this.sessionContexts.delete(event.sessionId);
+          SummaryHandler.sessionContexts.delete(event.sessionId);
           
           const isPriority = this.prioritySessionIds.has(event.sessionId);
           if (isPriority) {
             this.prioritySessionIds.delete(event.sessionId);
           }
           
-          const sessionInfo = this.sessionList.find(s => s.sessionId === event.sessionId);
+          const sessionInfo = SummaryHandler.sessionList.find(s => s.sessionId === event.sessionId);
           if (sessionInfo) {
             sessionInfo.status = event.success ? 'completed' : 'failed';
           }
@@ -511,7 +523,7 @@ export class SummaryHandler {
           conversationHistory: await this.getCurrentConversationHistory(),
           depth,
           maxDepth: MAX_DEPTH,
-          sessionList: this.sessionList,
+          sessionList: SummaryHandler.sessionList.slice(sessionListRoundStart),
           callHistory,
           sessionContext,
           writeNotes: accumulatedWriteNotes,
@@ -595,12 +607,26 @@ export class SummaryHandler {
       status: 'running',
       killed: false,
       abortManager: new AbortManager(),
+      conversationId: this.conversationId,
     };
 
     // 🔥 立即加入 sessionList，让 handleGather 能看到正在运行的 session
-    this.sessionList.push(sessionInfo);
+    SummaryHandler.sessionList.push(sessionInfo);
 
     return context;
+  }
+
+  /**
+   * 🔥 kill 终态落账：killed 分支此前直接 return——sessionInfo 滞留 running、completedAt 不写、
+   *    sessionList 永远只有启动时的 running 引用条目 → UI 兜底映射成 completed 但 endTime 恒为空，
+   *    计时器定格不到真实终止时刻（只能退化用最后一条消息时间凑）。kill 后必须在此落账终态。
+   */
+  private static finalizeKilledSession(context: SessionContext): void {
+    if (context.sessionInfo.status !== 'running' && context.sessionInfo.status !== 'pending') return;
+    context.sessionInfo.status = 'killed';
+    context.sessionInfo.completedAt = new Date();
+    SummaryHandler.sessionList.push({ ...context.sessionInfo });
+    context.status = 'killed';
   }
 
   private async executeSession(
@@ -612,13 +638,14 @@ export class SummaryHandler {
       //    → getSessionStatus 永远返回 running → UI 计时器无限走字
       context.sessionInfo.status = 'failed';
       context.sessionInfo.completedAt = new Date();
-      this.sessionList.push({ ...context.sessionInfo });
+      SummaryHandler.sessionList.push({ ...context.sessionInfo });
       context.status = 'failed';
       return { sessionId: context.sessionId, success: false };
     }
 
     // 🔥 检查是否被 kill
     if (context.killed) {
+      SummaryHandler.finalizeKilledSession(context);
       return { sessionId: context.sessionId, success: false };
     }
 
@@ -649,8 +676,9 @@ export class SummaryHandler {
       executionResult = { success: false, executionTrace: `执行失败: ${error}`, completeReport: undefined };
     }
 
-    // 🔥 执行后再次检查是否被 kill
+    // 🔥 执行后再次检查是否被 kill（执行中途被终止：结果作废，但终态必须落账）
     if (context.killed) {
+      SummaryHandler.finalizeKilledSession(context);
       return { sessionId: context.sessionId, success: false };
     }
 
@@ -662,7 +690,7 @@ export class SummaryHandler {
     };
 
     // 🔥 把完成的 session 加入 sessionList（不包含 completeReport）
-    this.sessionList.push({ ...context.sessionInfo });
+    SummaryHandler.sessionList.push({ ...context.sessionInfo });
     context.status = 'completed';
 
     // 🔥 等待收尾消息落库：工具回包经异步 IPC 逐条写入 workspace.messages，gather 立即触发会让
@@ -712,7 +740,7 @@ export class SummaryHandler {
             context.status = 'failed';
             context.sessionInfo.status = 'failed';
             context.sessionInfo.completedAt = new Date();
-            this.sessionList.push({ ...context.sessionInfo });
+            SummaryHandler.sessionList.push({ ...context.sessionInfo });
           }
 
           // 🔥 异常时也触发 sessionCompleted 事件
@@ -820,7 +848,7 @@ export class SummaryHandler {
 
       const userResponse = await new Promise<string>((resolve) => {
         const interactionId = `main-${this.sessionId}-${depth}`;
-        this.pendingInteractions.set(interactionId, {
+        SummaryHandler.pendingInteractions.set(interactionId, {
           message: parsedInteraction.message,
           sessionId: interactionId,
           timestamp: Date.now(),
@@ -838,7 +866,7 @@ export class SummaryHandler {
       });
 
       const interactionId = `main-${this.sessionId}-${depth}`;
-      this.pendingInteractions.delete(interactionId);
+      SummaryHandler.pendingInteractions.delete(interactionId);
 
       callHistory.push({
         depth,
@@ -890,7 +918,7 @@ export class SummaryHandler {
 
     // 🔥 4.1 处理 killSession
     for (const sessionId of killSessionRequests) {
-      this.killSession(sessionId);
+      SummaryHandler.killSession(sessionId);
       this.triggerEvent({ type: 'sessionKilled', sessionId });
     }
 
@@ -905,7 +933,7 @@ export class SummaryHandler {
       const baseTimestamp = Date.now();
 
       for (let i = 0; i < sessionTasks.length; i++) {
-        if (this.sessionContexts.size >= this.maxSessions) {
+        if (SummaryHandler.sessionContexts.size >= SummaryHandler.maxSessions) {
           skippedTasks.push(sessionTasks[i].task);
           continue;
         }
@@ -928,7 +956,7 @@ export class SummaryHandler {
           },
           content
         );
-        this.sessionContexts.set(sessionId, context);
+        SummaryHandler.sessionContexts.set(sessionId, context);
 
         const sessionPromise = this.executeSessionAsync(context, content);
         this.runningSessionPromises.set(sessionId, sessionPromise);
@@ -939,7 +967,7 @@ export class SummaryHandler {
       }
 
       if (skippedTasks.length > 0) {
-        const limitMessage = `已创建 sessions: [${createdSessionIds.join(', ')}]。⚠️ 达到最大 session 数量限制 (${this.maxSessions})，跳过 ${skippedTasks.length} 个任务。请整理当前进度并报告给用户，让用户决定是否继续。`;
+        const limitMessage = `已创建 sessions: [${createdSessionIds.join(', ')}]。⚠️ 达到最大 session 数量限制 (${SummaryHandler.maxSessions})，跳过 ${skippedTasks.length} 个任务。请整理当前进度并报告给用户，让用户决定是否继续。`;
         callHistory.push({
           depth,
           actions: actionLabels,

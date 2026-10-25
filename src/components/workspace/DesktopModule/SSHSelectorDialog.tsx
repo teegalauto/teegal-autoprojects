@@ -332,6 +332,9 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
                   </button>
                 </div>
                 {selfError && <div className="mt-2 text-xs text-red-600">{selfError}</div>}
+                <div className="mt-2 text-[11px] text-gray-400 leading-relaxed">
+                  端口默认 22 可改。Mac 需先开「远程登录」。
+                </div>
               </div>
             )}
 

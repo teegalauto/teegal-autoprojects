@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ChevronDown, ChevronRight, XCircle } from 'lucide-react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import { MessageData } from './types';
 import MessageContent from './MessageContent';
 import MessageIcon from './MessageIcon';
 import { cn } from '@/lib/utils';
-import { useWorkspace } from '@/hooks/workspace/useWorkspace';
+import { SummaryHandler } from '@/hooks/workspace/handlers/SummaryHandler';
 
 interface SessionMessageGroupProps {
   sessionId: string;
@@ -71,30 +71,29 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
 }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
   const [now, setNow] = useState(Date.now());
-  const { summaryHandler } = useWorkspace();
 
-  // 🔥 从 SummaryHandler 获取 session 状态
+  // 🔥 从 SummaryHandler 类级账本获取 session 状态（static 账本，任何组件直接查——
+  //    不再经由 useWorkspace 的 summaryHandler：那是每组件独立的 Hook 实例，
+  //    本组件拿到的永远是 null，导致计时器只能走兜底——0s 定格/假活跃窗口的根源）
   const [sessionStatus, setSessionStatus] = useState<{ status: 'running' | 'completed' | 'failed' | 'killed' | 'unknown'; startTime?: Date; endTime?: Date }>({ status: 'unknown' });
 
   // 🔥 定期刷新 session 状态
+  const lastLoggedStatusRef = useRef<string>('');
+  const mountLoggedRef = useRef(false);
+  // 🔍 挂载标记：组件渲染即打（区别于状态 log）——探针哑火时区分「组件没渲染」vs「effect 没跑」
+  if (!mountLoggedRef.current) {
+    mountLoggedRef.current = true;
+    console.log(`[SESSION-TIMER] 挂载: ${sessionId.slice(0, 8)} | 消息数=${messages.length}`);
+  }
   useEffect(() => {
     const refreshStatus = () => {
-      if (summaryHandler) {
-        setSessionStatus(summaryHandler.getSessionStatus(sessionId));
-      } else {
-        // 🔥 handler 为 null = 轮次 process() 已结束（每轮 new SummaryHandler，结束 setSummaryHandler(null)）
-        //    → 该轮所有 session 必已终结。state 若卡在 running 会永久走字（计时器不终止的真正根源）：
-        //    转为 completed，用组内最后一条消息时间定格
-        setSessionStatus(prev => {
-          if (prev.status !== 'running') return prev;
-          const last = messages[messages.length - 1];
-          return {
-            status: 'completed',
-            startTime: prev.startTime,
-            endTime: last?.timestamp ? new Date(last.timestamp) : undefined,
-          };
-        });
+      const next = SummaryHandler.getSessionStatus(sessionId);
+      // 🔍 排查「计时器不停」：只在状态变化时打印，一轮运行即能看到 status/endTime 的真实流转
+      if (next.status !== lastLoggedStatusRef.current) {
+        console.log(`[SESSION-TIMER] ${sessionId.slice(0, 8)}: ${lastLoggedStatusRef.current || '(init)'} → ${next.status} | endTime=${next.endTime ? next.endTime.toISOString() : '无'}`);
+        lastLoggedStatusRef.current = next.status;
       }
+      setSessionStatus(next);
     };
 
     // 立即刷新一次
@@ -105,7 +104,7 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
       const interval = setInterval(refreshStatus, 1000);
       return () => clearInterval(interval);
     }
-  }, [summaryHandler, sessionId, sessionStatus.status, messages]);
+  }, [sessionId, sessionStatus.status, messages]);
 
   // 🔥 判断是否正在运行（基于 SummaryHandler 的 session 自身状态——
   //    计时器终点必须落在该 session 自己的完成时刻，不能联动 isProcessing：那是整个轮次
@@ -172,12 +171,6 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
     return lastMsgTime ? Math.max(0, lastMsgTime - startTime) : 0;
   }, [startTime, endTime, isLive, lastMsgTime, now]);
 
-  const handleKillSession = () => {
-    if (summaryHandler && sessionId) {
-      summaryHandler.killSession(sessionId);
-    }
-  };
-
   if (messages.length === 0) return null;
 
   return (
@@ -211,12 +204,7 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
             <span className="text-xs text-gray-300 dark:text-gray-600">
               ·
             </span>
-            <span className={cn(
-              "text-xs font-mono",
-              isRunning
-                ? "text-blue-500 dark:text-blue-400"
-                : "text-gray-400 dark:text-gray-500"
-            )}>
+            <span className="text-xs font-mono text-gray-400 dark:text-gray-500">
               {formatDuration(duration)}
             </span>
           </>
@@ -231,24 +219,6 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
               {getLastMessageSummary(messages)}
             </span>
           </>
-        )}
-
-        {summaryHandler && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleKillSession();
-            }}
-            className={cn(
-              'ml-auto p-1 rounded',
-              'text-gray-300 dark:text-gray-600',
-              'hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20',
-              'transition-colors'
-            )}
-            title="终止此 Session"
-          >
-            <XCircle className="w-3.5 h-3.5" />
-          </button>
         )}
       </button>
 

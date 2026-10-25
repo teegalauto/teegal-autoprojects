@@ -480,11 +480,9 @@ export const useWorkspaceHandlers = (workspace: any) => {
     handleCancel: () => {
       console.log('🛑 [WORKSPACE-HANDLERS] 用户请求中止');
 
-      const summaryHandler = workspace.summaryHandler;
-      if (summaryHandler) {
-        summaryHandler.killAllSessions();
-        workspace.setSummaryHandler(null);
-      }
+      // 🔥 killAllSessions 走类级账本（static）：即使 UI state 的 handler 丢失也能中止全部 session
+      SummaryHandler.killAllSessions();
+      workspace.setSummaryHandler(null);
 
       globalAbortManager.abort();
 

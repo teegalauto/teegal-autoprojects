@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { ArrowUp, X, StopCircle, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check, Cloud, Power, Brain } from "lucide-react";
+import { ArrowUp, X, Square, Paperclip, Loader2, ChevronDown, Plus, Settings, AtSign, Key, Check, Cloud, Power, Brain } from "lucide-react";
 import { sshListActive, sshCloseInstance } from "@/utils/systemtools/sshInstance";
 import { FileAttachment } from "../types/ChatTypes";
 import FilePreviewList from "./FilePreviewList";
@@ -1033,17 +1033,15 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
               </DropdownMenuContent>
             </DropdownMenu>
             
-            {/* 发送/取消按钮 */}
+            {/* 发送/取消按钮：两者形状统一（圆形按键）；取消=红圆+白方块（ChatGPT 同款语义） */}
             {isProcessing ? (
-              <Button
-                variant="default"
-                size="sm"
+              <button
                 onClick={onCancel}
-                className="h-8 w-8 p-0 bg-red-600 hover:bg-red-700"
+                className="h-8 w-8 p-0 bg-red-600 hover:bg-red-700 border-0 text-white rounded-full flex items-center justify-center transition-colors"
                 title="取消执行"
               >
-                <StopCircle className="h-4 w-4" />
-              </Button>
+                <Square size={13} strokeWidth={3} />
+              </button>
             ) : (
               <button
                 onClick={onSendMessage}
