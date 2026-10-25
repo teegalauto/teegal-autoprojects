@@ -99,7 +99,7 @@ const UserMessageBubble: React.FC<UserMessageBubbleProps> = React.memo(({ messag
   return (
     <div className="flex justify-end mb-4">
       <div className="max-w-[70%] relative group">
-        <div className="bg-[#F7F4ED] text-black px-4 py-2.5 rounded-2xl rounded-br-md shadow-sm antialiased">
+        <div className="bg-[#f4f4f4] text-black px-4 py-2.5 rounded-3xl rounded-br-md antialiased">
           <div className="prose prose-sm max-w-none break-words">
             {message.content.split("\n").map((line, index) => {
               // 🔥 行内代码高亮：先按 `code` 分割，代码段用 <code> 渲染，其余走 LinkText

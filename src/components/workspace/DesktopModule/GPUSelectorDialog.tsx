@@ -51,10 +51,14 @@ const GPUSelectorDialog: React.FC<GPUSelectorDialogProps> = ({
   const [selectedGpu, setSelectedGpu] = useState<GPUOption | null>(null);
   const [gpuOptions, setGpuOptions] = useState<GPUOption[]>([]);
   const [loading, setLoading] = useState(false);
+  // 🔥 加载失败显性化：此前所有失败被静默吞掉（catch→console.warn），用户只看到空页面，
+  //    远程无从诊断（真实案例：部分 Mac 用户 local-backend 未起来，弹窗空白）
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // 🔥 从 API 获取 GPU 规格列表和可用性
   const fetchGpuData = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       // 并行获取规格列表和可用性
       const [specsResp, availabilityResp] = await Promise.all([
@@ -126,7 +130,12 @@ const GPUSelectorDialog: React.FC<GPUSelectorDialogProps> = ({
       });
 
       setGpuOptions(specs);
-    } catch (error) {
+      if (specs.length === 0) {
+        const st = (r: Response) => `HTTP ${r.status}`;
+        setLoadError(`规格接口异常（specs: ${st(specsResp)} / availability: ${st(availabilityResp)}）——本机服务可能未启动或云端不可达`);
+      }
+    } catch (error: any) {
+      setLoadError(`连接本机服务失败：${error?.message || String(error)}（local-backend 未运行？）`);
       console.warn('[GPU-SELECTOR] 获取数据失败:', error);
     } finally {
       setLoading(false);
@@ -208,9 +217,18 @@ const GPUSelectorDialog: React.FC<GPUSelectorDialogProps> = ({
           )}
 
           {gpuOptions.length === 0 && !loading && (
-            <div className="text-center text-gray-500 py-8">
-              暂无可用的计算实例规格
-            </div>
+            loadError ? (
+              <div className="text-center py-8">
+                <div className="text-red-600 text-sm mb-3">{loadError}</div>
+                <button onClick={fetchGpuData} className="px-4 py-1.5 text-sm rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors">
+                  重试
+                </button>
+              </div>
+            ) : (
+              <div className="text-center text-gray-500 py-8">
+                暂无可用的计算实例规格
+              </div>
+            )
           )}
           
           {/* 🔥 不再按云厂商分组，混合显示所有 GPU 规格 */}

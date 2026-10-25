@@ -159,13 +159,26 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
   const [confirmCloseId, setConfirmCloseId] = useState<string | null>(null); // 关机二次确认（行内，不弹窗）
   useEffect(() => {
     let cancelled = false;
+    // 🔥 空结果二次确认：后端同步云端资源表（清表重建）的瞬间，sync:false 读本地表会拿到
+    // 空窗结果——直接采信会导致计数灯"忽然熄灭几秒又亮"。连续 2 个轮询周期都空才真正清零，
+    // 瞬时抖动被旧列表兜住；代价是真正关机后灯最多晚 60s 灭（无感知成本）
+    let emptyStreak = 0;
     const refresh = () => {
       // 🔥 必须带 userId：本地资源表按 user_id 过滤（自绑机子只存在本地表，漏传 = 永远 0 条）
       sshListActive(userId, { sync: false })
         .then(r => {
+          if (cancelled) return;
           // 🔍 排查「开机了但图标不亮」：打印查询结果与实例摘要（rentalId/状态）
           console.log(`[INSTANCE-ICON] ok=${r.ok} count=${r.instances?.length ?? 0}${r.error ? ` err=${r.error}` : ''} | ${r.instances?.map((i: any) => `${i.cloud_rental_id || i.id}:${i.status}`).join(', ') || '(空)'}`);
-          if (!cancelled && r.ok) setActiveInstances(r.instances || []);
+          if (!r.ok) return; // 查询失败：保留上次列表，宁可慢灭不可错灭
+          const next = r.instances || [];
+          if (next.length > 0) {
+            emptyStreak = 0;
+            setActiveInstances(next);
+            return;
+          }
+          emptyStreak++;
+          if (emptyStreak >= 2) setActiveInstances([]);
         })
         .catch(e => console.warn('[INSTANCE-ICON] 查询异常:', e));
     };
@@ -660,6 +673,8 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
   return (
     <div className="pt-2 relative">
+      {/* ChatGPT 式渐变淡出：消息滚动到输入区上方时向下淡出，替代生硬分隔线（pointer-events-none 防点击劫持） */}
+      <div className="absolute -top-8 left-0 right-0 h-8 bg-gradient-to-t from-white to-transparent pointer-events-none" />
       {/* 文件预览区域 - 紧跟在输入框上方，增加左边距 */}
       {files.length > 0 && (
         <div className="mb-3 pl-2">
@@ -710,9 +725,9 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
         </div>
       )}
 
-      {/* 输入容器 - 简洁高级的白色卡片样式 */}
+      {/* 输入容器 - ChatGPT 风格：白画布上靠发丝边框 + 大圆角 + 极轻阴影浮出，聚焦反馈走边框不走阴影 */}
       <div
-        className="mt-2 mb-4 mx-2 cursor-text bg-white rounded-2xl border border-gray-200 shadow-md hover:shadow-xl hover:border-gray-300 transition-all duration-200"
+        className="mt-2 mb-4 mx-2 cursor-text bg-white rounded-3xl border border-[#e5e5e5] shadow-[0_2px_16px_rgba(0,0,0,0.06)] hover:border-[#d4d4d4] focus-within:border-[#c4c4c4] transition-colors duration-200"
         onClick={(e) => {
           // 🔥 点击容器时聚焦到 textarea，除非点击的是按钮区域
           const target = e.target as HTMLElement;
@@ -1033,7 +1048,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
               <button
                 onClick={onSendMessage}
                 disabled={!input.trim() && files.length === 0}
-                className="h-8 w-8 p-0 bg-black hover:bg-gray-800 border-0 text-white disabled:bg-black disabled:opacity-100 rounded-md flex items-center justify-center transition-colors"
+                className="h-8 w-8 p-0 bg-black hover:bg-gray-800 border-0 text-white disabled:bg-black disabled:opacity-100 rounded-full flex items-center justify-center transition-colors"
                 title="发送"
               >
                 <ArrowUp size={16} />

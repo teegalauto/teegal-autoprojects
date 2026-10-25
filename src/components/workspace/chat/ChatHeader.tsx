@@ -232,7 +232,7 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
   return (
     <>
       <div 
-        className="flex items-center justify-between px-4 py-2 border-b bg-white flex-shrink-0 h-12"
+        className="flex items-center justify-between px-4 py-2 border-b border-[#ececec] bg-white flex-shrink-0 h-12"
         style={isElectron ? { WebkitAppRegion: 'drag' } as any : {}}
       >
         {/* 左侧：标题 - macOS 需要留出红绿灯按钮空间 */}

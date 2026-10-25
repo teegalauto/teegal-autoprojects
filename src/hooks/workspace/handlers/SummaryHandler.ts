@@ -311,6 +311,22 @@ export class SummaryHandler {
   getSessionStatus(sessionId: string): { status: 'running' | 'completed' | 'failed' | 'killed' | 'unknown'; startTime?: Date; endTime?: Date } {
     const context = this.sessionContexts.get(sessionId);
     if (!context) {
+      // 🔥 sessionCompleted 时 context 会被删除（phase 编排清理），但 sessionList 保留终态——
+      //    兜底查 sessionList，让 UI 拿到真实 startTime/endTime（否则计时器冻结后跳变）。
+      //    ⚠️ 必须取最后一条：启动时 push 过一条 running、完成时再 push 一条 completed（L599/L657 双条并存），
+      //    find() 会命中 running 那条（无 completedAt）→ endTime 空 → UI 活跃窗口误判"仍活跃"，计时器走满 5 分钟
+      const info = [...this.sessionList].reverse().find(s => s.sessionId === sessionId);
+      if (info) {
+        // pending（已登记未启动）此时 context 已不在，按 unknown 走；running 说明 promise 已终结（完成后才删 context），按 completed 走
+        const mapped = info.status === 'running' ? 'completed' as const
+          : info.status === 'pending' ? 'unknown' as const
+          : info.status;
+        return {
+          status: mapped,
+          startTime: info.startedAt,
+          endTime: info.completedAt,
+        };
+      }
       return { status: 'unknown' };
     }
     return {
@@ -592,6 +608,12 @@ export class SummaryHandler {
     content: string
   ): Promise<{ sessionId: string; completeReport?: string; success: boolean }> {
     if (!context.thinkingResult?.tools) {
+      // 🔥 无工具提前返回：必须翻转状态并入 sessionList，否则 context 滞留 running
+      //    → getSessionStatus 永远返回 running → UI 计时器无限走字
+      context.sessionInfo.status = 'failed';
+      context.sessionInfo.completedAt = new Date();
+      this.sessionList.push({ ...context.sessionInfo });
+      context.status = 'failed';
       return { sessionId: context.sessionId, success: false };
     }
 
@@ -643,8 +665,10 @@ export class SummaryHandler {
     this.sessionList.push({ ...context.sessionInfo });
     context.status = 'completed';
 
-    // 🔥 等待一小段时间，确保最后一条消息已写入 workspace.messages
-    await new Promise(resolve => setTimeout(resolve, 100));
+    // 🔥 等待收尾消息落库：工具回包经异步 IPC 逐条写入 workspace.messages，gather 立即触发会让
+    //    summarizer 消息先于迟到的工具回包到达（用户观感"subagent 尾巴慢慢补上，吓以为坏了"）。
+    //    100ms 实测不够（大结果消息可拖到数百毫秒），放宽到 500ms；根治需 onMessage 完成计数，暂不引入
+    await new Promise(resolve => setTimeout(resolve, 500));
 
     // 🔥 返回执行结果，供 callHistory 记录
     return {
@@ -682,7 +706,15 @@ export class SummaryHandler {
           resolve(result);
         } catch (error) {
           console.error(`[SUMMARY-HANDLER] executeSessionAsync 异常:`, error);
-          
+
+          // 🔥 异常时也必须翻转状态（否则 context 滞留 running → UI 计时器无限走字）再触发事件
+          if (context.status === 'running') {
+            context.status = 'failed';
+            context.sessionInfo.status = 'failed';
+            context.sessionInfo.completedAt = new Date();
+            this.sessionList.push({ ...context.sessionInfo });
+          }
+
           // 🔥 异常时也触发 sessionCompleted 事件
           this.triggerEvent({
             type: 'sessionCompleted',

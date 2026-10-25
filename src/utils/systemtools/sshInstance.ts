@@ -300,13 +300,14 @@ export async function plinkExec(
   port: number = 22,
   timeout: number = 30
 ): Promise<{ out: string; fingerprint?: string; err?: string }> {
-  const base = `${PLINK_PATH} -ssh -P ${port} -batch -pw $env:SSHPASS ${user}@${host}`.replace(/\s+/g, ' ');
+  // 🔥 & 调用运算符必须带：PLINK_PATH 是带引号路径，PS 里引号路径直接跟参数 = ParserError"意外的标记"
+  const base = `& ${PLINK_PATH} -ssh -P ${port} -batch -pw $env:SSHPASS ${user}@${host}`.replace(/\s+/g, ' ');
   // 🔥 2>&1 必须带：-batch 的 "host key is not cached" 错误（含指纹）走 stderr，不合并就拿不到指纹
   const r1 = await runLocalShellDetailed(`${base} "${command}" 2>&1`, userId, credentialName, timeout);
   let out = r1.out;
   const fp = out.match(/SHA256:[A-Za-z0-9+/=]+/);
   if (fp && /host key is not cached/i.test(out)) {
-    const r2 = await runLocalShellDetailed(`${PLINK_PATH} -ssh -P ${port} -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName, timeout);
+    const r2 = await runLocalShellDetailed(`& ${PLINK_PATH} -ssh -P ${port} -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName, timeout);
     return { out: r2.out, fingerprint: fp[0], err: r2.err };
   }
   return { out, err: r1.err };

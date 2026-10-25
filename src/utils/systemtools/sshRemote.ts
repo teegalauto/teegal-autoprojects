@@ -185,11 +185,12 @@ export async function executeSshRemoteTool(
     if (authFail && conn.credentialName) {
       if (isWindows()) {
         // pscp 两步走：-batch 首连拿 hostkey 指纹 → 带 -hostkey 重连（同 plinkExec 约定）
+        // 🔥 & 调用运算符必须带：PSCP_PATH 是带引号路径，PS 里引号路径直接跟参数 = ParserError
         const pushArgs = `-P ${conn.port} -batch -pw $env:SSHPASS -r "${localPath}" ${target}`;
-        const r1 = await runLocalShellDetailed(`${PSCP_PATH} ${pushArgs} 2>&1`.replace(/\s+/g, ' '), context?.userId, conn.credentialName, timeoutSec);
+        const r1 = await runLocalShellDetailed(`& ${PSCP_PATH} ${pushArgs} 2>&1`.replace(/\s+/g, ' '), context?.userId, conn.credentialName, timeoutSec);
         const fp = r1.out.match(/SHA256:[A-Za-z0-9+/=]+/);
         if (fp && /host key is not cached/i.test(r1.out)) {
-          r = await runLocalShellDetailed(`${PSCP_PATH} -hostkey "${fp[0]}" ${pushArgs} 2>&1`.replace(/\s+/g, ' '), context?.userId, conn.credentialName, timeoutSec);
+          r = await runLocalShellDetailed(`& ${PSCP_PATH} -hostkey "${fp[0]}" ${pushArgs} 2>&1`.replace(/\s+/g, ' '), context?.userId, conn.credentialName, timeoutSec);
         } else {
           r = r1;
         }
@@ -202,7 +203,12 @@ export async function executeSshRemoteTool(
     const secs = ((Date.now() - started) / 1000).toFixed(1);
     if (scpFailed) {
       const reason = (r.err || r.out || '').trim().split('\n').filter(Boolean).slice(-2).join('; ') || 'scp 无输出（可能超时）';
-      return fail(`推送失败（${secs}s）: ${reason}`, r.out ? r.out.replace(/\n+$/, '').split('\n') : []);
+      // 🔥 本地路径不存在的自愈：LLM 拿不到项目绝对路径时爱凭猜测拼 localPath（用户名/code_path/clone 套层全靠猜），
+      // 教它改走 projectId+filePath 防呆通道（系统内解析真实磁盘位置），省掉连环试错轮
+      const hint = /stat local/i.test(reason)
+        ? '。💡 本地路径不存在：不要猜项目本地路径，改传 projectId+filePath（项目内相对路径）+remotePath，系统自动解析真实磁盘位置'
+        : '';
+      return fail(`推送失败（${secs}s）: ${reason}${hint}`, r.out ? r.out.replace(/\n+$/, '').split('\n') : []);
     }
     return ok([`✅ 已推送 ${localPath} → ${conn.user}@${conn.host}:${remotePath}（${secs}s）`]);
   }

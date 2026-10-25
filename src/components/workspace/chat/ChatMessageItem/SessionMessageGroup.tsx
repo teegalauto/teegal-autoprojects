@@ -81,6 +81,19 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
     const refreshStatus = () => {
       if (summaryHandler) {
         setSessionStatus(summaryHandler.getSessionStatus(sessionId));
+      } else {
+        // 🔥 handler 为 null = 轮次 process() 已结束（每轮 new SummaryHandler，结束 setSummaryHandler(null)）
+        //    → 该轮所有 session 必已终结。state 若卡在 running 会永久走字（计时器不终止的真正根源）：
+        //    转为 completed，用组内最后一条消息时间定格
+        setSessionStatus(prev => {
+          if (prev.status !== 'running') return prev;
+          const last = messages[messages.length - 1];
+          return {
+            status: 'completed',
+            startTime: prev.startTime,
+            endTime: last?.timestamp ? new Date(last.timestamp) : undefined,
+          };
+        });
       }
     };
 
@@ -92,10 +105,23 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
       const interval = setInterval(refreshStatus, 1000);
       return () => clearInterval(interval);
     }
-  }, [summaryHandler, sessionId, sessionStatus.status]);
+  }, [summaryHandler, sessionId, sessionStatus.status, messages]);
 
-  // 🔥 判断是否正在运行（基于 SummaryHandler 的状态）
+  // 🔥 判断是否正在运行（基于 SummaryHandler 的 session 自身状态——
+  //    计时器终点必须落在该 session 自己的完成时刻，不能联动 isProcessing：那是整个轮次
+  //    （summarizer+reactor 串联多个 session）的行进信号，session A 完成后 reactor 还在跑 B，
+  //    联动会让 A 的计时器陪跑到轮次结束）
   const isRunning = sessionStatus.status === 'running';
+
+  // 🔥 实时活动感知：组内跨轮间隙（LLM 思考中）没有新消息，但消息仍会继续到来——
+  //    只认 SummaryHandler 状态会让计时器在间隙里冻结、下轮落地时跳变（真实墙钟被切碎）。
+  //    活跃窗口只服务 unknown（历史回放/状态链拿不到）：completed/failed/killed/滞留 running 一律不进
+  const LIVE_WINDOW_MS = 5 * 60 * 1000;
+  const lastMsgTime = useMemo(() => {
+    if (messages.length === 0) return null;
+    const last = messages[messages.length - 1];
+    return last.timestamp ? new Date(last.timestamp).getTime() : null;
+  }, [messages]);
 
   // 🔥 获取开始时间（优先使用 SummaryHandler 的记录，否则使用第一条消息时间）
   const startTime = useMemo(() => {
@@ -115,35 +141,36 @@ export const SessionMessageGroup: React.FC<SessionMessageGroupProps> = ({
     return null;
   }, [sessionStatus.endTime]);
 
-  // 🔥 实时更新计时器（只在 Session 运行时更新）
+  const isLive = isRunning
+    // 🔥 窗口只给 unknown（历史回放/状态链缺失）；status 明确是终态或 running（被 isProcessing 修正过）都不进
+    || (sessionStatus.status === 'unknown' && !endTime
+        && !!lastMsgTime && now - lastMsgTime < LIVE_WINDOW_MS);
+
+  // 🔥 实时更新计时器（活跃期间持续走字，含跨轮思考间隙）
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isLive) return;
 
     const interval = setInterval(() => {
       setNow(Date.now());
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isRunning]);
+  }, [isLive]);
 
-  // 🔥 计算持续时间
+  // 🔥 计算持续时间（墙钟语义：运行/活跃 → now-start 走字；已结束 → 终点-start 定格）
   const duration = useMemo(() => {
     if (!startTime) return 0;
     if (endTime) {
-      // Session 已结束，使用 SummaryHandler 记录的结束时间
+      // Session 已结束，使用 SummaryHandler 记录的结束时间（sessionList 兜底后有真实终态）
       return endTime - startTime;
     }
-    if (!isRunning && messages.length > 0) {
-      // Session 已结束（从数据库加载，没有 SummaryHandler 记录），使用最后一条消息的时间戳
-      const lastMessage = messages[messages.length - 1];
-      const lastTime = lastMessage.timestamp ? new Date(lastMessage.timestamp).getTime() : null;
-      if (lastTime) {
-        return lastTime - startTime;
-      }
+    if (isLive) {
+      // 运行中或仍在活跃窗口内，跟随当前时间
+      return now - startTime;
     }
-    // Session 运行中，使用当前时间
-    return now - startTime;
-  }, [startTime, endTime, isRunning, messages, now]);
+    // 冷加载/已终结且无终态记录：退化为消息跨度（最后一条消息时间）
+    return lastMsgTime ? Math.max(0, lastMsgTime - startTime) : 0;
+  }, [startTime, endTime, isLive, lastMsgTime, now]);
 
   const handleKillSession = () => {
     if (summaryHandler && sessionId) {

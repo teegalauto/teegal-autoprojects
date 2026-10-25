@@ -14,8 +14,8 @@ interface MessageBubbleProps {
   onStepInput?: (stepId: string, input: Record<string, any>) => void;
 }
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ 
-  message, 
+const MessageBubble: React.FC<MessageBubbleProps> = ({
+  message,
   conversationId,
   isProcessing = false,
   onFileView,
@@ -50,7 +50,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
 
   if (message.role === 'user') {
     return (
-      <UserMessageBubble 
+      <UserMessageBubble
         message={message}
         onFileView={onFileView}
         onFileDownload={onFileDownload}

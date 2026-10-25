@@ -23,13 +23,14 @@ const KATEX_ERROR_STYLE = `
   font-size: 0.9em !important;
 }
 `;
-import { ChevronDown, ChevronUp, Copy, Check, Loader2, FileText, FolderOpen, ExternalLink, Image as ImageIcon } from 'lucide-react';
+import { ChevronDown, ChevronUp, Copy, Check, Loader2, FolderOpen, ExternalLink, Image as ImageIcon, Film } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MessageData } from './types';
 import { PreviewViewer } from '@/components/workspace/DesktopModule/PreviewViewer';
 import { TerminalOutputView, isTerminalOutput } from './TerminalOutputView';
 import { ECSWebSocketManager } from '@/utils/workspace/ECSWebSocketManager';
 import ImageViewer from '@/components/workspace/common/media/ImageViewer';
+import VideoPlayer from '@/components/workspace/common/media/VideoPlayer';
 import type { FileAttachment } from '@/components/workspace/types/ChatTypes';
 
 // 🔥 预处理 LaTeX 公式：统一转换为 remark-math 支持的格式
@@ -541,10 +542,13 @@ const preprocessNumericRanges = (text: string): string => {
 // 3. data 行不以 | 开头
 //    如：0.01 | 0.905 | 0.135 | | 0.05 | ...
 // 4. 表格紧跟段落文字，缺少空行（remark-gfm 要求表格前后有空行）
+// 5. 表头行没有 |（如「测试项, 结果」）或与分隔线之间被空行隔断
+//    → remark-gfm 整段按纯文本渲染，表头孤零零
+// 6. 表头行首混入段落文字（如「结果如下 | a | b |」）→ 段落文字挤占表头格
 //
-// 策略：找到 separator 行 → 确定列数 → 把 header+data 按 | 拆成 cell → 按列数重组
+// 策略：找到 separator 行 → 确定列数 → header 按格直取（含补救）→ data 按 | 拆成 cell → 按列数重组
 // 1. 行级拆分：把 separator 前后合并的其他内容拆到独立行
-// 2. cell 重组：不依赖 startsWith('|')、不依赖列数整除，自动补 | 和空 cell
+// 2. cell 重组：data 不依赖 startsWith('|')、不依赖列数整除，自动补 | 和空 cell
 // 3. 空行边界：header 前 + data 后自动加空行（remark-gfm 要求）
 const preprocessMarkdownTables = (text: string): string => {
   // 快速检测：必须包含 | 且有 separator 行（---）
@@ -587,14 +591,46 @@ const preprocessMarkdownTables = (text: string): string => {
     const cols = trimmed.split('|').map(s => s.trim()).filter(s => s).length;
     if (cols < 1) { i++; continue; }
 
-    // header 行（紧邻 separator 上一行，且包含 |）
-    const headerIdx = i - 1;
-    if (headerIdx < 0 || !lines[headerIdx].includes('|')) { i++; continue; }
-
     // data 行（separator 后连续包含 | 的非空行）
     let endIdx = i + 1;
     while (endIdx < lines.length && lines[endIdx].includes('|') && lines[endIdx].trim()) endIdx++;
     if (endIdx === i + 1) { i++; continue; }
+
+    // 表头获取：优先取紧邻 separator 上一行；补救两种 remark-gfm 会整段按文本渲染（表头孤零零）的场景：
+    //   补救 1：表头与分隔线之间被空行隔断 → 上溯跳过空行拿含 | 的行
+    //   补救 2：表头行没有 |（LLM 常写逗号分隔表头）→ 按逗号/顿号/制表符拆，格数与列数一致才采用
+    let headerIdx = i - 1;
+    let headerCells: string[] | null = null;
+    let leadText = ''; // 表头行首混入的段落文字（「结果如下 | a | b |」），重建时留在表格外
+    const isSepLine = (l: string) => /^[\s|:\-]+$/.test(l.trim()) && l.includes('---');
+    if (headerIdx >= 0 && lines[headerIdx].includes('|') && !isSepLine(lines[headerIdx])) {
+      const raw = lines[headerIdx].trim();
+      let cells = raw.split('|').map(s => s.trim());
+      if (cells[0] === '') cells.shift();
+      if (cells.length && cells[cells.length - 1] === '') cells.pop();
+      // 行首混入段落文字：格数超过列数时，超出部分留在表格外
+      if (!raw.startsWith('|') && cells.length > cols) {
+        leadText = cells.slice(0, cells.length - cols).filter(Boolean).join(' ');
+        cells = cells.slice(cells.length - cols);
+      }
+      headerCells = cells;
+    } else {
+      let up = headerIdx;
+      while (up >= 0 && !lines[up].trim()) up--;
+      if (up >= 0 && lines[up].includes('|') && !isSepLine(lines[up])) {
+        // 补救 1：空行隔断
+        headerIdx = up;
+        const cells = lines[up].trim().split('|').map(s => s.trim());
+        if (cells[0] === '') cells.shift();
+        if (cells.length && cells[cells.length - 1] === '') cells.pop();
+        headerCells = cells;
+      } else if (headerIdx >= 0 && lines[headerIdx].trim() && !/^[#>*+\-]|\d+\./.test(lines[headerIdx].trim())) {
+        // 补救 2：无管道表头（排除标题/列表/引用行，避免误收编）
+        const parts = lines[headerIdx].split(/[,，、\t]/).map(s => s.trim()).filter(Boolean);
+        if (parts.length === cols) headerCells = parts;
+      }
+    }
+    if (!headerCells || headerCells.length === 0) { i++; continue; }
 
     // 规范化每行：确保以 | 开头和结尾（修复 data 行不以 | 开头的情况）
     const normalize = (line: string): string => {
@@ -605,17 +641,14 @@ const preprocessMarkdownTables = (text: string): string => {
       return t;
     };
 
-    const headerFixed = normalize(lines[headerIdx]);
     const dataFixed = lines.slice(i + 1, endIdx).map(normalize).filter(l => l);
 
-    // 拼接所有行，按 | 拆分成 cells
-    const allBlock = [headerFixed, ...dataFixed].join(' ');
-    const rawCells = allBlock.split('|').map(c => c.trim());
+    // data 行按 | 拆成 cells 拼流，按 cols 分行，跳过行间空 cell（| | 合并行产生的空分隔）
+    const rawCells = dataFixed.join(' ').split('|').map(c => c.trim());
     while (rawCells.length && rawCells[0] === '') rawCells.shift();
     while (rawCells.length && rawCells[rawCells.length - 1] === '') rawCells.pop();
 
-    // 按 cols 分行，跳过行间空 cell（| | 合并行产生的空分隔）
-    const rows: string[][] = [];
+    const rows: string[][] = [headerCells];
     let current: string[] = [];
     for (const cell of rawCells) {
       if (current.length === cols) {
@@ -638,14 +671,19 @@ const preprocessMarkdownTables = (text: string): string => {
     // 数据行却是「维度名 | A值 | B值」正确对齐 → 渲染后首列表头被 A 占用、末列表头空白，
     // 用户对照数据会搞蒙。判定：表头尾部空 + 首列非空 + 数据行确实占满全部列 → 空位旋转到行首
     const header = rows[0];
-    const tailEmpty = header[header.length - 1] === '';
-    const dataUsesAllCols = rows.slice(1).some(r => r[r.length - 1] !== '');
-    if (tailEmpty && header[0] !== '' && dataUsesAllCols) {
-      header.pop();
-      header.unshift('');
+    if (header.length === cols) {
+      const tailEmpty = header[header.length - 1] === '';
+      const dataUsesAllCols = rows.slice(1).some(r => r[r.length - 1] !== '');
+      if (tailEmpty && header[0] !== '' && dataUsesAllCols) {
+        header.pop();
+        header.unshift('');
+      }
     }
+    // 表头格数与分隔线对齐（remark-gfm 按分隔线定列数）：多截少补
+    while (header.length > cols) header.pop();
+    while (header.length < cols) header.push('');
 
-    // 重建表格：空行 + header + separator + data + 空行
+    // 重建表格：（行首段落文字）+ 空行 + header + separator + data + 空行
     const separator = '|' + Array(cols).fill('---').join('|') + '|';
     const tableLines = [
       '',
@@ -654,6 +692,7 @@ const preprocessMarkdownTables = (text: string): string => {
       ...rows.slice(1).map(r => '| ' + r.join(' | ') + ' |'),
       ''
     ];
+    if (leadText) tableLines.unshift(leadText);
 
     lines.splice(headerIdx, endIdx - headerIdx, ...tableLines);
     i = headerIdx + tableLines.length;
@@ -662,97 +701,143 @@ const preprocessMarkdownTables = (text: string): string => {
   return lines.join('\n');
 };
 
-// 🔥 检测本地路径（白名单制）
+// 🔥 检测本地路径（白名单制）——AST 层内联链接化（替代旧版"消息末尾直达框"）
 // 策略：只匹配确定是用户本地路径的模式，不匹配云端执行环境路径
 // 匹配的三种模式：
 //   1. Windows 绝对路径：C:\Users\file.txt 或 D:/path/to/file
 //   2. Unix home 路径：~/Documents/file
 //   3. macOS 绝对路径：/Users/username/file
 // 不匹配的路径（云端环境路径）：/tmp/ /var/ /home/ /app/ /volume/ /root/ 等
-const extractLocalPaths = (text: string): string[] => {
-  const paths: string[] = [];
+// 已知局限：Windows 路径含空格时只能识别到最后一个空格前（正则字符类不含空格，扩了误判风险大于收益）
 
-  // 移除多行代码块；行内代码只剥离反引号、保留内容参与识别
-  // （LLM 常用反引号包裹路径做代码样式，整段删除会导致路径无法识别）
-  const textWithoutCodeBlocks = text
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/`([^`]+)`/g, '$1');
+// 常见文件扩展名（用于验证路径是否以有效文件结尾）
+const FILE_EXT_PATTERN = /\.[a-zA-Z]{1,8}$/;
 
-  // 移除 URL
-  const urlRegex = /https?:\/\/[^\s]+/g;
-  const textWithoutUrls = textWithoutCodeBlocks.replace(urlRegex, '');
+// 已知的可识别目录名（路径最后一段）
+const KNOWN_DIR_NAMES = /^(output|files|docs|data|temp|tmp|downloads|desktop|documents|webapp|project|workspace)$/i;
 
-  // 常见文件扩展名（用于验证路径是否以有效文件结尾）
-  const fileExtPattern = /\.[a-zA-Z]{1,8}$/;
+// 单遍扫描正则：三种路径模式合一（Windows 盘符 / ~/ home / /Users/ mac）
+const LOCAL_PATH_SCAN = /(?:[a-zA-Z]:[\\\/][\w\-.\/\\\u4e00-\u9fa5]+|~\/[\w\-.\/\u4e00-\u9fa5]+|\/Users\/[\w\-.\/\u4e00-\u9fa5]+)/g;
 
-  // 已知的可识别目录名（路径最后一段）
-  const knownDirNames = /^(output|files|docs|data|temp|tmp|downloads|desktop|documents|webapp|project|workspace)$/i;
+/**
+ * 校验候选串是否为有效本地路径；有效则返回 { path, rest }：
+ * - path：修剪尾部标点后的干净路径（作为链接文本与点击目标）
+ * - rest：修剪掉的尾部标点（需拼回原文文本流）
+ * 无效返回 null。校验规则与旧版 addPath 一致。
+ */
+const tryLocalPath = (raw: string): { path: string; rest: string } | null => {
+  let path = raw.trim();
+  if (path.length <= 1) return null;
 
-  const addPath = (raw: string) => {
-    let path = raw.trim();
+  // 修剪尾部标点（但保留扩展名中的点）
+  let rest = '';
+  const tailPunct = path.match(/[.,;:!?"'。，；：！？\s\)]+$/);
+  if (tailPunct) {
+    rest = tailPunct[0];
+    path = path.slice(0, path.length - tailPunct[0].length);
+  }
+  if (path.length <= 1) return null;
 
-    // 清理开头
-    path = path.replace(/^\/+/, '');
-    // 清理结尾标点（但保留扩展名中的点）
-    path = path.replace(/[.,;:!?"'。，；：！？"'\s\)]+$/, '');
+  // 排除中文紧跟路径的情况：如果路径以中文结尾，说明路径嵌入在中文语境中
+  if (/[\u4e00-\u9fa5]$/.test(path)) return null;
+  // 路径中间有中文目录名时排除（允许中文文件名，但不允许中文目录名）
+  if (/[\/\\][\u4e00-\u9fa5]+[\/\\]/.test(path)) return null;
 
-    if (path.length <= 1) return;
+  // 路径最后一段
+  const lastSegment = path.split(/[\/\\]/).pop() || '';
 
-    // 排除中文紧跟路径的情况：如果路径以中文结尾，说明路径嵌入在中文语境中
-    if (/[\u4e00-\u9fa5]$/.test(path)) return;
-    // 路径中间有中文目录名时排除（允许中文文件名，但不允许中文目录名）
-    if (/[\/\\][\u4e00-\u9fa5]+[\/\\]/.test(path)) return;
+  // 必须有文件扩展名，或者是已知目录名
+  const hasExtension = FILE_EXT_PATTERN.test(lastSegment);
+  const isKnownDir = KNOWN_DIR_NAMES.test(lastSegment);
+  const isWindowsAbsolute = /^[a-zA-Z]:[\/\\]/.test(path);
+  const isUnixHome = /^~\//.test(path);
+  const isMacAbsolute = /^\/Users\//.test(path);
 
-    // 路径最后一段
-    const lastSegment = path.split(/[\/\\]/).pop() || '';
-
-    // 必须有文件扩展名，或者是已知目录名
-    const hasExtension = fileExtPattern.test(lastSegment);
-    const isKnownDir = knownDirNames.test(lastSegment);
-    const isWindowsAbsolute = /^[a-zA-Z]:[\/\\]/.test(path);
-    const isUnixHome = /^~\//.test(path);
-    const isMacAbsolute = /^Users\//.test(path); // 去掉前导 / 后的 /Users/...
-
-    // 相对路径（非 Windows、非 home、非 macOS 绝对）：必须有扩展名
-    if (!isWindowsAbsolute && !isUnixHome && !isMacAbsolute) {
-      if (!hasExtension) return;
-    }
-
-    // Windows 绝对路径或 macOS 绝对路径或 home 路径，即使没有扩展名也允许
-    if (!hasExtension && !isKnownDir && !isWindowsAbsolute && !isUnixHome && !isMacAbsolute) return;
-
-    if (!paths.includes(path)) {
-      paths.push(path);
-    }
-  };
-
-  // 1. Windows 绝对路径: C:\Users\file.txt 或 D:/path/to/file
-  const windowsRegex = /[a-zA-Z]:[\\\/][\w\-.\/\\\u4e00-\u9fa5]+/g;
-  const windowsMatches = textWithoutUrls.match(windowsRegex) || [];
-  windowsMatches.forEach(addPath);
-
-  // 2. Unix home 路径: ~/Documents/file
-  const homeRegex = /~\/[\w\-.\/\u4e00-\u9fa5]+/g;
-  const homeMatches = textWithoutUrls.match(homeRegex) || [];
-  homeMatches.forEach(addPath);
-
-  // 3. macOS 绝对路径: /Users/username/file（白名单制，只匹配 /Users/ 开头）
-  // 不匹配 /tmp/ /var/ /home/ /app/ 等云端环境路径
-  const macRegex = /(?:^|[\s\r\n])(\/Users\/[\w\-.\/\u4e00-\u9fa5]+)/gm;
-  let m;
-  while ((m = macRegex.exec(textWithoutUrls)) !== null) {
-    addPath(m[1]);
+  // 相对路径（非 Windows、非 home、非 macOS 绝对）：必须有扩展名
+  if (!isWindowsAbsolute && !isUnixHome && !isMacAbsolute) {
+    if (!hasExtension) return null;
   }
 
-  return paths;
+  // Windows 绝对路径或 macOS 绝对路径或 home 路径，即使没有扩展名也允许
+  if (!hasExtension && !isKnownDir && !isWindowsAbsolute && !isUnixHome && !isMacAbsolute) return null;
+
+  return { path, rest };
 };
 
-// 🔥 点击本地路径打开文件
-const EDITABLE_EXTENSIONS = ['.py', '.js', '.ts', '.jsx', '.tsx', '.md', '.json', '.txt', '.yaml', '.yml', '.xml', '.html', '.css', '.scss', '.sql', '.sh', '.bat', '.java', '.go', '.rs', '.c', '.cpp', '.h', '.rb', '.php'];
+/**
+ * 🔥 remark 插件：把 text/inlineCode 节点中的本地路径拆分为链接节点
+ * - 必须挂在 remarkGfm 之后：gfm 先把裸 URL 变成 link 节点，本插件跳过 link 内部文本，
+ *   防止把 URL 路径段（如 https://host/Users/a.txt）误拆成链接
+ * - 代码块（code）整体跳过；inlineCode 仅当整值是一个有效路径时替换为链接
+ *   （LLM 常用反引号包裹路径做代码样式，整值替换即可让这类路径也可点）
+ * - 链接数据通过 data.hProperties.localPath 传给 components.a 渲染
+ */
+const remarkLocalPaths = () => (tree: any) => {
+  const splitNode = (value: string): any[] | null => {
+    const nodes: any[] = [];
+    let last = 0;
+    LOCAL_PATH_SCAN.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = LOCAL_PATH_SCAN.exec(value)) !== null) {
+      // macOS 绝对路径要求前缀是空白/行首（避免 xx/Users/foo 之类被拆）
+      if (m[0].startsWith('/Users/') && m.index > 0 && !/[\s\r\n]/.test(value[m.index - 1])) {
+        continue;
+      }
+      const valid = tryLocalPath(m[0]);
+      if (!valid) continue;
+      if (m.index > last) {
+        nodes.push({ type: 'text', value: value.slice(last, m.index) });
+      }
+      nodes.push({
+        type: 'link',
+        url: '#local-path',
+        data: { hProperties: { localPath: valid.path } },
+        children: [{ type: 'text', value: valid.path }],
+      });
+      if (valid.rest) {
+        nodes.push({ type: 'text', value: valid.rest });
+      }
+      last = m.index + m[0].length;
+    }
+    if (last === 0) return null;
+    if (last < value.length) {
+      nodes.push({ type: 'text', value: value.slice(last) });
+    }
+    return nodes;
+  };
 
-const isEditableFile = (path: string): boolean => {
+  const walk = (node: any, inLink: boolean) => {
+    if (!node.children || !Array.isArray(node.children)) return;
+    for (let i = 0; i < node.children.length; i++) {
+      const child = node.children[i];
+      if (child.type === 'code') continue; // 代码块整体跳过
+      if (!inLink && (child.type === 'text' || child.type === 'inlineCode') && typeof child.value === 'string') {
+        const parts = splitNode(child.value);
+        if (parts) {
+          if (child.type === 'inlineCode') {
+            // 行内代码仅整值是路径时替换为链接，部分匹配保留 code 样式（不破坏代码语义）
+            if (parts.length === 1 && parts[0].type === 'link') {
+              node.children[i] = parts[0];
+            }
+          } else {
+            node.children.splice(i, 1, ...parts);
+            i += parts.length - 1;
+          }
+        }
+        continue;
+      }
+      walk(child, inLink || child.type === 'link');
+    }
+  };
+  walk(tree, false);
+};
+
+// 🔥 媒体类型判断：消息内点击路径只做"预览或文件夹定位"，绝不触发创建项目
+const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v', '.wmv'];
+
+const isVideoFile = (path: string): boolean => {
   const ext = '.' + path.split('.').pop()?.toLowerCase();
-  return EDITABLE_EXTENSIONS.includes(ext);
+  return VIDEO_EXTENSIONS.includes(ext);
 };
 
 const isHtmlFile = (path: string): boolean => {
@@ -806,102 +891,103 @@ const handleLocalPathClick = async (localPath: string) => {
   }
 };
 
-const handleOpenInDesktop = (localPath: string) => {
-  if (isEditableFile(localPath)) {
-    // 🔥 通过 window 事件通知 DesktopPanel 打开文件（替代已删除的 codeEditEventService）
-    window.dispatchEvent(new CustomEvent('openProjectFile', {
-      detail: { filePath: localPath }
-    }));
-  } else {
-    handleLocalPathClick(localPath);
-  }
-};
-
-// 🔥 本地路径链接组件 - 简洁行内样式
-const LocalPathLinks: React.FC<{ text: string }> = ({ text }) => {
+// 🔥 本地路径行内链接组件（由 remarkLocalPaths 在 AST 层生成，components.a 拦截渲染）
+// 交互：点链接 = 智能打开（图片→预览、视频→播放、HTML→浏览器、其余一律文件夹定位）；
+// 链接后跟两个上标小按钮：[按类型动作] + [复制路径]
+// ⚠️ 消息内预览绝不触发"创建项目"（openProjectFile）路径：消息里出现的代码文件可能属于
+// 另一个已存在的项目（如 apps/<id>/package.json），注入当前项目是错误行为，定位到文件夹让用户自己点项目
+const LocalPathLink: React.FC<{ path: string }> = ({ path }) => {
   const { t } = useTranslation();
-  const localPaths = extractLocalPaths(text);
+  const [copied, setCopied] = useState(false);
   const [previewImage, setPreviewImage] = useState<FileAttachment | null>(null);
-  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const [previewVideo, setPreviewVideo] = useState<FileAttachment | null>(null);
 
-  const handleCopyPath = async (path: string) => {
+  const openPath = () => {
+    if (isImageFile(path)) {
+      const fileName = path.split(/[\\/]/).pop() || 'image';
+      setPreviewImage({
+        id: `local-${Date.now()}`,
+        name: fileName,
+        content: '',
+        type: 'image/' + (path.split('.').pop() || 'png').toLowerCase(),
+        localPath: path,
+      } as any);
+      return;
+    }
+    if (isVideoFile(path)) {
+      const fileName = path.split(/[\\/]/).pop() || 'video';
+      setPreviewVideo({
+        id: `local-${Date.now()}`,
+        name: fileName,
+        content: '',
+        type: 'video/' + (path.split('.').pop() || 'mp4').toLowerCase(),
+        localPath: path,
+      } as any);
+      return;
+    }
+    if (isHtmlFile(path)) {
+      handleOpenHtmlInBrowser(path);
+      return;
+    }
+    // 其余（含代码文件）：保险做法——只在文件夹里定位，不打开、不注入
+    handleLocalPathClick(path);
+  };
+
+  const copyPath = async () => {
     try {
       await navigator.clipboard.writeText(path);
-      setCopiedPath(path);
-      setTimeout(() => setCopiedPath(null), 2000);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     } catch (error) {
       console.error('复制路径失败:', error);
     }
   };
 
-  if (localPaths.length === 0) return null;
+  // 上标动作图标按文件类型：图片=预览、视频=播放、HTML=浏览器、其余=文件夹定位
+  const ActionIcon = isImageFile(path)
+    ? ImageIcon
+    : isVideoFile(path)
+    ? Film
+    : isHtmlFile(path)
+    ? ExternalLink
+    : FolderOpen;
+  const actionTitle = isImageFile(path)
+    ? t('workspace.messageContent.previewImage', { path })
+    : isVideoFile(path)
+    ? t('workspace.messageContent.preview', { path })
+    : isHtmlFile(path)
+    ? t('workspace.messageContent.openInBrowser', { path })
+    : t('workspace.messageContent.openInFolder', { path });
 
   return (
-    <>
-      <div className="flex flex-wrap gap-2 mt-1.5">
-        {localPaths.map((path, index) => (
-          <div key={`localpath-${index}`} className="flex items-center gap-1">
-            <button
-              onClick={() => handleLocalPathClick(path)}
-              className="inline-flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 cursor-pointer hover:underline bg-blue-50 dark:bg-blue-900/20 px-2 py-1 rounded-md border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors"
-              title={t('workspace.messageContent.openInFolder', { path })}
-            >
-              <FolderOpen className="w-3.5 h-3.5 flex-shrink-0" />
-              <span className="font-mono truncate max-w-[250px]">{path}</span>
-            </button>
-            {isImageFile(path) && (
-              <button
-                onClick={() => {
-                  const fileName = path.split(/[\\/]/).pop() || 'image';
-                  setPreviewImage({
-                    id: `local-${Date.now()}`,
-                    name: fileName,
-                    content: '',
-                    type: 'image/' + (path.split('.').pop() || 'png').toLowerCase(),
-                    localPath: path,
-                  } as any);
-                }}
-                className="inline-flex items-center gap-1.5 text-xs text-orange-600 hover:text-orange-800 dark:text-orange-400 dark:hover:text-orange-300 cursor-pointer hover:underline bg-orange-50 dark:bg-orange-900/20 px-2 py-1 rounded-md border border-orange-200 dark:border-orange-800 hover:bg-orange-100 dark:hover:bg-orange-900/30 transition-colors"
-                title={t('workspace.messageContent.previewImage', { path })}
-              >
-                <ImageIcon className="w-3.5 h-3.5 flex-shrink-0" />
-                <span className="text-xs">{t('workspace.messageContent.preview')}</span>
-              </button>
-            )}
-            {isHtmlFile(path) && (
-              <button
-                onClick={() => handleOpenHtmlInBrowser(path)}
-                className="inline-flex items-center gap-1.5 text-xs text-purple-600 hover:text-purple-800 dark:text-purple-400 dark:hover:text-purple-300 cursor-pointer hover:underline bg-purple-50 dark:bg-purple-900/20 px-2 py-1 rounded-md border border-purple-200 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-colors"
-                title={t('workspace.messageContent.openInBrowser', { path })}
-              >
-                <ExternalLink className="w-3.5 h-3.5 flex-shrink-0" />
-                <span className="text-xs">{t('workspace.messageContent.browser')}</span>
-              </button>
-            )}
-            {isEditableFile(path) && !isImageFile(path) && (
-              <button
-                onClick={() => handleOpenInDesktop(path)}
-                className="inline-flex items-center gap-1.5 text-xs text-green-600 hover:text-green-800 dark:text-green-400 dark:hover:text-green-300 cursor-pointer hover:underline bg-green-50 dark:bg-green-900/20 px-2 py-1 rounded-md border border-green-200 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/30 transition-colors"
-                title={t('workspace.messageContent.openInDesktop', { path })}
-              >
-                <FileText className="w-3.5 h-3.5 flex-shrink-0" />
-                <span className="text-xs">{t('workspace.messageContent.open')}</span>
-              </button>
-            )}
-            <button
-              onClick={() => handleCopyPath(path)}
-              className="inline-flex items-center gap-1.5 text-xs text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-300 cursor-pointer hover:underline bg-gray-50 dark:bg-gray-900/20 px-2 py-1 rounded-md border border-gray-200 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-900/30 transition-colors"
-              title={t('workspace.messageContent.copyPath', { path })}
-            >
-              {copiedPath === path ? (
-                <Check className="w-3.5 h-3.5 flex-shrink-0 text-green-600" />
-              ) : (
-                <Copy className="w-3.5 h-3.5 flex-shrink-0" />
-              )}
-            </button>
-          </div>
-        ))}
-      </div>
+    <span className="inline">
+      <a
+        href="#local-path"
+        onClick={(e) => {
+          e.preventDefault();
+          openPath();
+        }}
+        className="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 hover:underline break-all cursor-pointer"
+        title={path}
+      >
+        {path}
+      </a>
+      <sup className="inline-flex items-center gap-0.5 ml-0.5">
+        <button
+          onClick={openPath}
+          className="text-blue-400 hover:text-blue-700 dark:text-blue-500 dark:hover:text-blue-300 cursor-pointer"
+          title={actionTitle}
+        >
+          <ActionIcon className="w-3 h-3" />
+        </button>
+        <button
+          onClick={copyPath}
+          className="text-gray-300 hover:text-gray-600 dark:text-gray-600 dark:hover:text-gray-300 cursor-pointer"
+          title={t('workspace.messageContent.copyPath', { path })}
+        >
+          {copied ? <Check className="w-3 h-3 text-green-600" /> : <Copy className="w-3 h-3" />}
+        </button>
+      </sup>
       {previewImage && (
         <ImageViewer
           file={previewImage}
@@ -909,7 +995,14 @@ const LocalPathLinks: React.FC<{ text: string }> = ({ text }) => {
           onClose={() => setPreviewImage(null)}
         />
       )}
-    </>
+      {previewVideo && (
+        <VideoPlayer
+          file={previewVideo}
+          isOpen={!!previewVideo}
+          onClose={() => setPreviewVideo(null)}
+        />
+      )}
+    </span>
   );
 };
 
@@ -1160,8 +1253,11 @@ const markdownComponents: Components = {
   em({ children }) {
     return <em className="italic text-gray-800 dark:text-gray-200">{children}</em>;
   },
-  // 🔥 链接样式
-  a({ children, href }) {
+  // 🔥 链接样式（localPath = remarkLocalPaths 生成的本地路径行内链接，走 LocalPathLink 渲染）
+  a({ children, href, localPath }: any) {
+    if (localPath) {
+      return <LocalPathLink path={localPath} />;
+    }
     return (
       <a
         href={href}
@@ -1181,17 +1277,19 @@ const markdownComponents: Components = {
       </blockquote>
     );
   },
-  // 🔥 表格样式
+  // 🔥 表格样式：聊天区画布是纯白（ChatGPT 风格，ChatMessages/OptimizedChatPanel 均为 bg-white），
+  // 表格 bg-white 与画布同色但边框仍勾勒出卡片；th 的 bg-gray-100 在白底上呈现经典表头（GitHub 风格）。
+  // ⚠️ 勿把画布改回灰底（如 bg-gray-100），否则 th 会再次与页面同色、表头隐形
   table({ children }) {
     return (
-      <table className="w-full border-collapse my-3 text-sm">
+      <table className="w-full border-collapse my-3 text-sm bg-white dark:bg-gray-900">
         {children}
       </table>
     );
   },
   th({ children }) {
     return (
-      <th className="border border-gray-300 dark:border-gray-600 px-3 py-2 bg-gray-100 dark:bg-gray-800 font-medium text-left">
+      <th className="border border-gray-300 dark:border-gray-600 px-3 py-2 bg-gray-100 dark:bg-gray-800 font-semibold text-left">
         {children}
       </th>
     );
@@ -1452,13 +1550,11 @@ export const MessageContent: React.FC<MessageContentProps> = ({ message, icon })
       {content && (
         <div className="prose prose-sm max-w-none prose-headings:!border-0 prose-headings:!pt-0 prose-p:!border-0 prose-p:!pt-0 prose-ul:!border-0 prose-ol:!border-0 prose-li:!border-0">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+            remarkPlugins={[remarkGfm, remarkLocalPaths, remarkMath, remarkBreaks]}
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             components={markdownComponents}
             children={preprocessMessageText(content)}
           />
-          {/* 🔥 检测 content 中的本地路径 */}
-          <LocalPathLinks text={content} />
         </div>
       )}
 
@@ -1487,13 +1583,11 @@ export const MessageContent: React.FC<MessageContentProps> = ({ message, icon })
           ) : (
             <div className="prose prose-sm max-w-none prose-headings:!border-0 prose-headings:!pt-0 prose-p:!border-0 prose-p:!pt-0 prose-ul:!border-0 prose-ol:!border-0 prose-li:!border-0">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+                remarkPlugins={[remarkGfm, remarkLocalPaths, remarkMath, remarkBreaks]}
                 rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                 components={markdownComponents}
                 children={preprocessMessageText(resultString)}
               />
-              {/* 🔥 检测 result 中的本地路径 */}
-              <LocalPathLinks text={resultString} />
             </div>
           )}
         </>

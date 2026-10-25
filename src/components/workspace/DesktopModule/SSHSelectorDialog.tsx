@@ -97,6 +97,8 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
   const [selfAdding, setSelfAdding] = useState(false);
   const [selfProgress, setSelfProgress] = useState('');
   const [selfError, setSelfError] = useState<string | null>(null);
+  // 🔥 加载失败显性化：此前 catch→console.warn 全静默，local-backend 未启动时用户只看到空页
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // 复制 ssh 地址（user@IP，可直接拼连接命令），成功显示对勾 1.5s
   const handleCopyAddress = async (inst: ActiveInstance) => {
@@ -112,12 +114,19 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
 
   const fetchData = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       // 规格清单（展示型，直连本地转发）；活跃实例走核心层（带云端自愈校正）
       const [typesResp, active] = await Promise.all([
         fetch(`${getBackendUrl()}/api/rental/types`),
         sshListActive(userId)
       ]);
+
+      if (!typesResp.ok) {
+        setLoadError(`规格接口异常（HTTP ${typesResp.status}）——本机服务可能未启动或云端不可达`);
+      } else if (!active.ok) {
+        setLoadError(`实例列表查询失败：${active.error || '未知错误'}`);
+      }
 
       if (typesResp.ok) {
         const data = await typesResp.json();
@@ -150,7 +159,8 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
           port: r.port || 22,
         })));
       }
-    } catch (error) {
+    } catch (error: any) {
+      setLoadError(`连接本机服务失败：${error?.message || String(error)}（local-backend 未运行？）`);
       console.warn('[SSH-SELECTOR] 获取数据失败:', error);
     } finally {
       setLoading(false);
@@ -284,6 +294,16 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
         </div>
 
         <div className="p-6 flex-1 min-h-0 overflow-y-auto">
+          {/* 🔥 加载失败显性化：错误 + 重试，替代空白页 */}
+          {loadError && (
+            <div className="mb-4 text-center py-4">
+              <div className="text-red-600 text-sm mb-3">{loadError}</div>
+              <button onClick={fetchData} className="px-4 py-1.5 text-sm rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors">
+                重试
+              </button>
+            </div>
+          )}
+
           {/* 活跃实例：常驻中，可关机（云端）/ 解绑（自有机器，不影响机器本身） */}
           <div className="mb-4">
             <div className="flex items-center justify-between mb-2">

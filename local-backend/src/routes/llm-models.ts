@@ -21,10 +21,21 @@ function getUserId(req: express.Request): string | undefined {
 
 // ========== 用户模型管理 API ==========
 
+// 🔥 启动身份自愈：后端重启后 currentUserId 为空，GPU/租赁转发云端全部报
+//    "未登录...且 GPU_WORKER_SECRET 未配置" → 502 → 弹窗空白（聊天走渲染层配置不受
+//    影响，极难关联定位）。渲染层启动必调 GET /user-models 与 /all，顺手恢复身份
+function ensureCurrentUser(userId: string | undefined): void {
+  if (userId && userModelRegistry.getCurrentUserId() !== userId) {
+    userModelRegistry.setCurrentUser(userId);
+    console.log(`[LLM-MODELS-API] 已恢复当前用户身份: ${userId}`);
+  }
+}
+
 // 🔥 兼容前端调用的 /all 路由（返回所有模型，包括组织和助手模型）
 router.get('/all', (req, res) => {
   try {
     const userId = getUserId(req);
+    ensureCurrentUser(userId);
     console.log(`[LLM-MODELS-API] 获取所有模型, userId: ${userId}`);
 
     // 获取用户自定义模型
@@ -83,6 +94,7 @@ router.get('/all', (req, res) => {
 router.get('/user-models', (req, res) => {
   try {
     const userId = getUserId(req);
+    ensureCurrentUser(userId);
     console.log(`[LLM-MODELS-API] 获取用户模型, userId: ${userId}`);
 
     const models = userModelRegistry.getAllUserModels(userId);

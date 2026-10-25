@@ -7,6 +7,8 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from '@/context/AuthContext';
 import { SessionMessageGroup } from './ChatMessageItem/SessionMessageGroup';
 import { MessageData } from './ChatMessageItem/types';
+import { TraceReportApi } from '@/services/cloud/CloudApiClient';
+import { Clapperboard, ArrowUpCircle, Check, Loader2, XCircle } from 'lucide-react';
 
 interface ChatMessagesProps {
   messages: Message[];
@@ -28,6 +30,126 @@ interface ChatMessagesProps {
  * - loading: 加载历史消息模式，保持用户位置
  */
 type ScrollState = 'initial' | 'following' | 'browsing' | 'loading';
+
+// ============================================================================
+// 🔥 回合轨迹复制/上报
+// 回合 = 一条 user 消息到下一条 user 消息之前的全部消息（消息流天然分段）：
+// 无需"回合终止符"——正常收尾/中途 abort/关机全都自动成立（复制边界=数组切片）。
+// ============================================================================
+
+// 单段文本截断上限：终端输出可能极大，超限截断并标注原长
+const TRACE_TEXT_CAP = 8000;
+
+const capTraceText = (text: string): string =>
+  text.length > TRACE_TEXT_CAP ? `${text.slice(0, TRACE_TEXT_CAP)}…(截断，共${text.length}字)` : text;
+
+const formatTimestampHMS = (ts: Message['timestamp']): string => {
+  const d = ts instanceof Date ? ts : new Date(ts || Date.now());
+  return d.toTimeString().slice(0, 8);
+};
+
+/**
+ * 把一个回合的消息切片格式化为可粘贴给 LLM 研究的轨迹文本
+ * - summarizer 取 result（最终报告），reactor 取 content（动作描述）+ result（工具输出）
+ * - 空文本消息跳过，段落间空行分隔
+ */
+const formatRoundTrace = (round: Message[]): string => {
+  const lines: string[] = [];
+  round.forEach((m, idx) => {
+    const time = formatTimestampHMS(m.timestamp);
+    const label = m.apiRole
+      ? `${m.apiRole}${m.iconText ? `·${m.iconText}` : ''}`
+      : m.role;
+    if (m.apiRole === 'summarizer') {
+      const text = m.result || m.content || '';
+      if (text) lines.push(`[${idx}] ${label} ${time}\n${capTraceText(text)}`);
+    } else if (m.apiRole === 'reactor') {
+      const text = m.content || '';
+      if (text) lines.push(`[${idx}] ${label} ${time}\n${capTraceText(text)}`);
+      if (m.result) lines.push(`[输出] ${capTraceText(m.result)}`);
+    } else {
+      const text = m.content || '';
+      if (text) lines.push(`[${idx}] ${label} ${time}\n${capTraceText(text)}`);
+    }
+  });
+  return lines.join('\n\n');
+};
+
+/**
+ * 回合切片：锚点消息（回合内任意消息，如组头按钮传组内首条）→ 所在回合全部消息。
+ * 从锚点向前扫到最近的 user 消息即回合起点，到下一条 user 消息前即回合终点。
+ */
+const getRoundSlice = (messages: Message[], anchorId: string): Message[] | null => {
+  const idx = messages.findIndex((m) => m.id === anchorId);
+  if (idx < 0) return null;
+  let start = idx;
+  while (start > 0 && messages[start].role !== 'user') start--;
+  if (messages[start].role !== 'user') return null;
+  let end = messages.length;
+  for (let i = start + 1; i < messages.length; i++) {
+    if (messages[i].role === 'user') { end = i; break; }
+  }
+  return messages.slice(start, end);
+};
+
+/**
+ * 🔥 回合末尾工具行：复制/上报整个回合轨迹，挂在本回合最后一个渲染项下方（用户习惯位置）。
+ * 正常收尾=最终 summarizer/SubAgent 卡片下面；abort/关机后最后剩什么就挂什么下面。
+ */
+const RoundTraceActions: React.FC<{
+  onCopy: () => Promise<void>;
+  onReport: () => Promise<boolean>;
+}> = ({ onCopy, onReport }) => {
+  const [copied, setCopied] = useState(false);
+  const [state, setState] = useState<'idle' | 'pending' | 'done' | 'error'>('idle');
+
+  return (
+    <div className="flex items-center gap-0.5 mb-3">
+      <button
+        onClick={async () => {
+          try {
+            await onCopy();
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          } catch { /* 忽略 */ }
+        }}
+        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
+        title={copied ? '已复制本回合完整轨迹' : '复制本回合完整轨迹'}
+      >
+        {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clapperboard className="w-3.5 h-3.5" />}
+      </button>
+      <button
+        onClick={async () => {
+          if (state === 'pending') return;
+          setState('pending');
+          try {
+            const ok = await onReport();
+            setState(ok ? 'done' : 'error');
+          } catch {
+            setState('error');
+          }
+          setTimeout(() => setState('idle'), 2000);
+        }}
+        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
+        title={state === 'done'
+          ? '已上报，服务端保留 7 天'
+          : state === 'error'
+          ? '上报失败，请稍后重试'
+          : '上报本回合轨迹'}
+      >
+        {state === 'pending' ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        ) : state === 'done' ? (
+          <Check className="w-3.5 h-3.5 text-green-500" />
+        ) : state === 'error' ? (
+          <XCircle className="w-3.5 h-3.5 text-red-400" />
+        ) : (
+          <ArrowUpCircle className="w-3.5 h-3.5" />
+        )}
+      </button>
+    </div>
+  );
+};
 
 /**
  * 聊天消息组件
@@ -177,6 +299,56 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
 
     return items;
   }, [ungroupedMessages, groupedMessages]);
+
+  // 🔥 回合末尾标记：每回合最后一个渲染项（下一条 user 消息出现前的最后一项）。
+  // 渲染列表天然分段，无需"回合终止符"；abort/关机后最后剩什么，按钮就挂什么下面
+  const roundEndKeys = useMemo(() => {
+    const keys = new Set<string>();
+    let last: string | null = null;
+    for (const item of renderItems) {
+      if (item.type === 'ungrouped' && item.message.role === 'user') {
+        if (last) keys.add(last);
+        last = null;
+      } else {
+        last = item.type === 'ungrouped' ? item.message.id : `session-${item.groupKey}`;
+      }
+    }
+    // 🔥 闸门只作用于最后一段（正在行进的回合）：isProcessing（与发送按钮同源的准确行进信号）+
+    //    消息 status 兜底（streaming 僵死超 10 分钟放行）。历史回合（前面封口段）不受影响，按钮常驻
+    if (last && !isProcessing) {
+      const lastMsg = messages[messages.length - 1];
+      const lastTs = lastMsg?.timestamp ? new Date(lastMsg.timestamp).getTime() : 0;
+      const isStreaming = !!lastMsg
+        && (lastMsg.status === 'streaming' || lastMsg.status === 'pending')
+        && Date.now() - lastTs < 10 * 60 * 1000;
+      if (!isStreaming) keys.add(last);
+    }
+    return keys;
+  }, [renderItems, messages, isProcessing]);
+
+  // 🔥 复制/上报回合轨迹（按钮行挂在回合末尾渲染项下方，锚点=该渲染项首条消息）
+  const handleCopyRoundTrace = useCallback(async (anchorId: string) => {
+    const round = getRoundSlice(messages, anchorId);
+    if (!round) return;
+    try {
+      await navigator.clipboard.writeText(formatRoundTrace(round));
+    } catch (err) {
+      console.error('复制回合轨迹失败:', err);
+    }
+  }, [messages]);
+
+  // 🔍 上报回合轨迹到 homeweb（服务端保留 7 天）；返回是否成功供按钮反馈
+  const handleReportTrace = useCallback(async (anchorId: string): Promise<boolean> => {
+    const round = getRoundSlice(messages, anchorId);
+    if (!round || !currentConversationId || currentConversationId === 'null') return false;
+    try {
+      const res = await TraceReportApi.report({ conversationId: currentConversationId, trace: formatRoundTrace(round) });
+      return !!res?.success;
+    } catch (err) {
+      console.error('上报回合轨迹失败:', err);
+      return false;
+    }
+  }, [messages, currentConversationId]);
 
   // 🔥 场景1：对话切换时重置状态
   useEffect(() => {
@@ -338,11 +510,11 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
     <div className="flex-1 min-h-0 max-h-full overflow-hidden relative">
       <div
         ref={scrollContainerRef}
-        className="h-full w-full overflow-y-auto overflow-x-hidden bg-gray-100"
+        className="h-full w-full overflow-y-auto overflow-x-hidden bg-white"
         onScroll={handleScroll}
         style={{
           scrollbarWidth: 'thin',
-          scrollbarColor: '#d1d5db transparent',
+          scrollbarColor: '#d4d4d4 transparent',
         }}
       >
         {/* 🔥 始终使用 justify-start（从顶部排列），避免跷跷板效应
@@ -360,28 +532,37 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
           ) : (
             <>
               {renderItems.map((item) => {
-                if (item.type === 'ungrouped') {
-                  return (
-                    <MessageBubble
-                      key={item.message.id}
-                      message={item.message}
-                      conversationId={currentConversationId}
-                      onFileView={onFileView}
-                      onFileDownload={onFileDownload}
-                      onPlanApprove={onPlanApprove}
-                      onPlanReject={onPlanReject}
-                      onStepInput={onStepInput}
-                    />
-                  );
-                } else {
-                  return (
-                    <SessionMessageGroup
-                      key={`session-${item.groupKey}`}
-                      sessionId={item.groupData.sessionId}
-                      messages={item.groupData.messages}
-                    />
-                  );
-                }
+                const itemKey = item.type === 'ungrouped' ? item.message.id : `session-${item.groupKey}`;
+                const anchorId = item.type === 'ungrouped'
+                  ? item.message.id
+                  : item.groupData.messages[0]?.id;
+                const isRoundEnd = roundEndKeys.has(itemKey);
+                return (
+                  <React.Fragment key={itemKey}>
+                    {item.type === 'ungrouped' ? (
+                      <MessageBubble
+                        message={item.message}
+                        conversationId={currentConversationId}
+                        onFileView={onFileView}
+                        onFileDownload={onFileDownload}
+                        onPlanApprove={onPlanApprove}
+                        onPlanReject={onPlanReject}
+                        onStepInput={onStepInput}
+                      />
+                    ) : (
+                      <SessionMessageGroup
+                        sessionId={item.groupData.sessionId}
+                        messages={item.groupData.messages}
+                      />
+                    )}
+                    {isRoundEnd && anchorId && (
+                      <RoundTraceActions
+                        onCopy={() => handleCopyRoundTrace(anchorId)}
+                        onReport={() => handleReportTrace(anchorId)}
+                      />
+                    )}
+                  </React.Fragment>
+                );
               })}
               {isProcessing && <ProcessingIndicator />}
             </>

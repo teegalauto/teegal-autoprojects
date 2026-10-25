@@ -113,6 +113,7 @@ class SummaryService {
         {
           conversationHistory: request.context?.conversationHistory,
           conversationId: request.context?.conversationId,
+          userId: request.context?.userId, // 🔥 短 ID 置换：@projectid:短id → 完整 UUID（否则注入的"本地目录"是假路径）
         }
       );
 

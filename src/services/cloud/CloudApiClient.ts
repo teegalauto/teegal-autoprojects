@@ -115,4 +115,13 @@ export const UserApi = {
   getBalance: () => request<{ success: boolean; balance: number }>('/api/balance'),
 };
 
+/**
+ * 轨迹上报 API：用户点"上报"把本回合完整轨迹发到 homeweb 存查（服务端保留 7 天）。
+ * userId/email 服务端从 Bearer token 解，body 只带业务字段。
+ */
+export const TraceReportApi = {
+  report: (body: { conversationId: string; trace: string }) =>
+    request<{ success: boolean }>('/api/trace-report', { method: 'POST', body }),
+};
+
 export { getAuthToken, getCurrentUserId };

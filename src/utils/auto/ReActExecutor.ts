@@ -799,6 +799,7 @@ export class ReActExecutor {
         },
         {
           conversationId: conversationId,
+          userId: userId, // 🔥 短 ID 置换：@projectid:短id → 完整 UUID（否则注入的"本地目录"是假路径）
         }
       );
 

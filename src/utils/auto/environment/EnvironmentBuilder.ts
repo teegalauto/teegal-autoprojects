@@ -62,6 +62,8 @@ export class EnvironmentBuilder {
       conversationHistory?: Array<{ role: string; content: string; sessionId?: string; apiRole?: string }>;
       /** 会话ID */
       conversationId?: string;
+      /** 🔥 用户ID（用于短 ID 置换：@projectid:短id → 完整 UUID，否则"本地目录"拼出假路径） */
+      userId?: string;
     } = {}
   ): Promise<EnvironmentResult> {
     // 1. 选择策略
@@ -84,6 +86,10 @@ export class EnvironmentBuilder {
           timestamp: h.timestamp,
         }))
       );
+      // 🔥 短 ID 置换：登记的是 @projectid:8位短id，不置换则 getAppBasePath 拼出假目录注入给 LLM
+      if (options.userId) {
+        await importantObjectTracker.resolveShortAppIds(options.conversationId, options.userId);
+      }
     }
 
     // 5. 根据策略构建文本（拆分 static/dynamic）
@@ -461,6 +467,7 @@ export async function buildEnvironment(
   options?: {
     conversationHistory?: Array<{ role: string; content: string }>;
     conversationId?: string;
+    userId?: string;
   }
 ): Promise<EnvironmentResult> {
   return defaultEnvironmentBuilder.build(loopInfo, data, options);

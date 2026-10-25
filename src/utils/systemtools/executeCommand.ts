@@ -690,7 +690,13 @@ export async function executeExecuteCommandTool(
             if (isResolved) return;
             isResolved = true;
             const finalOutput = outputLines.join('\n');
-            const isSuccess = data.exitCode === 0;
+            // 🔥 plink 失败却报 exitCode 0（cmd /c 管道包装吃掉真实退出码）——轨迹实证三例全 0✓：
+            //    "plink: 'SHA256:...' is not a valid format"（参数错）、"FATAL ERROR: Configured password was
+            //    not accepted"（密码错）、"FATAL ERROR: Network error"（不可达）。plink 错误行都有
+            //    "plink: "/"FATAL ERROR: " 前缀，按前缀改判，不会误伤正常 echo 输出
+            const plinkAuthFailed = /\bplink\b/i.test(command)
+              && outputLines.some(l => /plink: |FATAL ERROR: |Configured password was not accepted/i.test(l));
+            const isSuccess = data.exitCode === 0 && !plinkAuthFailed;
 
             console.log('📥 [EXECUTE-COMMAND-TOOL] close 事件:', { exitCode: data.exitCode, isSuccess, outputLines: outputLines.length });
 
@@ -742,9 +748,18 @@ export async function executeExecuteCommandTool(
             const notFoundHint = (!isSuccess && data.exitCode !== null)
               ? buildCommandNotFoundHint(outputLines.join('\n'))
               : '';
+            // 🔥 PowerShell 语法自救：带引号的可执行路径要用 & 调用（LLM 抄激活模板常丢 &，同一 ParserError 连环烧轮）
+            const stderrText = outputLines.join('\n');
+            const psSyntaxHint = (!isSuccess && /UnexpectedToken|意外的标记/.test(stderrText) && /^\s*["'][^"']+\.(exe|ps1|bat|cmd)["']\s+-/.test(command))
+              ? '\n\n💡 PowerShell 中带引号的可执行文件路径必须用调用运算符 &：& "C:\\path\\tool.exe" 参数（直接 "路径" 参数会报"意外的标记"）'
+              : (!isSuccess && /TerminatorExpectedAtEndOfString|字符串缺少终止符/.test(stderrText) && /[^\x00-\x7F]/.test(command))
+              ? '\n\n💡 命令含中文/全角字符，引号被编码错配破坏。含此类字符的路径操作改用 userpc_run_python（unicode 安全，可 os.path.exists 定位真实目录）'
+              : (!isSuccess && /Out-File|DirectoryNotFoundException/.test(stderrText) && command.includes('>'))
+              ? '\n\n💡 远端命令里的 > 被本地 PowerShell 吞成 Out-File 了（在本地写了个不存在路径）。管道传给 plink/ssh 的整条远端命令必须放进引号内：plink host "cat > /remote/path"，远端重定向不能裸露在引号外'
+              : '';
             resolve({
               success: isSuccess,
-              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}${notFoundHint}`,
+              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}${notFoundHint}${psSyntaxHint}`,
               data: {
                 type: 'terminal',
                 command,
@@ -765,16 +780,20 @@ export async function executeExecuteCommandTool(
             isResolved = true;
             // 🔥 透传主进程的区分文案：总时长超时 vs 无输出挂起终止（LLM 据此选择不同自救策略）
             const timeoutMsg = data.error || '命令执行超时';
+            // 🔥 自愈指引：只讲问题 + 机制 + 怎么构建命令（不导向具体工具，shell 可能跑的并非项目内容）
+            const idleHint = timeoutMsg.includes('无输出')
+              ? '\n\n💡 机制说明：命令有输出就一直等待，仅当长时间无输出才判定卡死并终止。常见原因：python 未加 -u（管道下块缓冲不吐字）、命令在等交互输入、依赖/路径问题卡住。请构建持续有输出的命令再重试（python 加 -u、去除交互等待、加分段打印）。'
+              : '';
             resolve({
               success: false,
-              error: timeoutMsg,
+              error: timeoutMsg + idleHint,
               data: {
                 type: 'terminal',
                 command,
                 outputs: outputLines,
                 exitCode: -1,
                 executionTime: Date.now() - streamStartTime,
-                error: timeoutMsg,
+                error: timeoutMsg + idleHint,
               },
               metadata: {
                 toolName: 'userpc_shell'
@@ -945,15 +964,27 @@ export async function executeRunPythonTool(
   //    原实现无注入通道，LLM 用 paramiko 消费 SSHPASS 时拿到空值 → AuthenticationException
   //    被误判为"密码错/凭据冲突"，白白烧轮次排查
   const credentialName = params.credentialName;
+  // 🔥 fail-fast：脚本用 SSH 密码认证但未传 credentialName —— SSHPASS 必为空，执行必然失败。
+  //    真实案例：同一会话 7 连"0✓+仅提示"烧轮（LLM 幻觉"密码已注入"），提示拉不回来就直接拦，
+  //    让"不执行+错误说明"替代"空跑假成功"
+  if (!credentialName && /SSHPASS|sshpass|paramiko/i.test(code)) {
+    return {
+      success: false,
+      error: '❌ 未执行：脚本使用 SSH 密码认证（SSHPASS/paramiko/sshpass）但未传 credentialName——SSHPASS 环境变量为空，执行必然失败。传 credentialName=凭据名 后重试（凭据名用 list_credentials 查询，SSH 密码凭据注入后变量名为 SSHPASS）',
+      metadata: { toolName: 'userpc_run_python' },
+    };
+  }
   const cred = await resolveCredentialEnv(credentialName, context?.userId);
   if (cred.error) {
     return { success: false, error: cred.error, metadata: { toolName: 'userpc_run_python' } };
   }
   const credentialEnv = cred.env;
 
-  // 🔥 脚本引用 SSH 密码但未传 credentialName：输出尾部附提示，把 LLM 一次拉回正确通道
-  const sshHint = !credentialName && /SSHPASS|paramiko|sshpass/i.test(code)
-    ? '\n💡 提示: 脚本引用了 SSHPASS/SSH 密码但未传 credentialName——本工具传 credentialName=凭据名 即可注入 SSHPASS 环境变量；Windows 也可直接用 userpc_shell 写裸 ssh（平台自动补公钥免密参数）'
+  // 🔥 脚本读环境变量但未传 credentialName：输出尾部附提示，把 LLM 一次拉回正确通道
+  //    （真实案例：MiniMax 视频生成连环 6 轮 KeyError/NoneType，源头只是不知道能传凭据）
+  //    注：SSHPASS/paramiko/sshpass 已在上面 fail-fast 拦截，这里只兜一般环境变量读取
+  const sshHint = !credentialName && /os\.environ\[|os\.getenv\(/.test(code)
+    ? '\n💡 提示: 脚本读取了环境变量但未传 credentialName——本工具传 credentialName=凭据名 即可将凭据注入环境变量（凭据名用 list_credentials 查询）；SSH 密码凭据注入后变量名为 SSHPASS'
     : '';
 
   const tempFileName = `teegal_script_${Date.now()}.py`;

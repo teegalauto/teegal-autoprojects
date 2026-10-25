@@ -1431,15 +1431,24 @@ ipcMain.on('system:execute-command-stream', async (event, { command, timeout = 1
     const path = require('path');
     // 🔥 杀旧服务进程后等端口释放（killWaitMs），避免新进程报 "Port in use"
     const waitPrefix = killWaitMs > 0 ? `Start-Sleep -Milliseconds ${killWaitMs}\r\n` : '';
-    const scriptContent = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n${waitPrefix}${optimizedCommand}`;
+    // 🔥 末尾必须 exit $LASTEXITCODE：powershell.exe 跑完脚本默认返回 0，原生程序（plink/scp/ping/python）
+    //    的真实退出码全部丢失 → 工具层 0✓ 假成功（轨迹实证：plink 参数错/密码错/网络超时三例全 0✓）。
+    //    透传后 LLM 才能看到真实失败。cmdlet 场景 $LASTEXITCODE 为 $null，exit $null = 0，行为不变；
+    //    Start-Job 分支自带 exit 0，在其后的本行不可达，无影响
+    const scriptContent = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n${waitPrefix}${optimizedCommand}\r\nexit $LASTEXITCODE`;
     const scriptPath = path.join(require('os').tmpdir(), `teegal_cmd_${Date.now()}.ps1`);
-    fs.writeFileSync(scriptPath, scriptContent, 'utf8');
+    // 🔥 必须带 BOM：PS5 对无 BOM 的 .ps1 按系统 ANSI(GBK) 解码，UTF-8 中文/全角字符全变乱码，
+    //    乱码字节还会破坏引号配对 →"字符串缺少终止符" ParserError（真实案例：桌面全角路径目录打包连续失败）
+    fs.writeFileSync(scriptPath, '\uFEFF' + scriptContent, 'utf8');
     console.log('🔧 [MAIN-STREAM] 命令已写入脚本文件:', scriptPath);
     
     // 🔥 编码包装：解析期错误（如 LLM 写了 PS5 不支持的 &&）发生在脚本执行前，
     //    脚本文件内的 OutputEncoding 行来不及运行，报错按系统默认 GBK 输出 → Node 按 UTF-8 解码成乱码。
     //    改为 -Command 先设编码再 & 调脚本文件：任何报错（含解析错误）都稳定 UTF-8。
-    const encodingWrapper = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & '${scriptPath}'`;
+    //    🔥 末尾 exit $LASTEXITCODE：实测脚本内 exit 5 经 & 调用后进程码被归一成 1（只剩"非零"事实，
+    //    精确值丢失）——wrapper 层再补一次透传：脚本 exit 终止进程 → 本行不可达；仅退脚本 → 本行
+    //    拿 $LASTEXITCODE（脚本内最后原生命令的真实码）二次透传。两种 PS 行为下精确值都能出来
+    const encodingWrapper = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & '${scriptPath}'; exit $LASTEXITCODE`;
     proc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', encodingWrapper], {
       ...spawnOptions,
       shell: false

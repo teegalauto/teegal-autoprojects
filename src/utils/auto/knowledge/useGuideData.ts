@@ -308,14 +308,26 @@ return { success: true, data: { greeting: '你好，' + name } };
   },
   {
     question: "怎么运行Python代码？",
-    answer: `用userpc_run_python工具，直接提供Python代码即可在本地执行。`,
-    keywords: ["python", "运行python", "执行代码", "userpc_run_python", "py", "脚本"],
+    answer: `用userpc_run_python工具，直接提供Python代码即可在本地执行。注意：代码是临时脚本，执行完不落盘，需要持久化文件请用userpc_shell写文件；需要API密钥等凭据时传credentialName=凭据名（凭据以环境变量注入，名称用list_credentials查），不要把密钥硬编码在代码里。`,
+    keywords: ["python", "运行python", "执行代码", "userpc_run_python", "py", "脚本", "凭据", "credentialName", "环境变量"],
     category: "platform"
   },
   {
     question: "怎么执行shell命令？",
     answer: `用userpc_shell工具，提供命令即可在本地终端执行。`,
     keywords: ["shell", "命令行", "终端", "cmd", "bash", "userpc_shell", "执行命令"],
+    category: "platform"
+  },
+  {
+    question: "交付文件类成果（视频/音频/文档/图片）前要注意什么？",
+    answer: `必须先核验再交付：列出文件确认 size>0（0字节=失败）；媒体文件再用 ffprobe 验证可解码与时长。脚本返回码 rc=0 不等于文件成功落盘，禁止凭上一轮返回码断言成功。`,
+    keywords: ["交付", "核验", "验证", "0字节", "成片", "ffprobe", "文件大小", "视频", "音频", "成果"],
+    category: "platform"
+  },
+  {
+    question: "调用异步生成类API（视频/音频/图片批量生成）的标准模式？",
+    answer: `分三步走，不要一个脚本一把梭：①批量提交拿 task_id，把 id 落盘成 json；②用独立脚本按 id 轮询状态并增量下载（只补缺的，失败的单独重提）；③全部就绪后再做合成/交付。好处：轮询脚本被中断后可无损续跑，不用从头重来。`,
+    keywords: ["异步", "轮询", "task_id", "视频生成", "音频生成", "批量", "API", "提交", "下载", "断点续跑"],
     category: "platform"
   },
   {

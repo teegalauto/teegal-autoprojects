@@ -195,7 +195,7 @@ const OptimizedChatPanel: React.FC<OptimizedChatPanelProps> = React.memo(({
   }, [handleSendMessage]);
 
   return (
-    <div className="flex flex-col h-full bg-gray-100 overflow-hidden">
+    <div className="flex flex-col h-full bg-white overflow-hidden">
       <ChatHeader
         userId={user?.id}
         userEmail={user?.email}

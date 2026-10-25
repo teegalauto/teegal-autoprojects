@@ -8,7 +8,7 @@
  * 3. 提供格式化输出供环境注入使用
  */
 
-import { isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
+import { isSameProjectId, resolveProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
 
 export interface ProjectActivityStats {
@@ -379,6 +379,26 @@ export class ImportantObjectTracker {
     }
 
     return context;
+  }
+
+  /**
+   * 🔥 短 ID 置换：@projectid:759ea24b 这类 8 位短 ID 登记进缓存后，若不置换成完整 UUID，
+   * getAppBasePath 会拼出 apps/{短id} 的假目录，注入给 LLM 的"本地目录"路径不存在
+   * （真实案例：LLM 按注入的假路径读文件/推送三连失败）。在 build 时（有 userId 上下文）
+   * 一次性置换，缓存里存完整 ID，后续轮全部免费。
+   */
+  async resolveShortAppIds(conversationId: string, userId: string): Promise<void> {
+    const cache = this.objectCache.get(conversationId);
+    if (!cache || !userId) return;
+    const resolved = { id: '' };
+    for (const [key, obj] of [...cache.entries()]) {
+      if (obj.type !== 'app') continue;
+      const err = await resolveProjectId(key, resolved, userId); // 完整 UUID 直通，短 ID 查库置换
+      if (!err && resolved.id && resolved.id !== key) {
+        cache.delete(key);
+        cache.set(resolved.id, { ...obj, id: resolved.id });
+      }
+    }
   }
 
   /**
