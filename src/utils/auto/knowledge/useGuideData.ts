@@ -395,7 +395,7 @@ return { success: true, data: { greeting: '你好，' + name } };
 
 2. CPU执行
 - 前端点击"运行"按钮
-- 用 userpc_run_python / run_project_onlocal 工具执行本地脚本
+- 临时脚本用 userpc_run_python；跑项目用 run_project_onlocal(projectId='xxx')（自动探测入口，服务类自动脱管常驻）
 - 也可云端 CPU 执行：run_project_oncloud(instanceType='S5.*')，适合本地环境缺依赖的任务
 
 🔥 重要提示：本地执行仅适合轻量级 Python 脚本、数据处理、Web 开发等 CPU 任务。

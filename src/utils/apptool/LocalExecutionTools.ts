@@ -75,12 +75,12 @@ function checkGpuCode(code: string): { hasGpu: boolean; matches: string[] } {
 /**
  * 本地执行项目代码（run_project_onlocal）
  *
- * 在本地执行 Python/Node/Shell 代码，结果自动保存到 ExecutionLog
- * 支持单文件和多文件项目
- * 🔥 推荐使用此工具而非 userpcrunpython，因为执行日志会保存到数据库，可在 UI 中查看历史
+ * 在本地执行项目代码，结果自动保存到 ExecutionLog
+ * 只跑项目：只传 projectId 自动探测入口，或传 mainFile 指定入口；服务类自动脱管常驻
+ * 🔥 临时脚本（单文件 python）请用 userpc_run_python，本工具不收 code（双入口是误用温床）
  *
- * 用法: run_project_onlocal(projectId='xxx', code='print("hello")', language='python')
- *       run_project_onlocal(projectId='xxx', mainFile='train.py')  # 多文件项目执行主入口
+ * 用法: run_project_onlocal(projectId='xxx')                     # 自动探测入口执行整个项目
+ *       run_project_onlocal(projectId='xxx', mainFile='train.py')  # 指定入口执行
  */
 export async function executeRunDevTool(
   step: AutoStep,
@@ -95,7 +95,7 @@ export async function executeRunDevTool(
   if (!appId) {
     return {
       success: false,
-      error: "缺少 projectId 参数。用法: run_project_onlocal(projectId='xxx', code='...') 或 run_project_onlocal(projectId='xxx', mainFile='train.py')",
+      error: "缺少 projectId 参数。用法: run_project_onlocal(projectId='xxx') 执行整个项目，或 run_project_onlocal(projectId='xxx', mainFile='train.py') 指定入口",
     };
   }
 
@@ -114,29 +114,28 @@ export async function executeRunDevTool(
     };
   }
 
+  // 🔥 code 参数已下线：临时脚本与 userpc_run_python 双入口是 LLM 误用的温床（实测会写 python
+  //    脚本 subprocess 拉 npm dev，等 600s 超时假死）。本工具收窄为只跑项目，临时脚本走 userpc_run_python
+  if (params?.code || params?.content) {
+    return {
+      success: false,
+      error: "run_project_onlocal 已不支持 code 参数：临时脚本请改用 userpc_run_python。本工具只跑项目——只传 projectId 自动探测入口，或传 mainFile 指定入口。",
+    };
+  }
+
   // 🔥 提取参数
-  const code = params?.code || params?.content;
   const language = params?.language || 'auto';
   const mainFile = params?.mainFile || params?.main_file || params?.fileName;
   const timeout = params?.timeout ? parseInt(params.timeout) : 600;
 
-  // 🔥 执行语义：
-  // - 只传 projectId → 执行整个项目（底层自动探测入口：package.json scripts / main.py / app.py / index.js...）
+  // 🔥 执行语义（code 已下线，只剩项目模式）：
+  // - 只传 projectId → 执行整个项目（底层自动探测入口：package.json scripts / main.py / index.js...）
   // - 传 mainFile → 执行指定入口文件
-  // - 传 code → 临时单文件脚本（探索项目结构请用 userpc_shell 或 list_project_files，别用这个）
-  const isMultiFile = !!mainFile || !code?.trim();
-
-  if (!isMultiFile && !code?.trim()) {
-    return {
-      success: false,
-      error: "参数不足。用法: run_project_onlocal(projectId='xxx') 执行整个项目；或 run_project_onlocal(projectId='xxx', mainFile='train.py') 执行指定入口；或 code='...' 执行临时脚本",
-    };
-  }
+  const isMultiFile = true;
 
   // 🔥 GPU 代码安全检查
-  // 单文件项目：直接检查传入的 code 参数
-  // 多文件项目（有 mainFile）：读取 mainFile 内容进行检查
-  let codeToCheck = code || '';
+  // 多文件项目：读取 mainFile 内容进行检查
+  let codeToCheck = '';
 
   if (isMultiFile && mainFile) {
     const electron = (window as any).electron;
@@ -190,14 +189,14 @@ export async function executeRunDevTool(
 
     const result = await executeLocalCode(
       {
-        code: code || '',
+        code: '',
         language,
         timeout,
         appId: fullAppId,
         userId,
         isMultiFile,
         // 🔥 mainFile 缺省时传空串，底层 executeMultiFileProject 会自动探测项目入口
-        mainFile: mainFile || (isMultiFile ? '' : 'main.py'),
+        mainFile: mainFile || '',
       }
     );
 
@@ -285,7 +284,7 @@ export async function executeListExecutionLogsTool(
           appId: fullAppId,
           logs: [],
           logCount: 0,
-          message: `项目尚无本地执行记录。可以使用 run_project_onlocal(projectId='${appId}', code='...') 执行代码。`,
+          message: `项目尚无本地执行记录。可以使用 run_project_onlocal(projectId='${appId}') 执行整个项目（自动探测入口）。`,
         },
       };
     }

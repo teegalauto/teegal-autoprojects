@@ -600,6 +600,73 @@ export async function executeExecuteCommandTool(
     };
   }
 
+  // 🔥 批量杀进程短路（两种模式）：Teegal 自身（dev/打包）就跑在 node 进程链上，LLM 写
+  //    "重启=先杀旧"脚本时按 cmdline 宽匹配（如 'workbees-Qoder' in cmdline）或按端口反查爬
+  //    进程树选杀目标，实测把 electron/vite/backend 全圈进去、一条脚本杀死宿主应用。
+  //    python 脚本经 base64 藏在命令里，先解码再扫。组合判定：
+  //    ① 脚本"进程枚举 + kill 原语"同时出现 → 短路（精确 PID kill、纯枚举查看均放行）
+  //    ② 按映像名整族杀（taskkill /IM node.exe、Stop-Process -Name node）→ 一条命令灭全家，必拦
+  {
+    const b64 = [...command.matchAll(/FromBase64String\("([A-Za-z0-9+/=]+)"\)/g)]
+      .map(m => { try { return atob(m[1]); } catch { return ''; } })
+      .join('\n');
+    const scan = command + '\n' + b64;
+    const scriptKill = /\.kill\(\)|os\.kill\(|TerminateProcess/.test(scan)
+      && /process_iter|Get-CimInstance|wmic\s+process/.test(scan);
+    const nameKill = /taskkill[^&|;]*(\/IM|-IM)\s+"?(node|npm|python|electron)\.exe/i.test(scan)
+      || /Stop-Process\s+(-Name|-name)\s+"?(node|npm|python|electron)"/.test(scan);
+    if (scriptKill || nameKill) {
+      const msg = formatErrorMessage({
+        title: '❌ 批量杀进程已被拦截（自杀防护）',
+        reason: '检测到"进程枚举 + kill"或"按映像名整族杀"——Teegal 应用本身就运行在 node 进程链上，宽匹配会把它自己一起杀掉（应用直接自杀关闭）',
+        suggestion: `安全做法：
+1. 先枚举打印候选 PID 与完整 cmdline，人工确认目标清单里不含 Teegal 自身进程
+2. 用精确 PID 逐个杀（psutil.Process(pid).kill() 不受限制），禁止按 cmdline 子串宽匹配圈杀
+3. 杀完打印存活列表核验，再进行后续启动步骤`
+      });
+      return {
+        success: false,
+        error: msg,
+        data: {
+          type: 'terminal',
+          command,
+          outputs: [msg],
+          exitCode: -1,
+          executionTime: 0,
+          error: msg,
+        },
+        metadata: { toolName: 'userpc_shell' },
+      };
+    }
+  }
+
+  // 🔥 短 id 拼假路径短路：LLM 拿 8 位短 id 拼 Teegal 项目目录（apps\5677661e）——apps\ 下目录
+  //    以完整 UUID（36位带连字符）命名，短 id 路径必然不存在。实测会连烧 8 轮 shell 乱猜
+  //    （换目录、全盘 dir 超时），前置拦截一次拉回正道：路径从工具回执拿，别猜
+  if (/apps[\\/]+[0-9a-fA-F]{1,31}(?![0-9a-fA-F-])/.test(command)) {
+    const msg = formatErrorMessage({
+      title: '❌ 命令中检测到「短 id 拼项目路径」（该路径必然不存在）',
+      reason: 'Teegal 的 apps\\ 目录以完整 UUID（36位带连字符）命名，命令里的 8 位短 id（如 apps\\5677661e）拼出的目录不存在，执行只会反复报「找不到路径」',
+      suggestion: `正确做法：
+1. 项目真实本地路径从工具回执获取：list_projects 会返回 code_path
+2. 文件读取/编辑用 list_project_files / read_project_file / save_project_file（projectId 传短 id 即可，自动解析完整路径）
+3. 启动/执行项目用 run_project_onlocal(projectId=...)，不要用 shell 猜路径后手工拉起`
+    });
+    return {
+      success: false,
+      error: msg,
+      data: {
+        type: 'terminal',
+        command,
+        outputs: [msg],
+        exitCode: -1,
+        executionTime: 0,
+        error: msg,
+      },
+      metadata: { toolName: 'userpc_shell' },
+    };
+  }
+
   // 🔥 macOS/Linux 无 plink（Windows 工具）：对称短路返回平台指引——bash 的 command not found
   //    同样会让 LLM 乱猜（装 putty / 改 paramiko），结构化指引把它一次拉回正确通道
   if (getPlatform() !== 'windows' && /^\s*plink\b/.test(command)) {

@@ -340,6 +340,9 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.invoke('app-code:fork', data),
   deleteAppCodeFile: (data: { appId: string; fileName: string; isDirectory?: boolean; codePath?: string }) =>
     ipcRenderer.invoke('app-code:delete', data),
+  // 🔥 删除整个项目目录（userData/apps/{appId}）：项目删除时物理清理，防磁盘孤儿污染 LLM 上下文
+  deleteAppDir: (appId: string) =>
+    ipcRenderer.invoke('app-code:delete-app-dir', { appId }),
   renameAppCodeFile: (data: { appId: string; oldFileName: string; newFileName: string; codePath?: string }) =>
     ipcRenderer.invoke('app-code:rename', data),
   commitAppCodeHistory: (data: { appId: string; fileName?: string; codePath?: string }) =>

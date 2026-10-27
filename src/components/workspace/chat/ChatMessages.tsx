@@ -9,6 +9,7 @@ import { SessionMessageGroup } from './ChatMessageItem/SessionMessageGroup';
 import { MessageData } from './ChatMessageItem/types';
 import { TraceReportApi } from '@/services/cloud/CloudApiClient';
 import { Clapperboard, ArrowUpCircle, Check, Loader2, XCircle } from 'lucide-react';
+import { isInjectedMessage } from '@/utils/auto/context/RoundMemory';
 
 interface ChatMessagesProps {
   messages: Message[];
@@ -78,16 +79,19 @@ const formatRoundTrace = (round: Message[]): string => {
 /**
  * 回合切片：锚点消息（回合内任意消息，如组头按钮传组内首条）→ 所在回合全部消息。
  * 从锚点向前扫到最近的 user 消息即回合起点，到下一条 user 消息前即回合终点。
+ * 🔥 注入消息（process 内用户追加，content 带「---✅ 消息已加入队列」）不是回合起点，
+ *    与 RoundMemory.splitRounds 的回合分割语义对齐，否则复制/上报轨迹的回合边界会被注入消息切碎。
  */
 const getRoundSlice = (messages: Message[], anchorId: string): Message[] | null => {
+  const isRoundStart = (m: Message) => m.role === 'user' && !isInjectedMessage(m);
   const idx = messages.findIndex((m) => m.id === anchorId);
   if (idx < 0) return null;
   let start = idx;
-  while (start > 0 && messages[start].role !== 'user') start--;
-  if (messages[start].role !== 'user') return null;
+  while (start > 0 && !isRoundStart(messages[start])) start--;
+  if (!isRoundStart(messages[start])) return null;
   let end = messages.length;
   for (let i = start + 1; i < messages.length; i++) {
-    if (messages[i].role === 'user') { end = i; break; }
+    if (isRoundStart(messages[i])) { end = i; break; }
   }
   return messages.slice(start, end);
 };
@@ -119,18 +123,24 @@ const RoundTraceActions: React.FC<{
         {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clapperboard className="w-3.5 h-3.5" />}
       </button>
       <button
+        disabled={state !== 'idle'}
         onClick={async () => {
-          if (state === 'pending') return;
+          if (state !== 'idle') return; // pending 防重入；done 锁定——同一回合上报一次即止（防频繁上报打爆服务端）
           setState('pending');
           try {
             const ok = await onReport();
-            setState(ok ? 'done' : 'error');
+            if (ok) {
+              setState('done'); // 成功后锁定不回退（绿对勾常驻），失败才恢复可点
+            } else {
+              setState('error');
+              setTimeout(() => setState('idle'), 2000);
+            }
           } catch {
             setState('error');
+            setTimeout(() => setState('idle'), 2000);
           }
-          setTimeout(() => setState('idle'), 2000);
         }}
-        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
+        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors disabled:cursor-default"
         title={state === 'done'
           ? '已上报，服务端保留 7 天'
           : state === 'error'
@@ -302,11 +312,13 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
 
   // 🔥 回合末尾标记：每回合最后一个渲染项（下一条 user 消息出现前的最后一项）。
   // 渲染列表天然分段，无需"回合终止符"；abort/关机后最后剩什么，按钮就挂什么下面
+  // 🔥 注入消息（isInjectedMessage）不是回合起点，不触发封口——它属于当前回合内部，
+  //    作为普通渲染项参与"最后渲染项"竞争，轨迹按钮随回合推进后移
   const roundEndKeys = useMemo(() => {
     const keys = new Set<string>();
     let last: string | null = null;
     for (const item of renderItems) {
-      if (item.type === 'ungrouped' && item.message.role === 'user') {
+      if (item.type === 'ungrouped' && item.message.role === 'user' && !isInjectedMessage(item.message)) {
         if (last) keys.add(last);
         last = null;
       } else {

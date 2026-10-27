@@ -42,6 +42,14 @@ export const useDesktopApp = (userId?: string) => {
       const success = await desktopAppStorage.delete(id);
       if (!success) throw new Error('删除失败');
 
+      // 🔥 物理清理磁盘目录（幂等，失败不影响删除结果；外部导入项目的用户自有目录不会被触碰）
+      try {
+        const electron = (window as any).electron;
+        await electron?.deleteAppDir?.(id);
+      } catch (e) {
+        console.warn('[USE-DESKTOP-APP] 磁盘目录清理失败（不影响删除）:', e);
+      }
+
       setApps(prev => prev.filter(app => app.id !== id));
       return true;
     } catch (err: any) {

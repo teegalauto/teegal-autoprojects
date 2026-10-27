@@ -308,6 +308,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
                 if (e.key === 'Enter') handleCreateNew();
                 if (e.key === 'Escape') setNewInputMode(null);
               }}
+              onBlur={() => setNewInputMode(null)}
               className="flex-1 text-xs bg-transparent border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 focus:outline-none focus:border-blue-500"
               placeholder={newInputMode === 'folder'
                 ? t('workspace.desktopModule.fileTree.folderNamePlaceholder')
@@ -318,6 +319,7 @@ export function FileTree({ appId, onFileSelect, onViewHistory, onViewDiff, onFil
               variant="ghost"
               size="sm"
               className="h-5 px-1"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={handleCreateNew}
             >
               <Plus className="w-3 h-3" />
@@ -747,6 +749,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
                 if (e.key === 'Enter') handleCreateNew();
                 if (e.key === 'Escape') setNewInputMode(null);
               }}
+              onBlur={() => setNewInputMode(null)}
               className="flex-1 text-xs bg-transparent border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 focus:outline-none focus:border-blue-500"
               placeholder={newInputMode === 'folder'
                 ? t('workspace.desktopModule.fileTree.folderNamePlaceholder')
@@ -757,6 +760,7 @@ export const LegacyFileTree: React.FC<LegacyFileTreeProps> = ({ appId, onFileSel
               variant="ghost"
               size="sm"
               className="h-5 px-1"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={handleCreateNew}
             >
               <Plus className="w-3 h-3" />

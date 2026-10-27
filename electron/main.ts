@@ -3028,6 +3028,31 @@ ipcMain.handle('app-code:delete', async (_, { appId, fileName, isDirectory, code
 });
 
 /**
+ * 🔥 删除整个项目目录（userData/apps/{appId}）：项目删除时物理清理磁盘。
+ * 不清理的话孤儿目录会被 LLM 扫盘误认成有效项目（上下文污染，拿已删 projectId 去编辑必然失败）。
+ * 安全边界：只接受 appId、只拼默认路径——外部导入项目（code_path 指向用户自有目录）绝不触碰；
+ * 该路径下只剩 history/.teegal 等本项目数据，可安全删除。
+ */
+ipcMain.handle('app-code:delete-app-dir', async (_, { appId }: { appId: string }) => {
+  try {
+    // 防路径穿越：appId 只允许 UUID/短 id 字符
+    if (!appId || /[^a-zA-Z0-9_-]/.test(appId)) {
+      return { success: false, error: '非法 appId' };
+    }
+    const appDir = pathModule.join(app.getPath('userData'), 'apps', appId);
+    if (!fs.existsSync(appDir)) {
+      return { success: true }; // 幂等
+    }
+    await removeDirRobust(appDir);
+    console.log('🗑️ [APP-CODE] 项目目录已物理删除:', appDir);
+    return { success: true };
+  } catch (error) {
+    console.error('❌ [APP-CODE] 项目目录删除失败:', error);
+    return { success: false, error: error instanceof Error ? error.message : '删除失败' };
+  }
+});
+
+/**
  * 🔥 重命名 App 代码文件
  * 跨平台：使用 Node.js fs API
  */

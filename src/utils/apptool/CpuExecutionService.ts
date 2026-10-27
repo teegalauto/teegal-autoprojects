@@ -617,7 +617,11 @@ async function executeMultiFileProject(
     if (NON_EXECUTABLE_EXTS.includes(ext || '') || !ext) {
       return {
         success: false,
-        error: `无法确定项目入口（当前参考文件「${effectiveMainFile}」是文档/配置/媒体文件，且项目中未探测到 main.py/app.py/run.py/index.js 等常见入口）。请确认项目结构后重试：Python 项目通常入口为 app.py/main.py，Node 项目为 index.js 或 package.json 的 scripts。`,
+        error: `无法确定项目入口：项目根目录没有 package.json，也未探测到 main.py/app.py/run.py/index.js 等常见入口文件——真实项目很可能在子目录（或尚未创建）。
+下一步（不要逐个读取根目录文件确认，根目录已确认没有入口）：
+1. list_project_files 看文件树，定位含 package.json 或入口文件的子目录
+2. 用 userpc_shell 进入该子目录拉起（如 cd <子目录> && npm run dev）
+3. 或 run_project_onlocal(projectId, mainFile='子目录/入口文件') 传完整相对路径指定入口`,
         executionTime: Date.now() - startTime,
       };
     }
@@ -634,9 +638,14 @@ async function executeMultiFileProject(
       command = `npx ts-node "${mainFilePath}"`;
       commandType = 'ts-node';
     } else {
-      // 默认用 Python
-      command = `${pythonBin} "${mainFilePath}"`;
-      commandType = 'python';
+      // 🔥 未知扩展名禁止兜底当 python 跑：猜错类型只会产出莫名 SyntaxError 或卡死，
+      // 且执行日志被打上 python 标误导排查。明确报错让上层选对执行方式（run_project_onlocal
+      // 指定 mainFile / userpc_shell 进项目目录手工拉起）。
+      return {
+        success: false,
+        error: `无法识别的项目入口「${effectiveMainFile}」(.${ext})。可执行类型：.py/.js/.mjs/.ts，或项目根目录带 package.json（scripts.dev/start/build 自动识别）。若项目入口在子目录或需多服务启动，请用 userpc_shell 进入项目目录手工拉起。`,
+        executionTime: Date.now() - startTime,
+      };
     }
   }
 
@@ -695,6 +704,7 @@ async function executeMultiFileProject(
                 // 预览面板继续流式接收 stdout（终端效果）。
                 // 普通脚本不打印 localhost 地址 → 不触发 → 仍等进程退出返回完整结果
                 setTimeout(() => {
+                  if (serviceGuard) clearTimeout(serviceGuard);
                   resolve({
                     success: true,
                     output: outputLines.join('\n') + `\n\n✅ 服务已启动: ${detectedUrl}`,
@@ -711,7 +721,8 @@ async function executeMultiFileProject(
           } else if (data.type === 'close') {
             const exitCode = data.exitCode || 0;
             onProgress?.({ type: 'complete', data: `Exit code: ${exitCode}` });
-            
+            if (serviceGuard) clearTimeout(serviceGuard);
+
             resolve({
               success: exitCode === 0,
               output: outputLines.join('\n'),
@@ -723,6 +734,23 @@ async function executeMultiFileProject(
           }
         }
       });
+
+    // 🔥 90s 无条件兜底脱管（结构性保证：绝不卡死在 Run 等待）——不枚举执行类型（穷举必漏：
+    //    先漏 ts-node、再漏任何新增类型），只认时间：90s 内既未检测到访问地址、进程也未退出，
+    //    即脱管转后台并交还控制权。宁可提前交还（长任务转后台，LLM 靠 get_task_detail 轮询
+    //    日志确认结果，超 90s 的构建同理），绝不占死 LLM 执行通道等满 timeout（默认 600s）。
+    const SERVICE_WAIT_CAP_MS = 90_000;
+    const serviceGuard = setTimeout(() => {
+      if (detectedUrl) return; // 已检测到地址提前 resolve，无需兜底
+      (window as any).electron?.send?.('system:detach-command', { executionId: streamHandle.executionId });
+      resolve({
+        success: true,
+        output: outputLines.join('\n') + `\n\n⏱️ 已运行 ${SERVICE_WAIT_CAP_MS / 1000}s：未检测到访问地址、进程也未退出。进程已转后台继续运行（不再阻塞等待）——本次返回仅代表启动成功，不代表任务完成，切勿向用户谎报完成。\n- 推理/训练等长任务：仍在后台跑，用 get_task_detail 轮询增量输出，直到日志出现退出码才算结束\n- 服务类：用 get_task_detail 查日志确认实际监听端口/地址\n- 若预期它应很快退出：可能卡住了，查日志排查`,
+        executionTime: Date.now() - startTime,
+        exitCode: 0,
+        executionType: commandType as any,
+      });
+    }, SERVICE_WAIT_CAP_MS);
 
     // 超时处理
     setTimeout(() => {

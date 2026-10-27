@@ -187,7 +187,7 @@ export const AVAILABLE_TOOLS: ToolDefinition[] = [
   { id: 11, name: "delete_project_file", displayName: "删除项目文件", tokens: ["gather", "execution"], params: "projectId, filePath" },
 
   // 🔥 代码执行工具（local=本地 / cloud=云端）
-  { id: 12, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(只传=自动探测入口执行整个项目), mainFile?(指定入口，须已存在), code?(临时脚本，探路请用userpc_shell)。服务类(npm dev等)自动脱管常驻,不随任务结束终止,直至项目窗口关闭" },
+  { id: 12, name: "run_project_onlocal", displayName: "本地执行项目代码", tokens: ["gather", "execution"], params: "projectId(短id可; 只传=自动探测入口执行整个项目), mainFile?(指定入口)。进程随项目窗口存活,长任务/服务自动转后台不阻塞" },
   { id: 13, name: "run_project_oncloud", displayName: "云端运行项目代码", tokens: ["gather", "execution"], params: "projectId, instanceType(S5.*=CPU，GN*/ecs.*=GPU), wait?(默认true，false=稍后用户自己看结果)。仅跑码,不可部署" },
   { id: 14, name: "userpc_shell", displayName: "执行shell命令", tokens: ["gather", "execution"], params: "command, credentialName?(py长脚本须加 -u，静默会被判死)" },
   { id: 15, name: "userpc_run_python", displayName: "运行Python脚本", tokens: ["gather", "execution"], params: "code, credentialName?(凭据注入; 联网必带timeout≤30)" },

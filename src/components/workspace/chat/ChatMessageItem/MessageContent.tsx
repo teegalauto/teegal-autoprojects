@@ -502,15 +502,18 @@ const preprocessMessageText = (text: string): string => {
 
 // 🔥 预处理数值范围中的波浪号：防止 remark-gfm 将 ~ 误解析为删除线 ~~
 //
-// 核心问题：LLM 输出中的数值范围（如 "-50~50"、"0.02~0.025"）使用 ~ 作为范围分隔符，
-// 当相邻的 ~ 被 remark-gfm 配对成 ~~ 时，中间大段文字会被错误渲染为删除线。
-// 例如："输出范围 -50~50，huberdelta 提高到 20...改成 -50~50" 中，
-// remark-gfm 看到 ~50~...~50~ 配对为 ~~50...50~~，导致整段文字被划线。
+// 核心问题：remark-gfm 的删除线**单 ~ 也会配对**（GFM singleTilde 默认开启），且同一 markdown
+// 段落内距离无限远——LLM 输出里的中文范围（"几十~几百张"、"数十万~百万级"）前后两个 ~ 相隔半篇
+// 文章也会配成 ~~...~~，中间大段内容整段被渲染为删除线。
 //
-// 解决方案：在预处理阶段将数值范围中的 ~ 转义为 \~，阻止 remark-gfm 配对。
-// 匹配模式：数字(含负号、小数点) + ~ + 数字(含负号、小数点)
+// 旧方案只转义"数字~数字"（-50~50），中文夹在中间的 ~ 全漏（LLM 最爱写中文范围），导致
+// "修了东墙西墙还倒"。新方案（保护合法、转义其余）：
+//   1. 保护代码/数学/成对 ~~真删除线~~（合法语法原样保留）
+//   2. 剩余所有单 ~ 一律转义为 \~——无论数字范围、中文范围还是孤波浪，全部失去配对能力，
+//      渲染为字面 ~ 字符
+//
 const preprocessNumericRanges = (text: string): string => {
-  // 保护代码块和行内代码
+  // 保护代码块、行内代码、数学公式、成对的双波浪删除线（合法语法）
   const placeholders: string[] = [];
   let phId = 0;
   const protect = (content: string): string => {
@@ -518,11 +521,10 @@ const preprocessNumericRanges = (text: string): string => {
     return `\x00NR${phId++}\x00`;
   };
 
-  let result = text.replace(/```[\s\S]*?```|`[^`]+`/g, protect);
+  let result = text.replace(/```[\s\S]*?```|`[^`]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|~~[^~\n]+~~/g, protect);
 
-  // 匹配数值范围中的 ~：前面是数字/小数点/负号，后面是数字/负号
-  // 例如：-50~50 → -50\~50, 0.02~0.025 → 0.02\~0.025
-  result = result.replace(/([\d.\-])~(-?[\d.])/g, '$1\\~$2');
+  // 剩余所有单 ~ 全部转义（中文范围/数字范围/孤波浪——remark-gfm 单 ~ 会跨远距离配对成删除线）
+  result = result.replace(/~/g, '\\~');
 
   // 还原被保护的内容
   result = result.replace(/\x00NR(\d+)\x00/g, (_, idx) => {

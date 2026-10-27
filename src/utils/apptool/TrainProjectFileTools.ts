@@ -1920,8 +1920,11 @@ export async function executeEditProjectFileTool(
       fileMessages.push('💡 涉及 TS 文件：建议跑 npx tsc --noEmit 验证（可选，报错可自纠）');
     }
 
+    // 🔥 全部失败必须带 error：ReActExecutor 的失败日志/给 LLM 的错误信号都读 result.error，
+    //    只写 data.message 会导致 error=undefined（失败原因对 LLM 不可见，浪费轮次瞎重试）
     return {
       success: anySuccess,
+      ...(anySuccess ? {} : { error: fileMessages.join('\n\n') || '所有编辑均未应用' }),
       data: {
         type: 'fileEdited',
         appId: fullAppId,
