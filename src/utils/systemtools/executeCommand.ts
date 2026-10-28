@@ -508,6 +508,25 @@ function inferTimeout(_command: string): number {
   return 1800;
 }
 
+// 🔥 原样重试短路：同一命令（空白归一化+剥掉重定向装饰后）连续失败 2 次，第 3 次执行前直接拒绝。
+//    实测 chat-agent 轨迹：测试失败输出一字不差仍连跑 4 轮（含化装重试 |Out-String、*>文件），每轮零新信息纯烧轮次。
+//    拦截报错强制 LLM 转向读代码/写诊断脚本定位根因；逃生口=修改命令实质（加诊断输出/调参数），
+//    修改后归一化串不同自动解锁。成功即清除计数；Map 超限整表清空防泄漏。
+const RETRY_FAIL_LIMIT = 2;
+const _cmdFailCounts = new Map<string, number>();
+const normalizeCommandForRetry = (c: string): string => c
+  .replace(/\s*\|>\s*\S+|\s*>\s*\S+\s+2>&1|\s+2>&1\s*>\s*\S+|\s*\|\s*Out-String|\s*\|\s*Select-Object\s+-Last\s+\d+/gi, '')
+  .replace(/\s+/g, ' ')
+  .trim();
+const recordCommandFailure = (cmd: string): void => {
+  const key = normalizeCommandForRetry(cmd);
+  _cmdFailCounts.set(key, (_cmdFailCounts.get(key) || 0) + 1);
+  if (_cmdFailCounts.size > 100) _cmdFailCounts.clear();
+};
+const recordCommandSuccess = (cmd: string): void => {
+  _cmdFailCounts.delete(normalizeCommandForRetry(cmd));
+};
+
 export async function executeExecuteCommandTool(
   step: AutoStep,
   _planId: string,
@@ -667,6 +686,30 @@ export async function executeExecuteCommandTool(
     };
   }
 
+  // 🔥 原样重试短路：同一命令连续失败 2 次后拒绝执行（记录点在 close/timeout/非 electron 的 resolve 处）
+  if ((_cmdFailCounts.get(normalizeCommandForRetry(command)) || 0) >= RETRY_FAIL_LIMIT) {
+    const msg = formatErrorMessage({
+      title: `❌ 同一命令已连续失败 ${RETRY_FAIL_LIMIT} 次，原样重试已被拦截`,
+      reason: '该命令与上一次实质相同（仅空白/重定向装饰差异），失败输出也一致——再跑一次不会产生任何新信息，只会继续烧轮次',
+      suggestion: `正确做法：
+1. 失败信息已具备定位条件时：改用 read_project_file 读相关代码、或写诊断脚本打印中间状态，定位根因后修代码，再跑测试
+2. 确信是偶发问题（网络抖动/端口刚释放）必须重试：请修改命令实质（加诊断输出、调整参数），修改后的命令不受此限制`
+    });
+    return {
+      success: false,
+      error: msg,
+      data: {
+        type: 'terminal',
+        command,
+        outputs: [msg],
+        exitCode: -1,
+        executionTime: 0,
+        error: msg,
+      },
+      metadata: { toolName: 'userpc_shell' },
+    };
+  }
+
   // 🔥 macOS/Linux 无 plink（Windows 工具）：对称短路返回平台指引——bash 的 command not found
   //    同样会让 LLM 乱猜（装 putty / 改 paramiko），结构化指引把它一次拉回正确通道
   if (getPlatform() !== 'windows' && /^\s*plink\b/.test(command)) {
@@ -763,7 +806,18 @@ export async function executeExecuteCommandTool(
             //    "plink: "/"FATAL ERROR: " 前缀，按前缀改判，不会误伤正常 echo 输出
             const plinkAuthFailed = /\bplink\b/i.test(command)
               && outputLines.some(l => /plink: |FATAL ERROR: |Configured password was not accepted/i.test(l));
-            const isSuccess = data.exitCode === 0 && !plinkAuthFailed;
+            // 🔥 假成功降级：PS5 的 CommandNotFoundException 不改退出码（exitCode 照样 0），
+            //    但 && / | 链上该段之后的命令实际没执行（实测 npm install | tail -5 整条空跑却报成功）。
+            //    参数绑定类同理（mvrls5kd 轨迹实证）：cmd 语法 cd /d 在 PS 下报"找不到接受实际参数"，
+            //    && 链短路，后面的 npm install 整条静默跳过却报 success:true。"成功"比"失败"更毒——
+            //    LLM 会跳过后续步骤。识别即降级失败并给等价命令/语法指引
+            const commandNotFound = outputLines.some(l => /CommandNotFoundException|无法将".*"项识别为 cmdlet|无法将“.*”项识别为 cmdlet/i.test(l));
+            const psInvocationFailed = commandNotFound
+              || outputLines.some(l => /找不到接受实际参数|ParameterBindingException|PositionalParameterNotFound/i.test(l));
+            const isSuccess = data.exitCode === 0 && !plinkAuthFailed && !psInvocationFailed;
+
+            // 🔥 原样重试短路记账：成败都记（失败累计、成功清零）
+            if (isSuccess) { recordCommandSuccess(command); } else { recordCommandFailure(command); }
 
             console.log('📥 [EXECUTE-COMMAND-TOOL] close 事件:', { exitCode: data.exitCode, isSuccess, outputLines: outputLines.length });
 
@@ -815,6 +869,14 @@ export async function executeExecuteCommandTool(
             const notFoundHint = (!isSuccess && data.exitCode !== null)
               ? buildCommandNotFoundHint(outputLines.join('\n'))
               : '';
+            // 🔥 PS5 假成功降级后的等价命令指引：Unix 管道工具在 PS5 不存在
+            const psNotFoundHint = commandNotFound
+              ? '\n\n💡 PowerShell 5 没有 tail/head/grep/wc 等 Unix 命令（报 CommandNotFoundException，且 && / | 链上该段之后的命令实际未执行）。等价替换：tail -N → Select-Object -Last N；grep → Select-String；wc -l → (Measure-Object -Line).Lines。修正后整条重跑'
+              : '';
+            // 🔥 参数绑定类假成功降级后的语法指引（cmd 语法混进 PowerShell 等场景）
+            const psBindingHint = (!commandNotFound && psInvocationFailed)
+              ? '\n\n💡 这是 PowerShell 参数绑定错误（命令语法在该 shell 下不合法，&& 链上后续命令实际未执行）。常见错配：cmd 的 cd /d → PowerShell 直接 cd "路径"（无需 /d）；带引号的路径没加调用运算符 → & "路径" 参数。修正语法后整条重跑'
+              : '';
             // 🔥 PowerShell 语法自救：带引号的可执行路径要用 & 调用（LLM 抄激活模板常丢 &，同一 ParserError 连环烧轮）
             const stderrText = outputLines.join('\n');
             const psSyntaxHint = (!isSuccess && /UnexpectedToken|意外的标记/.test(stderrText) && /^\s*["'][^"']+\.(exe|ps1|bat|cmd)["']\s+-/.test(command))
@@ -826,7 +888,7 @@ export async function executeExecuteCommandTool(
               : '';
             resolve({
               success: isSuccess,
-              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}${notFoundHint}${psSyntaxHint}`,
+              error: isSuccess ? undefined : `命令执行失败（退出码: ${data.exitCode}）\n${outputLines.filter(l => l.startsWith('[stderr]')).join('\n')}${guardHint}${notFoundHint}${psNotFoundHint}${psBindingHint}${psSyntaxHint}`,
               data: {
                 type: 'terminal',
                 command,
@@ -845,6 +907,7 @@ export async function executeExecuteCommandTool(
           } else if (data.type === 'timeout') {
             if (isResolved) return;
             isResolved = true;
+            recordCommandFailure(command); // 🔥 原样重试短路记账：超时也是失败
             // 🔥 透传主进程的区分文案：总时长超时 vs 无输出挂起终止（LLM 据此选择不同自救策略）
             const timeoutMsg = data.error || '命令执行超时';
             // 🔥 自愈指引：只讲问题 + 机制 + 怎么构建命令（不导向具体工具，shell 可能跑的并非项目内容）
@@ -894,6 +957,8 @@ export async function executeExecuteCommandTool(
       }, timeout * 1000 + 10000);
     } else {
       handleExecuteCommand({ command, timeout, workingDir }).then(async (result) => {
+        // 🔥 原样重试短路记账（非 Electron 分支同样生效）
+        if (result.success) { recordCommandSuccess(command); } else { recordCommandFailure(command); }
         resolve({
           success: result.success,
           data: {

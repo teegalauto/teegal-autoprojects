@@ -87,6 +87,32 @@ function trimToolResultsForPayload(toolResults: ToolResult[], keepFull: number):
   });
 }
 
+/**
+ * 🔥 只读侦察打转预警：连续多轮 read/list 只读不写是"读了又读不落笔"的拖延信号
+ * （mvrls5kd 轨迹实证：30+ 轮反复读类型/签名，三轮自称"最后一次读取"，宣布"下一轮一次性写"
+ * 却从不兑现）。不拦截调用（大文件分段读是正当场景），只在阈值点注入点名提醒逼当场落笔；
+ * 逃生门指向笔记机制（笔记跨归档周期存留，是关键契约的正确存放处，该轨迹里 LLM 一条笔记没写）。
+ */
+const READONLY_RECON_TOOLS = new Set(['read_project_file', 'list_project_files']);
+
+/** 连续只读轮数：从最新条目向前数，遇到任何非只读工具即停（写/执行/complete 都算破环） */
+function readReconStreak(toolResults: ToolResult[]): number {
+  let n = 0;
+  for (let i = toolResults.length - 1; i >= 0; i--) {
+    if (READONLY_RECON_TOOLS.has(toolResults[i]?.toolName || '')) n++;
+    else break;
+  }
+  return n;
+}
+
+/** 连续只读 ≥4 轮时注入（4/8/12…每 +4 再提一次），返回空串=本轮不提醒 */
+function buildReadLoopReminder(toolResults: ToolResult[]): string {
+  const streak = readReconStreak(toolResults);
+  if (streak < 4 || (streak - 4) % 4 !== 0) return '';
+  console.log(`🔄 [REACT-EXECUTOR] 只读打转预警注入: 连续 ${streak} 轮只读未写`);
+  return `⚠️ 打转预警（系统检测）：已连续 ${streak} 轮只读文件、未做任何写入。这是"先再核对一下"式拖延的信号——立即当轮落笔开始写代码；若确有怕丢的关键字段/签名，本轮先用一次 save_project_file 写成笔记（笔记跨归档周期存留），之后凭笔记写，禁止再读原文件。`;
+}
+
 export interface ReActCallbacks {
   onMessage: (callId: string, message: Partial<{
     role: 'user' | 'assistant' | 'system' | 'auto';
@@ -313,6 +339,8 @@ export class ReActExecutor {
     roundNumber: number;
     toolResults: ToolResult[];
     writeNotes: string;
+    /** 🔥 本轮注入的系统提醒（只读打转预警等），经独立通道渲染在 prompt 尾部 */
+    systemReminder?: string;
   }): Promise<ToolResult[]> {
     const {
       sessionId,
@@ -326,6 +354,7 @@ export class ReActExecutor {
       roundNumber,
       toolResults,
       writeNotes,
+      systemReminder,
     } = params;
 
     const MAX_ROUNDS = 500;
@@ -357,6 +386,7 @@ export class ReActExecutor {
       sessionId,
       userId,
       conversationId,
+      systemReminder,
       userQuery,
       letAgentTodo,
       toolResults: windowedToolResults,   // 🔥 窗口化
@@ -579,6 +609,7 @@ export class ReActExecutor {
         roundNumber: roundNumber + 1,
         toolResults,
         writeNotes: currentWriteNotes,
+        systemReminder: buildReadLoopReminder(toolResults),
       });
     }
 
@@ -619,7 +650,7 @@ export class ReActExecutor {
       console.log(`[REACT-EXECUTOR] Round ${roundNumber} 主动归档: ${archBoundary}/${toolResults.length} 条旧结果标记为归档（保留最近 ${keep} 条完整）`);
     }
 
-    // 🔥 递归调用
+    // 🔥 递归调用（系统提醒按最新历史重算：连续只读≥4轮时注入打转预警）
     return this.handleRound({
       sessionId,
       userId,
@@ -632,6 +663,7 @@ export class ReActExecutor {
       roundNumber: roundNumber + 1,
       toolResults: [...toolResults, ...executedResults],
       writeNotes: currentWriteNotes,
+      systemReminder: buildReadLoopReminder([...toolResults, ...executedResults]),
     });
   }
 
@@ -768,6 +800,8 @@ export class ReActExecutor {
     letAgentTodo: string;
     toolResults: ToolResult[];
     writeNotes?: string;
+    /** 🔥 系统提醒（只读打转预警等），透传给后端渲染在 prompt 尾部 */
+    systemReminder?: string;
   }): Promise<ReActRoundResponse> {
     const {
       roundNumber,
@@ -779,6 +813,7 @@ export class ReActExecutor {
       letAgentTodo,
       toolResults,
       writeNotes,
+      systemReminder,
     } = params;
 
     try {
@@ -820,6 +855,7 @@ export class ReActExecutor {
         environmentText: environmentResult.text,
         staticEnvironmentText: environmentResult.staticText,
         dynamicEnvironmentText: environmentResult.dynamicText,
+        systemReminder,
         writeNotes,
         // 🔥 推理强度（用户级偏好）：UI 写 localStorage，这里直接读——不经过 UI→Panel→Handler
         //    的长传参链。未设置时 undefined，backend 用默认档。三档声明意图，LLMService 按模型族映射

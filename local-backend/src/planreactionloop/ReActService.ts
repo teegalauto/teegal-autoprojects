@@ -56,6 +56,8 @@ export interface ReActRoundRequest {
   staticEnvironmentText?: string; // 🔥 固定部分环境文本（ExecutionTools、UserPC 等，每轮不变）
   dynamicEnvironmentText?: string; // 🔥 动态部分环境文本（ImportantObjects、UserInjectMessages 等）
   writeNotes?: string; // 🔥 工作笔记，防止遗忘
+  /** 🔥 系统提醒（executor 检测到异常模式如只读打转时注入），独立于结果体渲染在 prompt 尾部 */
+  systemReminder?: string;
   /** 🔥 推理强度（'low'|'high'）：前端 UI 用户偏好，缺省用默认档。glm-5.3 low 档写代码明显弱 */
   reasoningEffort?: string;
 }
@@ -103,6 +105,7 @@ export class ReActService {
       staticEnvironmentText,
       dynamicEnvironmentText,
       writeNotes,
+      systemReminder,
       reasoningEffort,
     } = request;
 
@@ -128,6 +131,7 @@ export class ReActService {
         staticEnvironmentText,
         dynamicEnvironmentText,
         writeNotes,
+        systemReminder, // 🔥 打转预警等系统提醒，渲染在 prompt 尾部（独立通道，不被结果体预算截断）
         clearWindow: CLEAR_WINDOW, // 🔥 传入 clearWindow，保持与截断逻辑一致
         maxHistoryChars: MAX_HISTORY_CHARS, // 🔥 历史体积预算，超出自动梯度压缩
         sessionId, // 🔥 压缩级棘轮按 session 记忆（压缩一旦激活不回落，防历史内容反复变化打断缓存）

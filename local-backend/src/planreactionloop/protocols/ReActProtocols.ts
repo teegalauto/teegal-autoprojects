@@ -66,7 +66,7 @@ const STANDARD_REACT_PROTOCOL: ReActProtocolConfig = {
 
 轮次: {roundNumber}/{maxRounds} | 剩余: {remainingRounds}
 ⚠️请仔细参考执行历史，切勿重复执行操作。
-⚠️请遵从systemprompt的格式返回JSON，不要包含其他文本。`,
+{systemReminder}⚠️请遵从systemprompt的格式返回JSON，不要包含其他文本。`,
 };
 
 /**
@@ -425,6 +425,8 @@ export const ReActProtocols = {
     /** 🔥 动态部分环境文本（ImportantObjects、UserInjectMessages 等，可能每轮变化） */
     dynamicEnvironmentText?: string;
     writeNotes?: string;
+    /** 🔥 系统提醒（executor 检测到异常模式注入，如只读打转预警）；空=不渲染 */
+    systemReminder?: string;
     clearWindow?: number; // 🔥 折叠批次大小
     maxHistoryChars?: number; // 🔥 执行历史体积预算（字符），超出自动梯度压缩
     sessionId?: string; // 🔥 会话标识（压缩级棘轮按 session 记忆，可选）
@@ -434,7 +436,7 @@ export const ReActProtocols = {
     /** 🔥 prompt 分项体积（字符）：executionHistory / staticEnv / dynamicEnv，用于每轮体积归因 */
     parts: { history: number; staticEnv: number; dynamicEnv: number; autoArchived: number };
   } => {
-    const { roundNumber, maxRounds, userQuery, letAgentTodo, relevantFiles, toolResults, environmentText, staticEnvironmentText, dynamicEnvironmentText, writeNotes, clearWindow = 1, maxHistoryChars = 36000, sessionId } = params;
+    const { roundNumber, maxRounds, userQuery, letAgentTodo, relevantFiles, toolResults, environmentText, staticEnvironmentText, dynamicEnvironmentText, writeNotes, systemReminder, clearWindow = 1, maxHistoryChars = 36000, sessionId } = params;
 
     const { text: executionHistory, autoArchived } = buildExecutionHistory(toolResults, clearWindow, writeNotes, maxHistoryChars, sessionId);
     const remainingRounds = maxRounds - roundNumber;
@@ -453,7 +455,9 @@ export const ReActProtocols = {
       .replace('{remainingRounds}', String(remainingRounds))
       .replace('{staticEnvironment}', staticEnv)
       .replace('{dynamicEnvironment}', dynamicEnv)
-      .replace('{executionHistory}', executionHistory);
+      .replace('{executionHistory}', executionHistory)
+      // 🔥 系统提醒带尾随换行：无提醒时占位替换为空串不留残行，有提醒时与下一行隔开
+      .replace('{systemReminder}', systemReminder ? `${systemReminder}\n` : '');
 
     // 🔥 prompt 体积监控：超过 200KB 说明有内容异常膨胀（正常 1-2 万 token ≈ 40-80KB）
     const promptSize = systemPrompt.length + userPrompt.length;
