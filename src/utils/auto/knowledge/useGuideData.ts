@@ -397,6 +397,7 @@ return { success: true, data: { greeting: '你好，' + name } };
 - 前端点击"运行"按钮
 - 临时脚本用 userpc_run_python；跑项目用 run_project_onlocal(projectId='xxx')（自动探测入口，服务类自动脱管常驻）
 - 也可云端 CPU 执行：run_project_oncloud(instanceType='S5.*')，适合本地环境缺依赖的任务
+- 🔥 3001/3002 是 Teegal 自身后端端口（生产/开发），项目服务和测试脚本禁止占用或清理这两个端口——"清理残留端口"会杀死宿主 Teegal，导致用户界面整体瘫痪。端口冲突时项目改用其他端口（3000/5173/8xxx 等）
 
 🔥 重要提示：本地执行仅适合轻量级 Python 脚本、数据处理、Web 开发等 CPU 任务。
 如果代码包含 torch、cuda、transformers 等深度学习组件，强烈建议使用 GPU 训练（run_project_oncloud），原因：

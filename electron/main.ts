@@ -33,6 +33,16 @@ let appViewerWindow: BrowserWindow | null = null;
 // 这样开发版本和生产版本可以同时运行，互不干扰
 let BACKEND_PORT = 3001; // 默认生产端口
 
+// 🔥 后端看门狗：进程被杀/崩溃后自动重启（真实案例：项目测试脚本"清理端口 3001"误杀宿主后端，
+//    渲染层全部请求 CONNECTION_REFUSED、项目管理面板空白，直到手动重启应用才恢复）。
+//    2s/5s/10s 退避重试 3 次；存活超 5 分钟视为稳定运行，计数归零（长期稳定后被杀按首次处理）。
+//    应用主动退出（before-quit/will-quit/window-all-closed 调 cleanupBackendProcess）时不重启。
+let backendRestartAttempts = 0;
+let isQuittingApp = false;
+let backendStartedAt = 0;
+const BACKEND_RESTART_DELAYS_MS = [2000, 5000, 10000];
+const BACKEND_STABLE_RESET_MS = 5 * 60 * 1000;
+
 // 🔥 日志文件路径
 let logFilePath: string;
 
@@ -274,8 +284,33 @@ function startBackendServer() {
 
   backendProcess.on('exit', (code) => {
     log(`⚠️ 后端服务退出，退出码: ${code}`);
+
+    // 🔥 看门狗：非应用退出导致的死亡（被误杀/崩溃）自动重启，避免 3001 无人监听直到手动重启应用
+    if (isQuittingApp) {
+      log('🛑 应用正在退出，后端不重启');
+      return;
+    }
+    if (backendStartedAt && Date.now() - backendStartedAt > BACKEND_STABLE_RESET_MS) {
+      backendRestartAttempts = 0;
+    }
+    if (backendRestartAttempts >= BACKEND_RESTART_DELAYS_MS.length) {
+      log('❌ [BACKEND-WATCHDOG] 后端自动重启已达上限（3 次），放弃。请重启 Teegal');
+      return;
+    }
+    const delay = BACKEND_RESTART_DELAYS_MS[backendRestartAttempts];
+    backendRestartAttempts++;
+    log(`♻️ [BACKEND-WATCHDOG] ${delay}ms 后进行第 ${backendRestartAttempts} 次自动重启...`);
+    setTimeout(() => {
+      if (isQuittingApp) return;
+      try {
+        startBackendServer();
+      } catch (e) {
+        log('❌ [BACKEND-WATCHDOG] 重启失败: ' + (e instanceof Error ? e.message : String(e)));
+      }
+    }, delay);
   });
 
+  backendStartedAt = Date.now();
   log('✅ 后端服务进程已创建，端口: ' + BACKEND_PORT);
 }
 
@@ -759,6 +794,8 @@ app.whenReady().then(async () => {
  * 清理后端进程
  */
 function cleanupBackendProcess() {
+  // 🔥 看门狗联动：应用主动退出时的清理，exit 回调不得触发自动重启
+  isQuittingApp = true;
   if (backendProcess && backendProcess.pid) {
     try {
       console.log('🛑 正在关闭后端服务... PID:', backendProcess.pid);

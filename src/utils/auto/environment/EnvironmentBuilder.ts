@@ -411,8 +411,20 @@ ${knowledgeText}`;
     // 云端产物交付提醒：仅当检测到运行中的云端实例时注入（本地任务不出现，避免误导与 token 浪费）
     const cloudHint = await this.getCloudDeliverHint();
 
+    // 🔥 宿主端口保护（每轮必见；知识库是被动的，关键词不命中就看不到）：
+    //    真实案例：项目测试脚本把 3001 写进 killPort 清理名单，宿主后端被杀，
+    //    渲染层全部请求 CONNECTION_REFUSED、项目管理面板空白
+    let hostPortHint = '';
+    try {
+      const backendPort = new URL(getBackendUrl()).port;
+      if (backendPort) {
+        hostPortHint = `- Teegal宿主端口: ${backendPort}（禁止占用/清理）`;
+      }
+    } catch { /* URL 解析失败不注入 */ }
+
     const sections = [`## 用户环境`, envInfo, pathHint];
     if (cloudHint) sections.push(cloudHint);
+    if (hostPortHint) sections.push(hostPortHint);
     return sections.join('\n');
   }
 

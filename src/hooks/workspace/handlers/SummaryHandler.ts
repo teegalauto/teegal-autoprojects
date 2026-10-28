@@ -271,6 +271,7 @@ export class SummaryHandler {
     //    计时器定格不了真实终止时刻，且下一轮消息触发重查时误入 unknown 活跃窗口假走字
     context.sessionInfo.completedAt = new Date();
     SummaryHandler.sessionList.push({ ...context.sessionInfo });
+    SummaryHandler.persistFinalState(context.sessionInfo);
 
     // 🔥 通知 ReActExecutor 停止（静态方法无实例上下文，conversationId 从 context 取）
     const reActExecutor = ReActExecutor.getInstance();
@@ -335,6 +336,11 @@ export class SummaryHandler {
           endTime: info.completedAt,
         };
       }
+      // 🔥 内存账全空（典型：Ctrl+R 刷新后回看已完成 session，static 账本不跨刷新）——
+      //    查 localStorage 终态持久化兜底。拿到终态就能给 UI 真实 endTime，计时器直接定格，
+      //    不会再落进"unknown+近 5 分钟消息"的活跃窗口假走字（实测刷新后计时器走满 5 分钟才自愈）
+      const persisted = SummaryHandler.readFinalState(sessionId);
+      if (persisted) return persisted;
       return { status: 'unknown' };
     }
     return {
@@ -342,6 +348,48 @@ export class SummaryHandler {
       startTime: context.sessionInfo.startedAt,
       endTime: context.sessionInfo.completedAt,
     };
+  }
+
+  // 🔥 终态持久化（localStorage，跨刷新存活）：sessionContexts/sessionList 都是内存 static，
+  //    刷新后全空——刚结束的 session 被组件的 5 分钟活跃窗口误判"仍活跃"，计时器假走字。
+  //    只存终态（completed/failed/killed）的最小元组，容量上限 100 条，FIFO 逐出
+  private static finalStateKey(sessionId: string): string {
+    return `teegal_session_final:${sessionId}`;
+  }
+
+  private static persistFinalState(info: SessionInfo): void {
+    try {
+      if (!info.sessionId) return;
+      if (info.status !== 'completed' && info.status !== 'failed' && info.status !== 'killed') return;
+      localStorage.setItem(SummaryHandler.finalStateKey(info.sessionId), JSON.stringify({
+        status: info.status,
+        startedAt: info.startedAt?.toISOString(),
+        completedAt: info.completedAt?.toISOString(),
+        at: Date.now(),
+      }));
+      const indexKey = 'teegal_session_final_index';
+      const idx: string[] = JSON.parse(localStorage.getItem(indexKey) || '[]');
+      if (!idx.includes(info.sessionId)) idx.push(info.sessionId);
+      while (idx.length > 100) {
+        const evict = idx.shift();
+        if (evict) localStorage.removeItem(SummaryHandler.finalStateKey(evict));
+      }
+      localStorage.setItem(indexKey, JSON.stringify(idx));
+    } catch { /* 存储异常不影响主流程 */ }
+  }
+
+  private static readFinalState(sessionId: string): { status: 'completed' | 'failed' | 'killed'; startTime?: Date; endTime?: Date } | null {
+    try {
+      const raw = localStorage.getItem(SummaryHandler.finalStateKey(sessionId));
+      if (!raw) return null;
+      const e = JSON.parse(raw);
+      if (!e?.status) return null;
+      return {
+        status: e.status,
+        startTime: e.startedAt ? new Date(e.startedAt) : undefined,
+        endTime: e.completedAt ? new Date(e.completedAt) : undefined,
+      };
+    } catch { return null; }
   }
 
   private parseSayToUser(sayToUser: string): { isInteraction: boolean; message: string } {
@@ -626,6 +674,7 @@ export class SummaryHandler {
     context.sessionInfo.status = 'killed';
     context.sessionInfo.completedAt = new Date();
     SummaryHandler.sessionList.push({ ...context.sessionInfo });
+    SummaryHandler.persistFinalState(context.sessionInfo);
     context.status = 'killed';
   }
 
@@ -639,6 +688,7 @@ export class SummaryHandler {
       context.sessionInfo.status = 'failed';
       context.sessionInfo.completedAt = new Date();
       SummaryHandler.sessionList.push({ ...context.sessionInfo });
+      SummaryHandler.persistFinalState(context.sessionInfo);
       context.status = 'failed';
       return { sessionId: context.sessionId, success: false };
     }
@@ -691,6 +741,7 @@ export class SummaryHandler {
 
     // 🔥 把完成的 session 加入 sessionList（不包含 completeReport）
     SummaryHandler.sessionList.push({ ...context.sessionInfo });
+    SummaryHandler.persistFinalState(context.sessionInfo);
     context.status = 'completed';
 
     // 🔥 等待收尾消息落库：工具回包经异步 IPC 逐条写入 workspace.messages，gather 立即触发会让
@@ -741,6 +792,7 @@ export class SummaryHandler {
             context.sessionInfo.status = 'failed';
             context.sessionInfo.completedAt = new Date();
             SummaryHandler.sessionList.push({ ...context.sessionInfo });
+            SummaryHandler.persistFinalState(context.sessionInfo);
           }
 
           // 🔥 异常时也触发 sessionCompleted 事件
