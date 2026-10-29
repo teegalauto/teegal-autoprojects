@@ -87,7 +87,8 @@ router.post('/', (req, res) => {
     const {
       id, name, description, code, config, preview, user_id,
       env_vars, current_code, previous_code,
-      definition, interface_spec, market_status, market_app_id
+      definition, interface_spec, market_status, market_app_id,
+      project_type
     } = req.body;
 
     if (!name || !user_id) {
@@ -117,6 +118,8 @@ router.post('/', (req, res) => {
       code_path: null,
       // 🔥 项目类型（普通创建走 normal，基础项目由 ensure 接口单独创建）
       app_type: 'normal' as const,
+      // 🔥 项目场景类型（LLM 创建时选择）
+      project_type: project_type || null,
     };
 
     const app = desktopAppDAO.create(appData);

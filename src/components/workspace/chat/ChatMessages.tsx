@@ -246,7 +246,9 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
       if (!force && now - lastFetchAtRef.current < 10_000) return;
       lastFetchAtRef.current = now;
       try {
-        const resp = await ApiClient.llm.sessionAggregates(2);
+        // 🔥 窗口取 365 天：对话里的历史回合可能跨越数日前（此前 days=2，两天前的回合
+        // session 聚合查不到 → 历史回合一律不显示 token，被误读成"全累加到最后回合"）
+        const resp = await ApiClient.llm.sessionAggregates(365);
         const list = resp?.data;
         if (cancelled || !Array.isArray(list)) return;
         const map = new Map<string, number>();

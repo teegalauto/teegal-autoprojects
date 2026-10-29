@@ -30,6 +30,8 @@ export interface DesktopApp {
   market_status?: 'local' | 'outworking';  // 市场状态：local=本地，outworking=出门工作中
   // 🔥 项目类型：normal=普通项目，system_base=系统基础项目（不可删除，如扩展工具）
   app_type?: 'normal' | 'system_base';
+  // 🔥 项目场景类型（LLM upsert_project 声明）：training | inference | shortfilm | agent | general；NULL=未分类
+  project_type?: string | null;
   createdAt: Date;
   updatedAt: Date;
   userId: string;

@@ -10,6 +10,25 @@
 
 import { isSameProjectId, resolveProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
+import { desktopAppStorage } from '@/services/storage';
+
+/**
+ * 🔥 项目场景类型 → 注入标签/针对性提示映射。
+ * 落库值来自 upsert_project 的 type 参数（白名单见 TrainProjectFileTools.PROJECT_TYPES）。
+ * 加新类型：此处加 label/hint + 工具白名单 + AppCard 标签。
+ */
+const PROJECT_TYPE_LABELS: Record<string, string> = {
+  training: '训练',
+  inference: '推理',
+  shortfilm: '短剧/短片',
+  agent: 'Agent编排',
+};
+// 🔥 场景 hint：一行内说完，注入行带「建议: 」前缀（可选参考，自建方案更优可不跟）
+const PROJECT_TYPE_HINTS: Record<string, string> = {
+  training: '训练项目：可先 use_guide 搜"训练"参考内置流程',
+  inference: '推理项目：可先 use_guide 搜"推理"参考内置用法',
+  shortfilm: '短剧项目：可先 use_guide 搜"短剧"参考内置制作流程',
+};
 
 export interface ProjectActivityStats {
   trainCount: number;      // GPU 训练次数
@@ -719,9 +738,16 @@ export class ImportantObjectTracker {
       //    （真实案例：manim 渲染搜不到落盘文件，被迫用脚本重抄一遍代码）
       //    注意不能用 getCodePath——普通项目 code_path 为 null，会漏掉默认路径
       const codePaths = new Map<string, string>();
+      // 🔥 场景类型（落库值，upsert_project 的 type 参数）——推测值仅作兜底
+      const typeByApp = new Map<string, string>();
       await Promise.all(apps.map(async (app) => {
-        const p = await getAppBasePath(app.id).catch(() => null);
+        const [p, row] = await Promise.all([
+          getAppBasePath(app.id).catch(() => null),
+          desktopAppStorage.getById(app.id).catch(() => null),
+        ]);
         if (p) codePaths.set(app.id, p);
+        const pt = (row as any)?.project_type;
+        if (pt) typeByApp.set(app.id, String(pt));
       }));
 
       // 🔥 运行状态（每项目 ≤20 字）：服务进程存活 + 探活状态码 + 运行时长。
@@ -758,8 +784,11 @@ export class ImportantObjectTracker {
             summary += `，${parts.join('/')}`;
           }
         }
-        if (app.inferredType && app.inferredType !== 'general') {
-          summary += `，推测${app.inferredType === 'training' ? '训练' : '推理'}项目`;
+        // 🔥 场景类型标签：只认落库值（upsert_project 由 LLM 自选），注入回来让它看到，
+        //    类型错了会自己 upsert 修正（自愈）。无落库值不加标签——推测兜底已撤，注入行尽量精简
+        const projectType = typeByApp.get(app.id);
+        if (projectType && projectType !== 'general') {
+          summary += `，${PROJECT_TYPE_LABELS[projectType] || projectType}项目`;
         }
 
         lines.push(`${index + 1}. [${timeStr}] ${shortId} (${summary})`);
@@ -805,6 +834,13 @@ export class ImportantObjectTracker {
         }
         if (owned.length === 0) {
           lines.push('   实例: 无');
+        }
+
+        // 🔥 场景针对性提示：按落库类型给行动引导（如短剧 → use_guide 搜内置制作技能）。
+        //    只在落库类型命中时出现，推测类型不给 hint（不确定的信息不引导）
+        if (typeByApp.get(app.id)) {
+          const hintText = PROJECT_TYPE_HINTS[typeByApp.get(app.id)!];
+          if (hintText) lines.push(`   建议: ${hintText}`);
         }
       });
       lines.push('');

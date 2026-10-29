@@ -48,5 +48,8 @@ export const mapDbAppToDesktopApp = (dbApp: any): DesktopApp => {
     interface_spec: dbApp.interface_spec || null,
     // 🔥 项目类型：normal=普通项目，system_base=系统基础项目（不可删除）
     app_type: dbApp.app_type || 'normal',
+    // 🔥 项目场景类型（training/inference/shortfilm/agent/general）：AppCard 标签数据源，
+    //    漏映射会导致落库了类型但卡片永远不显示标签
+    project_type: dbApp.project_type || null,
   };
 };

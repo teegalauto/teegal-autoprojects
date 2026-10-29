@@ -64,6 +64,8 @@ export interface DesktopApp {
   code_path: string | null;
   // 🔥 项目类型：normal=普通项目，system_base=基础项目（不可删除，系统级，list_projects 排在最前）
   app_type: 'normal' | 'system_base';
+  // 🔥 项目场景类型（LLM upsert_project 时选择）：training | inference | shortfilm | agent | general；NULL=未分类
+  project_type?: string | null;
   created_at: number;
   updated_at: number;
 }

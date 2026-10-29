@@ -64,10 +64,10 @@ export class DesktopAppDAO {
         id, name, description, code, config, preview, user_id,
         current_code, previous_code, env_vars,
         definition, interface_spec, market_status, model_visualization,
-        code_path, app_type,
+        code_path, app_type, project_type,
         created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -87,6 +87,7 @@ export class DesktopAppDAO {
       app.model_visualization || null,
       app.code_path || null,
       app.app_type || 'normal',
+      app.project_type || null,
       now,
       now
     );
@@ -94,6 +95,7 @@ export class DesktopAppDAO {
     return {
       ...app,
       app_type: app.app_type || 'normal',
+      project_type: app.project_type || null,
       created_at: now,
       updated_at: now
     };
@@ -231,6 +233,11 @@ export class DesktopAppDAO {
       fields.push('app_type = ?');
       values.push(updates.app_type);
     }
+    // 🔥 项目场景类型（upsert_project 的 type 参数：training/inference/shortfilm/agent/general）
+    if (updates.project_type !== undefined) {
+      fields.push('project_type = ?');
+      values.push(updates.project_type);
+    }
 
     fields.push('updated_at = ?');
     values.push(now);
@@ -293,6 +300,8 @@ export class DesktopAppDAO {
       code_path: row.code_path || null,
       // 🔥 项目类型
       app_type: row.app_type || 'normal',
+      // 🔥 项目场景类型
+      project_type: row.project_type || null,
       created_at: row.created_at,
       updated_at: row.updated_at
     };

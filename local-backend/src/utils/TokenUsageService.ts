@@ -377,7 +377,10 @@ export class TokenUsageService {
       const daily = this.stats.dailyUsages[date];
       if (!daily?.records) continue;
       for (const r of daily.records) {
-        if (r.source === 'summary' && r.sessionId === conversationId) {
+        // 🔥 conversationId 精确匹配（修复后落库的记录）；存量记录 sessionId=None（修复前
+        // SummaryService 请求体漏传 context），只能按时间窗近似归属——单用户桌面端
+        // 不同对话回合时间窗几乎不重叠，取交集风险可接受
+        if (r.source === 'summary' && (r.sessionId === conversationId || !r.sessionId)) {
           matched.push({ ts: new Date(r.timestamp).getTime(), total: r.totalTokens || 0 });
         }
       }

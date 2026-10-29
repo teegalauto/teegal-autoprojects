@@ -158,6 +158,11 @@ export const ApiClient = {
         result?: string;
       }>;
       agentMessage?: string; // 🔥 Agent 消息
+      // 🔥 透传给后端 SummaryModule：recordUsage('summary') 以 context.conversationId 为落库键
+      context?: {
+        conversationId?: string;
+        userId?: string;
+      };
     }, signal?: AbortSignal) => request<any>(ApiRoutes.AUTO.SUMMARY, { body, signal }),
 
     reactionLoopSummary: (body: {

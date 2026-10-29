@@ -607,9 +607,44 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
 创建成功后返回 projectId，然后用 save_project_file(projectId='xxx', filePath='main.py', content='...') 写入代码文件。
 项目定位/用途变化时，用 upsert_project(projectId='xxx', description='...') 更新自述，方便后续会话快速理解项目。
 
+🔥 场景类型 type 可选：training（训练）| inference（推理）| shortfilm（短剧/短片）| agent（Agent编排）| general（通用）。创建时顺手选一个，系统会按类型给针对性提示；类型选错可随时 upsert 修正。
 🔥 GPU 训练项目用 run_project_oncloud(projectId='xxx', instanceType='ecs.*') 启动训练。
 🔥 CPU 项目用 run_project_onlocal(projectId='xxx') 本地执行，或在前端点击"运行"按钮。`,
-    keywords: ["创建项目", "upsert_project", "create_project", "create_train_project", "新建项目", "创建应用", "对比实验", "新项目", "create project", "新建训练项目", "更新项目"],
+    keywords: ["创建项目", "upsert_project", "create_project", "create_train_project", "新建项目", "创建应用", "对比实验", "新项目", "create project", "新建训练项目", "更新项目", "项目类型", "项目分类"],
+    category: "platform"
+  },
+  {
+    question: "短剧/短片/视频制作项目的标准流程是什么？",
+    answer: `短片/短剧类任务建议按以下管线执行（角色与风格一致性靠"帧作锚点"而非提示词）：
+
+1. 目录约定：film/keyframes（原料帧）、film/clips（中间片段）、film/out（成品）、film/check（自查快照）——QA 快照不污染成品目录。
+2. 先定分镜和风格关键词（同一套质地/配色/纹理词在所有生图提示中逐字复述），生成关键帧与角色设定图；后续每张图都参考已有帧。
+3. 视频一律 image-to-video（以关键帧为输入），不要 text-to-video——一致性来自帧引用。
+4. 合成前 normalize（统一分辨率/帧率/时长）再拼接；重合成时缓存已转码片段。
+5. 成品自查三件套（生成≠完成，必须自查）：
+   - 视觉：抽帧（-ss 取中段）拼 contact sheet 后逐张读图，检查字幕对比度（白字落在浅色背景要加投影）、镜头衔接；
+   - 参数：ffprobe/ffmpeg -i 核对时长、分辨率、帧率是否符合承诺；
+   - 音轨：volumedetect 分段查电平，忽大忽小就换成连续合成的环境音床（lavfi anoisesrc/sine 组合 + loudnorm）。
+6. 动手前先向用户报预算（镜头数/张数/秒数），控制在承诺范围内。
+7. 镜头/片段文件按 ep01_sc02_shot03 编号命名（对应 film/keyframes、film/clips）；某镜头不满意只重生成该镜头（同路径覆盖），不要全片重跑。
+8. 批量生图/生视频每批并发 2-3、失败单张重试；每批先落盘再继续，防中断丢批次。
+
+若项目类型标记为 shortfilm，注入环境会带提示引导先查阅本技能；自建方案更优可不参考。`,
+    keywords: ["短片", "短剧", "视频制作", "影片", "生视频", "文生视频", "图生视频", "分镜", "关键帧", "视频合成", "视频剪辑", "短视频", "电影感", "角色一致性", "风格一致", "video", "film"],
+    category: "platform"
+  },
+  {
+    question: "视频/音频处理（ffmpeg）常见坑有哪些？",
+    answer: `ffmpeg 平台坑清单（Windows 优先）：
+
+1. 🔥 Windows 上 ffprobe 通常不存在：PATH 里找不到时用系统自带 shim "/c/Users/<用户名>/AppData/Local/Microsoft/WindowsApps/ffmpeg"（只读时长/分辨率用 ffmpeg -i 也够，输出在 stderr）。
+2. Python 缺 PIL/numpy 时先 pip install pillow（字幕烧录/拼图需要）。
+3. 字体：中文字幕用 C:/Windows/Fonts/msyh.ttc（微软雅黑）或 simhei.ttf，drawtext 的 fontfile 参数注意 Windows 路径转义。
+4. 多段检查帧拼 contact sheet：用 xstack filter_complex 拼网格后一次性读图，省轮次。
+5. 音轨电平检查：volumedetect 分段跑（-ss -t 取样），整体响度用 loudnorm=I=-21:TP=-3:LRA=9。
+6. 环境音床：anoisesrc(pink)+sine 低频组合经 lowpass/highpass/tremolo 调制，amix 时 normalize=0 防止互相拉低。
+7. 长命令拆步执行，每步带 -hide_banner -loglevel error 控制输出量。`,
+    keywords: ["ffmpeg", "ffprobe", "视频时长", "视频信息", "字幕烧录", "drawtext", "音轨", "响度", "loudnorm", "volumedetect", "环境音", "音频合成", "抽帧", "contact sheet", "xstack", "视频转码", "拼接视频"],
     category: "platform"
   },
   {

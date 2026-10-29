@@ -358,6 +358,8 @@ export class LocalDatabase {
         code_path TEXT, -- 导入项目的本地路径，NULL时使用默认 apps/{appId} 目录
         -- 🔥 项目类型：normal=普通项目，system_base=基础项目（不可删除，系统级）
         app_type TEXT NOT NULL DEFAULT 'normal',
+        -- 🔥 项目场景类型：training=训练 | inference=推理 | shortfilm=短剧/短片 | agent=Agent编排 | general=通用（NULL=未分类）
+        project_type TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -570,6 +572,18 @@ export class LocalDatabase {
       }
     } catch (error) {
       console.warn('⚠️ 检查/添加 app_type 字段失败:', error);
+    }
+
+    // 🔥 迁移：为 desktop_apps 表添加 project_type 字段（项目场景类型：training/inference/shortfilm/agent/general）
+    try {
+      const columns = this.db.prepare('PRAGMA table_info(desktop_apps)').all() as any[];
+      const hasProjectTypeColumn = columns.some(col => col.name === 'project_type');
+      if (!hasProjectTypeColumn) {
+        this.db.exec("ALTER TABLE desktop_apps ADD COLUMN project_type TEXT");
+        console.log('✅ 已为 desktop_apps 表添加 project_type 字段');
+      }
+    } catch (error) {
+      console.warn('⚠️ 检查/添加 project_type 字段失败:', error);
     }
 
     console.log('✅ 数据库表结构初始化完成（含 FTS5 全文搜索）');

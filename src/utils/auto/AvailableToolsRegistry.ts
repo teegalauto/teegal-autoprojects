@@ -207,7 +207,7 @@ export const AVAILABLE_TOOLS: ToolDefinition[] = [
 
   // 🔥 项目与账户管理
   // 创建/更新项目元信息（不带 projectId=创建；带 projectId=更新 name/description，让 LLM 维护项目自述）
-  { id: 23, name: "upsert_project", displayName: "创建/更新项目", tokens: ["gather", "execution"], params: "name, description, projectId?(传入则为更新模式)" },
+  { id: 23, name: "upsert_project", displayName: "创建/更新项目", tokens: ["gather", "execution"], params: "name, description, projectId?(传入则为更新模式), type?(场景类型:training训练|inference推理|shortfilm短剧/短片|agent编排|general通用)" },
   // 🔥 凭据管理工具（LLM 只能看到凭据名称，看不到明文值；param 型参数可写）
   { id: 24, name: "list_credentials", displayName: "查询凭据/设置参数", tokens: ["gather", "execution"], params: "action?(list=查凭据与参数; set=改参数,传name+value,仅限param型)" },
 

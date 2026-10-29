@@ -2342,6 +2342,18 @@ export async function executeStopGpuTrainTool(
 //    （产物不存 _OUTPUT_DIR / 不输出结果 JSON / 云端下载数据集走外网卡死，是最高频的三类错误）
 const TRAIN_CODE_SPEC_HINT = `⚠️ GPU训练代码三规则：①产物（模型/图表）保存到系统注入的 _OUTPUT_DIR（用 os.path.join 拼路径，勿用相对路径）；②finally 中 print 一行 JSON：{"success":true,"output":"摘要","files":["_OUTPUT_DIR/best.pt"],"charts":["_OUTPUT_DIR/x.png"]}；③云端外网受限，数据集用 list_cloud_files 返回的内网地址下载；完整模板见 use_guide('GPU训练代码约束')`;
 
+/**
+ * 🔥 项目场景类型白名单：upsert_project 的 type 参数只接受这些枚举，
+ * 未知值丢弃（不落库脏数据）。前端 AppCard 标签与注入提示都以此为准。
+ */
+const PROJECT_TYPES = ['training', 'inference', 'shortfilm', 'agent', 'general'] as const;
+
+function normalizeProjectType(v: any): string | null {
+  if (!v) return null;
+  const s = String(v).trim().toLowerCase();
+  return (PROJECT_TYPES as readonly string[]).includes(s) ? s : null;
+}
+
 export async function executeUpsertProjectTool(
   step: AutoStep,
   _planId: string,
@@ -2376,16 +2388,19 @@ export async function executeUpsertProjectTool(
       };
     }
 
-    const updates: { name?: string; description?: string } = {};
+    const updates: { name?: string; description?: string; project_type?: string } = {};
     const newName = params?.name || params?.projectName || params?.project_name;
     const newDesc = params?.description || params?.desc;
     if (newName) updates.name = String(newName);
     if (newDesc) updates.description = String(newDesc);
+    // 🔥 场景类型可选更新（training/inference/shortfilm/agent/general）
+    const newType = normalizeProjectType(params?.type || params?.projectType || params?.project_type);
+    if (newType) updates.project_type = newType;
 
-    if (!updates.name && !updates.description) {
+    if (!updates.name && !updates.description && !updates.project_type) {
       return {
         success: false,
-        error: "更新项目需至少提供 name 或 description（projectId 只用于定位项目）",
+        error: "更新项目需至少提供 name、description 或 type（projectId 只用于定位项目）",
       };
     }
 
@@ -2411,6 +2426,8 @@ export async function executeUpsertProjectTool(
   // 🔥 提取参数（支持多种参数名）
   const name = params?.name || params?.projectName || params?.project_name || `新应用 ${new Date().toLocaleTimeString()}`;
   const description = params?.description || params?.desc || '通过 LLM 工具创建的训练项目';
+  // 🔥 场景类型（training/inference/shortfilm/agent/general），注入层按类型给针对性提示
+  const projectType = normalizeProjectType(params?.type || params?.projectType || params?.project_type);
 
   try {
     console.log(`[CREATE-PROJECT] 创建项目: name="${name}", userId=${userId}`);
@@ -2428,6 +2445,7 @@ export async function executeUpsertProjectTool(
       user_id: userId,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      project_type: projectType,
     };
 
     const data = await desktopAppStorage.create(newApp);
@@ -2457,7 +2475,7 @@ export async function executeUpsertProjectTool(
         appId,
         name,
         description,
-        message: `项目 "${name}" 创建成功。appId: ${appId}\n\n现在可以使用 save_project_file(appId='${appId}', filePath='main.py', content='...') 写入代码文件，然后用 run_project_oncloud(projectId='${appId}', instanceType='...') 在云端运行。\n\n${TRAIN_CODE_SPEC_HINT}`,
+        message: `项目 "${name}" 创建成功${projectType ? `（类型: ${projectType}）` : ''}。appId: ${appId}\n\n现在可以使用 save_project_file(appId='${appId}', filePath='main.py', content='...') 写入代码文件，然后用 run_project_oncloud(projectId='${appId}', instanceType='...') 在云端运行。\n\n${TRAIN_CODE_SPEC_HINT}`,
         nextSteps: {
           saveFile: `save_project_file(appId='${appId}', filePath='main.py', content='...')`,
           listFiles: `list_project_files(appId='${appId}')`,

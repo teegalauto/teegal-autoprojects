@@ -103,8 +103,20 @@ export const DesktopAppCard = memo(({ app, index, hasResident, onAppUpdated, onA
     }
   };
 
-  // 🔥 推断项目类型：训练 > 推理 > 普通
-  const getProjectType = (): { type: 'training' | 'inference' | 'normal'; label: string; color: string } => {
+  // 🔥 项目类型标签：落库 project_type（LLM upsert_project 声明的场景类型）优先；
+  //    存量项目无落库值时退回运行记录推断（training > inference），general/未知不显示
+  const getProjectType = (): { type: string; label: string; color: string } => {
+    const pt = app.project_type;
+    if (pt && pt !== 'general') {
+      const byType: Record<string, { label: string; color: string }> = {
+        training: { label: t('workspace.desktopModule.desktopAppCard.trainingLabel'), color: 'bg-orange-100 text-orange-700' },
+        inference: { label: t('workspace.desktopModule.desktopAppCard.inferenceLabel'), color: 'bg-purple-100 text-purple-700' },
+        shortfilm: { label: t('workspace.desktopModule.desktopAppCard.shortfilmLabel'), color: 'bg-pink-100 text-pink-700' },
+        agent: { label: t('workspace.desktopModule.desktopAppCard.agentLabel'), color: 'bg-blue-100 text-blue-700' },
+      };
+      const hit = byType[pt];
+      if (hit) return { type: pt, ...hit };
+    }
     if (hasTrainingRecord) {
       return { type: 'training', label: t('workspace.desktopModule.desktopAppCard.trainingLabel'), color: 'bg-orange-100 text-orange-700' };
     }
@@ -225,12 +237,15 @@ export const DesktopAppCard = memo(({ app, index, hasResident, onAppUpdated, onA
         <CardHeader className="pb-2 relative">
           {getDisplayStatus() && (
             <div className="absolute top-2 right-2 flex items-center gap-1">
-              <span className={`text-[8px] px-1.5 py-0.5 rounded-full ${
-                getDisplayStatus()!.status === 'success' ? 'bg-green-100 text-green-700' : 
-                getDisplayStatus()!.status === 'failed' ? 'bg-red-100 text-red-700' : 
-                getDisplayStatus()!.status === 'cancelled' ? 'bg-yellow-100 text-yellow-700' :
-                'bg-blue-100 text-blue-700 animate-pulse'
-              }`}>
+              {/* 🔥 状态降权为「圆点+灰字」：type 徽章（左下）是有色身份标签，执行状态是瞬态信号，
+                  同用 100/700 色阶会打架。圆点保留红/绿/黄/蓝语义，running 用脉冲 */}
+              <span className="flex items-center gap-1 text-[9px] leading-none text-gray-400 dark:text-gray-500">
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                  getDisplayStatus()!.status === 'success' ? 'bg-green-500' :
+                  getDisplayStatus()!.status === 'failed' ? 'bg-red-400' :
+                  getDisplayStatus()!.status === 'cancelled' ? 'bg-yellow-500' :
+                  'bg-blue-500 animate-pulse'
+                }`} />
                 {getDisplayStatus()!.label}
               </span>
             </div>
@@ -301,6 +316,7 @@ export const DesktopAppCard = memo(({ app, index, hasResident, onAppUpdated, onA
     prevProps.app.id === nextProps.app.id &&
     getTimestamp(prevProps.app.updatedAt) === getTimestamp(nextProps.app.updatedAt) &&
     prevProps.app.name === nextProps.app.name &&
+    prevProps.app.project_type === nextProps.app.project_type &&
     prevProps.index === nextProps.index &&
     prevProps.hasResident === nextProps.hasResident
   );

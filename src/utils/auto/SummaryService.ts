@@ -127,6 +127,13 @@ class SummaryService {
         maxDepth: request.maxDepth,
         agentMessage: request.agentMessage, // 🔥 传递 Agent 消息
         writeNotes: request.writeNotes, // 🔥 传递累加的笔记
+        // 🔥 context 必须透传：后端 SummaryModule recordUsage('summary') 以 context.conversationId
+        // 为落库键。此前请求体漏带 context → 全部 summary 记录 sessionId=None →
+        // 回合级 token 聚合永远拿不到 summarizer 消耗
+        context: {
+          conversationId: request.context?.conversationId,
+          userId: request.context?.userId,
+        },
       }, signal);
 
       const data = result;
