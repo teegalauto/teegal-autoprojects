@@ -59,13 +59,19 @@ export const QuickCreateApp: React.FC<QuickCreateAppProps> = ({ disabled = false
       onClick={handleCreateBlankApp}
       disabled={disabled || isCreatingApp}
       title="创建空白应用"
-      className="h-7 w-7 p-0"
+      className="h-7 px-2 gap-1 text-xs"
       style={isElectron ? { WebkitAppRegion: 'no-drag' } as React.CSSProperties : {}}
     >
       {isCreatingApp ? (
-        <div className="h-4 w-4 border-2 border-gray-300 border-t-blue-600 rounded-full animate-spin" />
+        <>
+          <div className="h-3.5 w-3.5 border-2 border-gray-300 border-t-blue-600 rounded-full animate-spin" />
+          创建中...
+        </>
       ) : (
-        <PlusSquare className="h-4 w-4" />
+        <>
+          <PlusSquare className="h-3.5 w-3.5" />
+          新建项目
+        </>
       )}
     </Button>
   );

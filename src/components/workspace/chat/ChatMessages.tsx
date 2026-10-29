@@ -8,6 +8,7 @@ import { useAuth } from '@/context/AuthContext';
 import { SessionMessageGroup } from './ChatMessageItem/SessionMessageGroup';
 import { MessageData } from './ChatMessageItem/types';
 import { TraceReportApi } from '@/services/cloud/CloudApiClient';
+import { ApiClient } from '@/utils/ApiClient';
 import { Clapperboard, ArrowUpCircle, Check, Loader2, XCircle } from 'lucide-react';
 import { isInjectedMessage } from '@/utils/auto/context/RoundMemory';
 
@@ -96,14 +97,23 @@ const getRoundSlice = (messages: Message[], anchorId: string): Message[] | null 
   return messages.slice(start, end);
 };
 
+// 🔥 token 计数格式化：1234 → 1.2k、1234567 → 1.23M（回合末尾「| token: xx」用）
+const formatTokenCount = (n: number): string => {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+};
+
 /**
  * 🔥 回合末尾工具行：复制/上报整个回合轨迹，挂在本回合最后一个渲染项下方（用户习惯位置）。
  * 正常收尾=最终 summarizer/SubAgent 卡片下面；abort/关机后最后剩什么就挂什么下面。
+ * tokens>0 时追加「| token: xx」——本回合全部 LLM 调用消耗（local-backend token-usage 按 sessionId 聚合）。
  */
 const RoundTraceActions: React.FC<{
   onCopy: () => Promise<void>;
   onReport: () => Promise<boolean>;
-}> = ({ onCopy, onReport }) => {
+  tokens?: number;
+}> = ({ onCopy, onReport, tokens }) => {
   const [copied, setCopied] = useState(false);
   const [state, setState] = useState<'idle' | 'pending' | 'done' | 'error'>('idle');
 
@@ -117,7 +127,7 @@ const RoundTraceActions: React.FC<{
             setTimeout(() => setCopied(false), 2000);
           } catch { /* 忽略 */ }
         }}
-        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
+        className="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-700 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 dark:hover:text-gray-300 transition-colors"
         title={copied ? '已复制本回合完整轨迹' : '复制本回合完整轨迹'}
       >
         {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clapperboard className="w-3.5 h-3.5" />}
@@ -140,7 +150,7 @@ const RoundTraceActions: React.FC<{
             setTimeout(() => setState('idle'), 2000);
           }
         }}
-        className="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-gray-600 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors disabled:cursor-default"
+        className="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-700 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 dark:hover:text-gray-300 transition-colors disabled:cursor-default"
         title={state === 'done'
           ? '已上报，服务端保留 7 天'
           : state === 'error'
@@ -157,6 +167,14 @@ const RoundTraceActions: React.FC<{
           <ArrowUpCircle className="w-3.5 h-3.5" />
         )}
       </button>
+      {typeof tokens === 'number' && tokens > 0 && (
+        <span
+          className="ml-1 text-[11px] text-gray-400 dark:text-gray-500 select-none"
+          title="本回合 LLM 调用总 token（输入+输出，输入含缓存命中部分，搜索场景输入会偏大）"
+        >
+          | Token: {formatTokenCount(tokens)}
+        </span>
+      )}
     </div>
   );
 };
@@ -208,6 +226,62 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
   
   // 🔥 内容高度状态（用于判断是否需要滚动到底部）
   const [contentFillsContainer, setContentFillsContainer] = useState(false);
+
+  // 🔥 回合 token 消耗：local-backend 的 token-usage 按 react sessionId 聚合每次 LLM 调用记录，
+  // 回合内 session group 的 key 就是 react sessionId，按 key 求和即为该回合总消耗。
+  // 拉取时机：挂载 / isProcessing 翻转（任务结束必拉，拿最终值）/ 消息增长（10s 节流防刷请求）。
+  // 无记录（旧消息、纯聊天无 react 会话）→ Map 空 → 按钮行不显示「| token: xx」。
+  const [sessionTokens, setSessionTokens] = useState<Map<string, number>>(new Map());
+  const [summaryByKey, setSummaryByKey] = useState<Map<string, number>>(new Map());
+  const lastFetchAtRef = useRef(0);
+  const wasProcessingRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchAggregates = async () => {
+      // 任务刚结束（false 翻转）绕过节流，拿最终 token 数；其余 10s 节流
+      const force = !isProcessing && wasProcessingRef.current;
+      wasProcessingRef.current = isProcessing;
+      const now = Date.now();
+      if (!force && now - lastFetchAtRef.current < 10_000) return;
+      lastFetchAtRef.current = now;
+      try {
+        const resp = await ApiClient.llm.sessionAggregates(2);
+        const list = resp?.data;
+        if (cancelled || !Array.isArray(list)) return;
+        const map = new Map<string, number>();
+        for (const agg of list) {
+          if (agg?.sessionId && typeof agg.totalTokens === 'number') {
+            map.set(agg.sessionId, agg.totalTokens);
+          }
+        }
+        setSessionTokens(map);
+      } catch { /* 增强功能，拉取失败静默 */ }
+
+      // 🔥 summary token 按回合时间窗聚合：thinking/最终报告记录键是 conversationId（无法按
+      // session 归属），前端发回合时间窗，后端求窗口内 summary 记录总和（含纯聊天回合）
+      const rounds = roundMetaRef.current;
+      if (!cancelled && currentConversationId && rounds.length > 0) {
+        try {
+          const resp2 = await ApiClient.llm.summaryWindows(
+            String(currentConversationId),
+            rounds.map(r => ({ startTs: r.startTs, endTs: r.endTs }))
+          );
+          const totals = resp2?.data;
+          if (!cancelled && Array.isArray(totals)) {
+            const m = new Map<string, number>();
+            rounds.forEach((r, i) => {
+              if ((totals[i] || 0) > 0) m.set(r.key, totals[i]);
+            });
+            setSummaryByKey(m);
+          }
+        } catch { /* 同上，静默 */ }
+      }
+    };
+    fetchAggregates();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isProcessing, messages.length]);
 
   // 🔥 滚动到底部
   const scrollToBottom = useCallback((behavior: 'smooth' | 'auto' = 'smooth') => {
@@ -337,6 +411,52 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
     }
     return keys;
   }, [renderItems, messages, isProcessing]);
+
+  // 🔥 每回合元数据：回合分割与 roundEndKeys 完全同构（user 消息封口，注入消息不封口）。
+  // key = roundEndKeys 同款 itemKey；sessions = 回合内 session group 的 react sessionId 列表；
+  // startTs/endTs = 回合时间窗（summary 记录键是 conversationId，按窗聚合 thinking/最终报告 token）
+  const roundMeta = useMemo(() => {
+    const rounds: Array<{ key: string; sessions: string[]; startTs: number; endTs: number }> = [];
+    let sessions: string[] = [];
+    let last: string | null = null;
+    let startTs = 0;
+    const itemTs = (item: (typeof renderItems)[number]): number =>
+      item.type === 'ungrouped'
+        ? Number(item.message.timestamp || 0)
+        : Number(item.groupData.messages?.[0]?.timestamp || 0);
+    const flush = (endTs: number) => {
+      if (last) rounds.push({ key: last, sessions: [...sessions], startTs, endTs });
+      sessions = [];
+    };
+    for (const item of renderItems) {
+      if (item.type === 'ungrouped' && item.message.role === 'user' && !isInjectedMessage(item.message)) {
+        flush(startTs > 0 ? itemTs(item) - 1 : Date.now());
+        startTs = itemTs(item);
+        last = null;
+      } else {
+        if (item.type !== 'ungrouped') sessions.push(item.groupKey);
+        if (startTs === 0) startTs = itemTs(item);
+        last = item.type === 'ungrouped' ? item.message.id : `session-${item.groupKey}`;
+      }
+    }
+    flush(Date.now()); // 最后一段：未封口回合，窗口到当下（行进中 token 随轮次增长）
+    return rounds;
+  }, [renderItems]);
+
+  // 供 effect 读取最新值（roundMeta 不能进 effect deps，否则每轮重渲染都会发请求）
+  const roundMetaRef = useRef(roundMeta);
+  roundMetaRef.current = roundMeta;
+
+  // 🔥 回合 token 总消耗 = reactor（session 聚合）+ summarizer（时间窗聚合）；无记录则无键不显示
+  const roundTokenMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const r of roundMeta) {
+      const total = r.sessions.reduce((s, id) => s + (sessionTokens.get(id) || 0), 0)
+        + (summaryByKey.get(r.key) || 0);
+      if (total > 0) map.set(r.key, total);
+    }
+    return map;
+  }, [roundMeta, sessionTokens, summaryByKey]);
 
   // 🔥 复制/上报回合轨迹（按钮行挂在回合末尾渲染项下方，锚点=该渲染项首条消息）
   const handleCopyRoundTrace = useCallback(async (anchorId: string) => {
@@ -571,6 +691,7 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
                       <RoundTraceActions
                         onCopy={() => handleCopyRoundTrace(anchorId)}
                         onReport={() => handleReportTrace(anchorId)}
+                        tokens={roundTokenMap.get(itemKey)}
                       />
                     )}
                   </React.Fragment>

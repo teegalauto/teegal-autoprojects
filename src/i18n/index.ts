@@ -699,8 +699,8 @@ const resources = {
           defaultUserName: "用户"
         },
         workspaceGrid: {
-          projectsTitle: "创建项目",
-          filesTitle: "上传文件",
+          projectsTitle: "项目列表",
+          filesTitle: "文件列表",
           filterAll: "全部",
           filterNormal: "普通项目",
           filterSystemBase: "基础项目"

@@ -481,6 +481,34 @@ const stripDecorativeSeparators = (text: string): string => {
   return result;
 };
 
+// 🔥 【...】整行标题提升为 Markdown 标题：LLM 爱用【一、xxx】做小节标题，
+// 全角括号不是 markdown 语法，remark 按普通段落渲染，与正文无视觉差别（读起来乏味）。
+// 仅当整行 = 可选 emoji 前缀 + 单个【...】（≤40字、不含换行/嵌套【】）+ 可选尾冒号时
+// 转换为 ## 标题；行中夹带【】的普通句子、列表/引用行、代码块内一律不动。
+const promoteBracketHeadings = (text: string): string => {
+  if (!text.includes('【')) return text;
+
+  const placeholders: string[] = [];
+  let phId = 0;
+  const protect = (content: string): string => {
+    placeholders.push(content);
+    return `\x00BH${phId++}\x00`;
+  };
+
+  // 代码块/行内代码里的【】是内容原貌，不能动
+  let result = text
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/`[^`]+`/g, protect);
+
+  result = result.replace(
+    /^[ \t]*(?:[\p{Extended_Pictographic}\uFE0F\u200D]{1,3}[ \t]*)?【([^【】\n]{1,40})】[ \t]*[：:]?[ \t]*$/gmu,
+    '## $1'
+  );
+
+  result = result.replace(/\x00BH(\d+)\x00/g, (_, idx) => placeholders[parseInt(idx)]);
+  return result;
+};
+
 // 🔥 统一的消息文本预处理管道（content 和 result 共用，保证行为一致）
 const preprocessMessageText = (text: string): string => {
   return preprocessNumericRanges(
@@ -490,7 +518,7 @@ const preprocessMessageText = (text: string): string => {
           preprocessBareMath(
             preprocessLatexFormulas(
               preprocessMarkdownTables(
-                preprocessUrls(stripDecorativeSeparators(text))
+                promoteBracketHeadings(preprocessUrls(stripDecorativeSeparators(text)))
               )
             )
           )

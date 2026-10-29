@@ -64,11 +64,19 @@ const WorkspaceGrid = ({
   // 初始化时获取窗口宽度 + 监听窗口 resize
   useEffect(() => {
     const initWidth = async () => {
+      // 🔥 面板感知：HMR/Fast Refresh 会保留 sidePanel 状态但重跑本 effect——
+      // 面板开着时 OS 窗口是已拉宽的（原宽+500），直接把全宽给 chat 会把面板挤出窗口右缘
+      // （被 overflow-hidden 裁掉 = "chat 吞掉项目/文件面板"，需手动拖窗触发 resize 才恢复）。
+      // 与下方 handleResize 同策略：panelOpen 时减去面板宽，并同步 originalSizeRef
+      const panelOpen = sidePanelRef.current !== null;
       if (isElectron && (window as any).electron?.window) {
         const size = await (window as any).electron.window.getSize();
-        setChatWidth(size[0]);
+        setChatWidth(panelOpen ? size[0] - DESKTOP_PANEL_WIDTH : size[0]);
+        if (panelOpen) {
+          originalSizeRef.current = { width: size[0] - DESKTOP_PANEL_WIDTH, height: size[1] };
+        }
       } else {
-        setChatWidth(window.innerWidth);
+        setChatWidth(panelOpen ? window.innerWidth - DESKTOP_PANEL_WIDTH : window.innerWidth);
       }
     };
     initWidth();

@@ -25,12 +25,15 @@ interface AppTab {
   name: string;
 }
 
-const tabKey = (t: { appId?: string; url?: string }) => t.appId || t.url || '';
+// 🔥 key 按形态取：app 型用 appId，url 型用 url。url 型 tab 现在可携带归属 appId（收编链接反查），
+//    沿用旧的 `appId || url` 会撞 key（同 app 的 url tab 与 app tab 冲突 + 去重误判）
+const tabKey = (t: { type?: 'app' | 'url'; appId?: string; url?: string }) => (t.type === 'app' ? t.appId : t.url) || '';
 
 const AppViewerPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const initAppId = searchParams.get('appId') || '';
   const initUrl = searchParams.get('url') || '';
+  const ownerAppId = searchParams.get('ownerAppId') || '';
   const initName = searchParams.get('name') || '';
   const conversationId = searchParams.get('conversationId') || null;
   const { user } = useAuth();
@@ -38,7 +41,7 @@ const AppViewerPage: React.FC = () => {
   // 🔥 多 tab 状态：初始 tab 来自 URL，后续 tab 来自主进程 IPC
   const [tabs, setTabs] = useState<AppTab[]>(
     initAppId ? [{ type: 'app', appId: initAppId, name: initName }]
-    : initUrl ? [{ type: 'url', url: initUrl, name: initName }]
+    : initUrl ? [{ type: 'url', url: initUrl, name: initName, appId: ownerAppId || undefined }]
     : []
   );
   const [activeKey, setActiveKey] = useState<string>(initAppId || initUrl);
@@ -65,9 +68,10 @@ const AppViewerPage: React.FC = () => {
     const electron = (window as any).electron;
     if (!electron?.onAddAppTab) return;
     return electron.onAddAppTab(({ appId, url, name }: { appId?: string; url?: string; name?: string }) => {
-      const incoming: AppTab = appId
-        ? { type: 'app', appId, name: name || '' }
-        : { type: 'url', url, name: name || '' };
+      // 🔥 url 优先判定：收编链接现在带 appId（归属标记），但 tab 形态仍是 url 型——只有纯 {appId} 才是 app 型
+      const incoming: AppTab = url
+        ? { type: 'url', url, name: name || '', appId }
+        : { type: 'app', appId, name: name || '' };
       const key = tabKey(incoming);
       setTabs(prev => {
         if (prev.some(t => tabKey(t) === key)) {

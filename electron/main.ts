@@ -640,9 +640,9 @@ function setupIPC() {
     });
 
     // 🔥 与主窗口相同的加载策略（dev: vite server / prod: index.html + hash 路由）
-    const route = appId
+    const route = appId && !url
       ? `#/app-viewer?appId=${encodeURIComponent(appId)}${name ? `&name=${encodeURIComponent(name)}` : ''}`
-      : `#/app-viewer?url=${encodeURIComponent(url!)}${name ? `&name=${encodeURIComponent(name)}` : ''}`;
+      : `#/app-viewer?url=${encodeURIComponent(url!)}${appId ? `&ownerAppId=${encodeURIComponent(appId)}` : ''}${name ? `&name=${encodeURIComponent(name)}` : ''}`;
     if (process.env.NODE_ENV === 'development') {
       viewerWin.loadURL(`http://localhost:8080/${route}`);
     } else {
@@ -1953,6 +1953,23 @@ ipcMain.handle('app:runtime:summary', async (_event, appIds: string[]) => {
       url: urls[0] || null,
     };
   });
+});
+
+// 🔥 按 URL 反查归属 app：收编 localhost 链接时给 url 型 tab 挂 appId——「文件变更自动刷新」靠它匹配
+ipcMain.handle('app:runtime:resolve', (_event, url: string) => {
+  try {
+    const target = new URL(String(url || ''));
+    const targetKey = `${target.hostname}:${target.port}`;
+    for (const [appId, urls] of appLastUrls) {
+      for (const u of urls) {
+        try {
+          const cu = new URL(u);
+          if (`${cu.hostname}:${cu.port}` === targetKey) return appId;
+        } catch { /* 跳过非法记录 */ }
+      }
+    }
+  } catch { /* 非法 URL */ }
+  return null;
 });
 
 /**

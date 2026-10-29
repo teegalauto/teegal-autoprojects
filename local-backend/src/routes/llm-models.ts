@@ -431,6 +431,25 @@ router.get('/token-usage/session-aggregates', (req, res) => {
   }
 });
 
+// 🔥 回合级 summary token：summarizer（thinking/最终报告）记录键是 conversationId，
+// 前端按回合发时间窗，返回与窗口顺序一一对应的 token 总数（配合 session-aggregates 拼回合总消耗）
+router.post('/token-usage/summary-windows', (req, res) => {
+  try {
+    const { conversationId, windows } = req.body || {};
+    if (!conversationId || !Array.isArray(windows)) {
+      return res.status(400).json({ success: false, error: 'conversationId and windows[] are required' });
+    }
+    const totals = tokenUsageService.getSummaryTokensInWindows(
+      String(conversationId),
+      windows.slice(0, 100).map((w: any) => ({ startTs: Number(w.startTs) || 0, endTs: Number(w.endTs) || Date.now() }))
+    );
+    res.json({ success: true, data: totals });
+  } catch (error) {
+    console.error('[LLM-MODELS-API] summary-windows 聚合失败:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch summary windows' });
+  }
+});
+
 // ========== 通用路由（必须放在最后） ==========
 
 router.get('/:id', (req, res) => {

@@ -8,6 +8,7 @@
  */
 
 import React, { useEffect, useRef } from 'react';
+import { desktopAppEventService } from '@/services/events/DesktopAppEventService';
 
 const ElectronWebview = 'webview' as any; // Electron webview tag（React 无内置类型）
 
@@ -36,6 +37,45 @@ export const ServicePreview: React.FC<ServicePreviewProps> = ({ appId, url, bare
     wv.addEventListener('console-message', onConsole);
     return () => wv.removeEventListener('console-message', onConsole);
   }, [appId, url]);
+
+  // 🔥 项目文件改动自动刷新：LLM save/edit/delete_project_file 成功 → ToolHandler 广播，
+  //    匹配 appId 的 webview 1.5s 防抖 reloadIgnoringCache（一轮多文件落盘只刷一次，绕过缓存）。
+  //    双通道：同窗口走内存事件总线；查看器是独立 BrowserWindow 收不到内存事件，走 storage 事件兜底
+  useEffect(() => {
+    if (!appId) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleReload = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        try {
+          const wv = webviewRef.current;
+          if (wv?.reloadIgnoringCache) wv.reloadIgnoringCache();
+          else if (wv?.reload) wv.reload();
+          console.log('🔄 [SERVICE-RELOAD] webview 已自动刷新:', { appId, url });
+        } catch { /* webview 已销毁则忽略 */ }
+      }, 1500);
+    };
+    const unsub = desktopAppEventService.subscribe('app_updated', (event) => {
+      if (event.appId !== appId) return;
+      console.log('📡 [SERVICE-RELOAD] 收到文件变更事件（同窗口总线）:', { appId });
+      scheduleReload();
+    });
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== 'projectFilesChangedSignal' || !e.newValue) return;
+      try {
+        const signal = JSON.parse(e.newValue);
+        if (signal?.appId !== appId) return;
+        console.log('📡 [SERVICE-RELOAD] 收到文件变更信号（跨窗口 storage）:', { appId });
+        scheduleReload();
+      } catch { /* 信号解析失败忽略 */ }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => {
+      unsub();
+      window.removeEventListener('storage', onStorage);
+      if (timer) clearTimeout(timer);
+    };
+  }, [appId]);
 
   return (
     <div className="w-full h-full flex flex-col">

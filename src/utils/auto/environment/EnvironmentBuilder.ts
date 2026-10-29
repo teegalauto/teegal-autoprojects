@@ -373,7 +373,7 @@ ${knowledgeText}`;
       }
       return `- ${name}`;
     }).join('\n');
-    return `## session内部工具\n${toolList}\n💡 方括号内为关键参数名，*为扩展工具；操作projectId:base-ext 可自写工具并热重载进列表`;
+    return `## session内部工具\n${toolList}\n💡 方括号内为关键参数名，*为扩展工具；产物落盘新建项目`;
   }
 
   /**

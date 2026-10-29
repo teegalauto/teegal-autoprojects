@@ -37,6 +37,8 @@ export const ApiRoutes = {
     ALL_MODELS: '/api/llm-models/all',
     PROXY_CALL: '/api/llm-proxy/call',
     PROXY_MODELS: '/api/llm-proxy/models',
+    SESSION_AGGREGATES: '/api/llm-models/token-usage/session-aggregates',
+    SUMMARY_WINDOWS: '/api/llm-models/token-usage/summary-windows',
   },
   
   CODE_EXECUTION: {
@@ -233,6 +235,26 @@ export const ApiClient = {
       models?: Array<{ id: string; name: string; modelId: string; provider: string; requestFormat?: string }>;
       error?: string;
     }>(ApiRoutes.LLM.PROXY_MODELS, { method: 'POST', body: userId ? { userId } : {} }),
+
+    // 🔥 按 react sessionId 聚合的 token 用量（chat 回合末尾「| token: xx」显示用）
+    sessionAggregates: (days: number = 2) => request<{
+      success: boolean;
+      data?: Array<{
+        sessionId: string;
+        totalTokens: number;
+        promptTokens: number;
+        completionTokens: number;
+        reactRounds: number;
+        summaryCalls: number;
+        [key: string]: any;
+      }>;
+    }>(`${ApiRoutes.LLM.SESSION_AGGREGATES}?days=${days}`, { method: 'GET' }),
+
+    // 🔥 回合级 summary token：按 conversationId + 时间窗聚合（thinking/最终报告都记在 conversationId 下）
+    summaryWindows: (conversationId: string, windows: Array<{ startTs: number; endTs: number }>) => request<{
+      success: boolean;
+      data?: number[];
+    }>(ApiRoutes.LLM.SUMMARY_WINDOWS, { method: 'POST', body: { conversationId, windows } }),
   },
 
   codeExecution: {

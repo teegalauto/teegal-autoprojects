@@ -29,7 +29,12 @@ export function useLinkInterceptor() {
             const u = new URL(href);
             if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]') {
               if (electron?.openAppViewerWindow) {
-                electron.openAppViewerWindow({ url: href, name: u.host });
+                // 🔥 反查归属 app 挂上 appId：url 型 tab 才能匹配「文件变更自动刷新」；查不到按裸链接收编（行为不变）
+                Promise.resolve(electron.resolveAppIdByUrl ? electron.resolveAppIdByUrl(href) : null)
+                  .then((ownerAppId: string | null) => {
+                    electron.openAppViewerWindow({ url: href, name: u.host, ...(ownerAppId ? { appId: ownerAppId } : {}) });
+                  })
+                  .catch(() => electron.openAppViewerWindow({ url: href, name: u.host }));
                 return false;
               }
             }

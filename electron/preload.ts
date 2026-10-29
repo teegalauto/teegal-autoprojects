@@ -49,6 +49,7 @@ contextBridge.exposeInMainWorld('electron', {
   appendAppTrace: (appId: string, message: string) => ipcRenderer.send('app:trace:append', { appId, message }),
   takeAppTraces: (appId: string) => ipcRenderer.invoke('app:trace:take', appId),
   getAppRuntimeSummary: (appIds: string[]) => ipcRenderer.invoke('app:runtime:summary', appIds),
+  resolveAppIdByUrl: (url: string) => ipcRenderer.invoke('app:runtime:resolve', url),
   probeAppUrl: (url: string) => ipcRenderer.invoke('app:probe:url', url),
 
   /**
@@ -528,8 +529,10 @@ declare global {
         getSize: () => Promise<[number, number]>;
         setSize: (width: number, height: number) => void;
       };
-      // 🔥 打开项目查看器独立窗口（appId 型=项目 / url 型=本地服务预览）
+      // 🔥 打开项目查看器独立窗口（appId 型=项目 / url 型=本地服务预览；url+appId 同传=收编链接带归属）
       openAppViewerWindow: (opts: { appId?: string; url?: string; name?: string }) => Promise<{ success: boolean; reused?: boolean; error?: string }>;
+      // 🔥 按 URL 反查归属 app（收编 localhost 链接时挂 appId 用）
+      resolveAppIdByUrl: (url: string) => Promise<string | null>;
       // 🔥 监听主进程"新增项目 tab"
       onAddAppTab: (callback: (data: { appId?: string; url?: string; name?: string }) => void) => () => void;
       // 🔥 基础项目工具目录监视（fs.watch 热重载，appId 多账号隔离）

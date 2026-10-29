@@ -838,7 +838,7 @@ export async function executeExecuteCommandTool(
                   command,
                   outputs: outputLines,
                   exitCode: data.exitCode ?? -2,
-                  executionTime: 0,
+                  executionTime: Date.now() - streamStartTime,
                   error: cancelReason ? `用户终止原因: ${cancelReason}` : '用户主动终止命令',
                   executionId: streamExecutionId,
                 },
@@ -894,7 +894,7 @@ export async function executeExecuteCommandTool(
                 command,
                 outputs: outputLines,
                 exitCode: data.exitCode,
-                executionTime: 0,
+                executionTime: Date.now() - streamStartTime,
                 message: isSuccess ? '命令执行成功' : `命令执行失败（退出码: ${data.exitCode}）`,
                 executionId: streamExecutionId,
               },
@@ -911,8 +911,10 @@ export async function executeExecuteCommandTool(
             // 🔥 透传主进程的区分文案：总时长超时 vs 无输出挂起终止（LLM 据此选择不同自救策略）
             const timeoutMsg = data.error || '命令执行超时';
             // 🔥 自愈指引：只讲问题 + 机制 + 怎么构建命令（不导向具体工具，shell 可能跑的并非项目内容）
+            //    挂点定位真实案例：验证脚本 4 连挂各烧 120s——outputs 里"段标题已打印、结果行没来"
+            //    就是挂点，LLM 却盲猜"缺网络超时"，加了定位指引后一轮可锁定
             const idleHint = timeoutMsg.includes('无输出')
-              ? '\n\n💡 机制说明：命令有输出就一直等待，仅当长时间无输出才判定卡死并终止。常见原因：python 未加 -u（管道下块缓冲不吐字）、命令在等交互输入、依赖/路径问题卡住。请构建持续有输出的命令再重试（python 加 -u、去除交互等待、加分段打印）。'
+              ? '\n\n💡 机制说明：命令有输出就一直等待，仅当长时间无输出才判定卡死并终止。挂点定位：看 outputs 最后一段——标题已打印但没有对应结果行 = 挂在那段里，优先排查该段的无超时网络请求（urllib/requests 显式传 timeout）和对 node_modules 等大目录的递归扫描（glob/rglob 会走几万文件，先 print 再扫或排除 node_modules）。其他常见原因：等交互输入、依赖/路径卡住、shell 里手写 python 未加 -u（平台 run_python 已自动加）。重跑前加分段打印让每步进度可见。'
               : '';
             resolve({
               success: false,
@@ -947,7 +949,7 @@ export async function executeExecuteCommandTool(
             command,
             outputs: outputLines,
             exitCode: -1,
-            executionTime: timeout * 1000,
+            executionTime: Date.now() - streamStartTime,
             error: '命令执行超时',
           },
           metadata: {
@@ -1171,7 +1173,7 @@ export async function executeRunPythonTool(
               command: `python ${tempFileName}`,
               outputs: [...outputLines, '[timeout] 本地兜底：150s 无输出，判定挂起已中止'],
               exitCode: -1,
-              executionTime: 0,
+              executionTime: Date.now() - pyStartTime,
               executionId: streamResult.executionId,
             },
             metadata: { toolName: 'userpc_run_python' }
@@ -1179,6 +1181,8 @@ export async function executeRunPythonTool(
         }, 150000);
       };
 
+      // 🔥 实际耗时：正常完成/被杀路径都报真实 elapsed（此前全部硬编码 0，UI 时间列无效）
+      const pyStartTime = Date.now();
       const streamResult = executeCommandStream({
         command,
         timeout,
@@ -1210,7 +1214,7 @@ export async function executeRunPythonTool(
                 command: `python ${tempFileName}`,
                 outputs: outputLines,
                 exitCode: data.exitCode,
-                executionTime: 0,
+                executionTime: Date.now() - pyStartTime,
                 message: 'Python 代码执行完成',
                 executionId: streamResult.executionId,
               },
@@ -1234,7 +1238,7 @@ export async function executeRunPythonTool(
                 command: `python ${tempFileName}`,
                 outputs: outputLines,
                 exitCode: -1,
-                executionTime: 0,
+                executionTime: Date.now() - pyStartTime,
                 executionId: streamResult.executionId,
               },
               metadata: { toolName: 'userpc_run_python' }

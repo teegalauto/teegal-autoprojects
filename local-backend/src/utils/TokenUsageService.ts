@@ -354,6 +354,45 @@ export class TokenUsageService {
   }
 
   /**
+   * 🔥 按 conversationId + 时间窗聚合 summary 类调用 token（聊天回合级显示用）
+   *
+   * summarizer（开局 thinking / 最终报告）的记录键是 conversationId，与 react 记录（键=react sessionId）
+   * 键空间不同；前端把每个回合的时间窗 [startTs, endTs] 发过来，这里求落在窗口内的 summary 记录总和。
+   * @param windows 最多 100 个窗口，返回数组与窗口顺序一一对应
+   */
+  getSummaryTokensInWindows(conversationId: string, windows: Array<{ startTs: number; endTs: number }>): number[] {
+    // 只扫窗口覆盖到的日期桶，避免全量遍历
+    const dayKeys = new Set<string>();
+    const toDayKey = (ts: number) => {
+      const d = new Date(ts);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    for (const w of windows) {
+      dayKeys.add(toDayKey(w.startTs));
+      dayKeys.add(toDayKey(w.endTs));
+    }
+
+    const matched: Array<{ ts: number; total: number }> = [];
+    for (const date of dayKeys) {
+      const daily = this.stats.dailyUsages[date];
+      if (!daily?.records) continue;
+      for (const r of daily.records) {
+        if (r.source === 'summary' && r.sessionId === conversationId) {
+          matched.push({ ts: new Date(r.timestamp).getTime(), total: r.totalTokens || 0 });
+        }
+      }
+    }
+
+    return windows.map((w) => {
+      let total = 0;
+      for (const m of matched) {
+        if (m.ts >= w.startTs && m.ts <= w.endTs) total += m.total;
+      }
+      return total;
+    });
+  }
+
+  /**
    * 清除指定日期之前的数据（用于清理旧数据）
    */
   clearOldData(beforeDate: string): void {

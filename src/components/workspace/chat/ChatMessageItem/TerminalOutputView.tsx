@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Copy, Check, Terminal, Loader2, Square, ChevronDown, ChevronRight } from 'lucide-react';
+import { Copy, Check, Loader2, Square, ChevronDown, ChevronRight } from 'lucide-react';
 
 interface TerminalOutputData {
   type: 'terminal';
@@ -113,7 +113,6 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
           ) : (
             <ChevronRight className="w-4 h-4 text-gray-500 shrink-0" />
           )}
-          <Terminal className="w-4 h-4 text-gray-400 shrink-0" />
           <span className="text-gray-300 font-semibold whitespace-nowrap">终端输出</span>
           {isStreaming && (
             <Loader2 className="w-3 h-3 text-blue-400 animate-spin ml-1 shrink-0" />

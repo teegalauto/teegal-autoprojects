@@ -255,6 +255,17 @@ return { success: true, data: { result: llmResult.content } };
     category: "platform"
   },
   {
+    question: "报告/文档类产物保存到哪？",
+    answer: `分析报告、调研文档、笔记等非代码产物，不要放进扩展工具项目（projectId:base-ext / base-extensiontool）——它只存放工具文件（tools/ 与 registry.json）。正确做法：
+
+1. 用 upsert_project(name='项目名', description='用途说明') 新建专属项目
+2. 用 save_project_file(projectId='新项目id', filePath='文件名.md', content='...') 写入
+
+用户没有指定存放位置时，默认按上述方式新建项目，而不是复用 base-ext。`,
+    keywords: ["报告保存", "报告存哪", "保存报告", "报告文件", "写报告", "分析报告", "调研报告", "成本分析", "文档保存", "文档存哪", "保存文档", "md文件", "markdown保存", "笔记保存", "产物保存", "存到哪里", "放哪个项目", "报告项目"],
+    category: "platform"
+  },
+  {
     question: "工具文件格式是什么？",
     answer: `工具文件是 .js 纯函数体（不用 import/export），作用域内注入两个变量：
 
@@ -398,6 +409,7 @@ return { success: true, data: { greeting: '你好，' + name } };
 - 临时脚本用 userpc_run_python；跑项目用 run_project_onlocal(projectId='xxx')（自动探测入口，服务类自动脱管常驻）
 - 也可云端 CPU 执行：run_project_oncloud(instanceType='S5.*')，适合本地环境缺依赖的任务
 - 🔥 3001/3002 是 Teegal 自身后端端口（生产/开发），项目服务和测试脚本禁止占用或清理这两个端口——"清理残留端口"会杀死宿主 Teegal，导致用户界面整体瘫痪。端口冲突时项目改用其他端口（3000/5173/8xxx 等）
+- 🔥 严禁在用户电脑弹出原生命令行窗口（用户会深深不安）：Popen 拉起常驻/服务进程时 Windows 必须 creationflags=subprocess.CREATE_NO_WINDOW（npm/批处理子进程同样适用），Linux/Mac 用 start_new_session=True 并把 stdout/stderr 重定向到文件；项目服务一律优先 run_project_onlocal（托管、隐藏、状态可查、退出自动清理），不要手写 npm start 常驻
 
 🔥 重要提示：本地执行仅适合轻量级 Python 脚本、数据处理、Web 开发等 CPU 任务。
 如果代码包含 torch、cuda、transformers 等深度学习组件，强烈建议使用 GPU 训练（run_project_oncloud），原因：

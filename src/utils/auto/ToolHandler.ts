@@ -30,6 +30,7 @@ import { extensionToolRegistry, ExtensionToolContext, ExtensionToolResult } from
 import { loadBaseProjectTools, BASE_PROJECT_ID } from '@/utils/auto/BaseProjectToolLoader';
 import { ApiClient } from '@/utils/ApiClient';
 import { ToolDefinition } from '@/utils/auto/AvailableToolsRegistry';
+import { desktopAppEventService } from '@/services/events/DesktopAppEventService';
 
 export class ToolHandler {
   private userId: string;
@@ -166,6 +167,24 @@ export class ToolHandler {
     };
   }
 
+  // 🔥 项目文件写入成功后广播：ServicePreview webview 订阅后自动 reload——改完即见，用户不用手动刷新。
+  //    双通道：① 同窗口内存事件总线（app_updated）② localStorage storage 事件（查看器是独立
+  //    BrowserWindow，内存事件不互通；storage 事件只在"其他窗口"触发，恰好覆盖跨窗口方向）
+  private emitProjectFilesChanged(step: AutoStep, result: AutoToolResult) {
+    if (!result?.success) return;
+    const projectId = step.toolParams?.projectId || step.appId;
+    if (!projectId) {
+      // 🔍 验证排查锚点：工具跑成功却没广播，第一嫌疑就是参数里没取到 projectId
+      console.warn('📡 [SERVICE-RELOAD] 文件写入成功但拿不到 projectId，跳过广播:', step.toolName, step.toolParams ? Object.keys(step.toolParams) : null);
+      return;
+    }
+    try {
+      desktopAppEventService.emitAppUpdated(projectId, this.userId || '', { source: 'project_file_tool' });
+      localStorage.setItem('projectFilesChangedSignal', JSON.stringify({ appId: projectId, t: Date.now() }));
+      console.log('📡 [SERVICE-RELOAD] 已广播文件变更:', { projectId });
+    } catch { /* 广播失败不影响工具结果 */ }
+  }
+
   private registerTool(
     name: string,
     executor: (step: AutoStep, sessionId: string, onProgress?: (progress: ExecuteCommandProgress) => void) => Promise<AutoToolResult>
@@ -192,13 +211,19 @@ export class ToolHandler {
       return executeReadProjectFileTool(step, sessionId, { userId: this.userId });
     });
     this.registerTool("save_project_file", async (step: AutoStep, sessionId: string) => {
-      return executeSaveProjectFileTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId });
+      const result = await executeSaveProjectFileTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId });
+      this.emitProjectFilesChanged(step, result);
+      return result;
     });
     this.registerTool("edit_project_file", async (step: AutoStep, sessionId: string) => {
-      return executeEditProjectFileTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId });
+      const result = await executeEditProjectFileTool(step, sessionId, { userId: this.userId, conversationId: this.conversationId });
+      this.emitProjectFilesChanged(step, result);
+      return result;
     });
     this.registerTool("delete_project_file", async (step: AutoStep, sessionId: string) => {
-      return executeDeleteProjectFileTool(step, sessionId, { userId: this.userId });
+      const result = await executeDeleteProjectFileTool(step, sessionId, { userId: this.userId });
+      this.emitProjectFilesChanged(step, result);
+      return result;
     });
     
     // 🔥 任务历史工具（合并版：云端训练 train + 本地执行 localrun 双源，见 TaskHistoryTools）
