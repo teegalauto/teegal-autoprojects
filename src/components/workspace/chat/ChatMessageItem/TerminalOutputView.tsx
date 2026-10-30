@@ -98,35 +98,35 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
   };
 
   const isSuccess = exitCode === 0 || (exitCode === null && !error && !isStreaming);
-  const statusColor = isSuccess ? 'text-green-400' : 'text-red-400';
+  const statusColor = isSuccess ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400';
   const bgColor = isSuccess ? 'bg-green-600' : 'bg-red-600';
 
   return (
-    <div className="bg-gray-900 rounded-lg overflow-hidden border border-gray-700 font-mono text-xs">
+    <div className="bg-gray-50 dark:bg-gray-900 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 font-mono text-xs">
       <div
-        className="bg-gray-800 px-3 py-2 flex items-center justify-between border-b border-gray-700 cursor-pointer"
+        className="bg-gray-100 dark:bg-gray-800 px-3 py-2 flex items-center justify-between border-b border-gray-200 dark:border-gray-700 cursor-pointer"
         onClick={() => setIsExpanded(!isExpanded)}
       >
         <div className="flex items-center gap-2 min-w-0">
           {isExpanded ? (
-            <ChevronDown className="w-4 h-4 text-gray-500 shrink-0" />
+            <ChevronDown className="w-4 h-4 text-gray-400 dark:text-gray-500 shrink-0" />
           ) : (
-            <ChevronRight className="w-4 h-4 text-gray-500 shrink-0" />
+            <ChevronRight className="w-4 h-4 text-gray-400 dark:text-gray-500 shrink-0" />
           )}
-          <span className="text-gray-300 font-semibold whitespace-nowrap">终端输出</span>
+          <span className="text-gray-600 dark:text-gray-300 font-semibold whitespace-nowrap">终端输出</span>
           {isStreaming && (
-            <Loader2 className="w-3 h-3 text-blue-400 animate-spin ml-1 shrink-0" />
+            <Loader2 className="w-3 h-3 text-blue-500 dark:text-blue-400 animate-spin ml-1 shrink-0" />
           )}
         </div>
         {/* 🔥 收起态摘要：占据剩余空间单行截断（流式实时刷新），展开时不显示避免与正文重复 */}
         {!isExpanded && collapsedSummary && (
-          <span className="flex-1 min-w-0 truncate text-gray-500 ml-2 mr-2">
+          <span className="flex-1 min-w-0 truncate text-gray-400 dark:text-gray-500 ml-2 mr-2">
             {collapsedSummary}
           </span>
         )}
         <div className="flex items-center gap-2">
           {executionTime && (
-            <span className="text-gray-500">{(executionTime / 1000).toFixed(1)}s</span>
+            <span className="text-gray-400 dark:text-gray-500">{(executionTime / 1000).toFixed(1)}s</span>
           )}
           {exitCode !== null && exitCode !== undefined && (
             <span className={`px-1.5 py-0.5 rounded text-white text-[10px] ${bgColor}`}>
@@ -144,7 +144,7 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
                 e.stopPropagation();
                 handleTerminate();
               }}
-              className="text-red-400 hover:text-red-300 flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-red-900/30 transition-colors"
+              className="text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors"
               title="终止命令"
             >
               <Square className="w-3 h-3 fill-current" />
@@ -156,11 +156,11 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
               e.stopPropagation();
               handleCopy();
             }}
-            className="text-gray-400 hover:text-white flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-gray-700 transition-colors"
+            className="text-gray-400 dark:text-gray-400 hover:text-gray-700 dark:hover:text-white flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
             title="复制全部输出"
           >
             {copied ? (
-              <Check className="w-3 h-3 text-green-400" />
+              <Check className="w-3 h-3 text-green-500 dark:text-green-400" />
             ) : (
               <Copy className="w-3 h-3" />
             )}
@@ -171,15 +171,15 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
       {isExpanded && (
         <div
           ref={scrollRef}
-          className="p-3 max-h-[200px] overflow-y-auto bg-gray-950 leading-relaxed"
+          className="p-3 max-h-[200px] overflow-y-auto bg-white dark:bg-gray-950 leading-relaxed"
         >
           {command && (
-            <div className="text-gray-400 mb-2 pb-2 border-b border-gray-800">
-              <span className="text-gray-500">$</span> {command}
+            <div className="text-gray-500 dark:text-gray-400 mb-2 pb-2 border-b border-gray-200 dark:border-gray-800">
+              <span className="text-gray-400 dark:text-gray-500">$</span> {command}
             </div>
           )}
           {hasMore && (
-            <div className="text-gray-500 mb-2">
+            <div className="text-gray-400 dark:text-gray-500 mb-2">
               ... 省略前 {outputs.length - MAX_DISPLAY_LINES} 行
             </div>
           )}
@@ -189,13 +189,13 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
             </div>
           ))}
           {isStreaming && (
-            <div className="text-blue-400 mt-2 flex items-center gap-1">
+            <div className="text-blue-500 dark:text-blue-400 mt-2 flex items-center gap-1">
               <Loader2 className="w-3 h-3 animate-spin" />
               <span>等待输出...</span>
             </div>
           )}
           {error && (
-            <div className="text-red-400 mt-2 border-t border-gray-700 pt-2">
+            <div className="text-red-600 dark:text-red-400 mt-2 border-t border-gray-200 dark:border-gray-700 pt-2">
               错误: {error}
             </div>
           )}
