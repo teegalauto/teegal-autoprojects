@@ -22,12 +22,17 @@ const PROJECT_TYPE_LABELS: Record<string, string> = {
   inference: '推理',
   shortfilm: '短剧/短片',
   agent: 'Agent编排',
+  research: '深度研究',
+  ppt: '演示文稿',
 };
 // 🔥 场景 hint：一行内说完，注入行带「建议: 」前缀（可选参考，自建方案更优可不跟）
 const PROJECT_TYPE_HINTS: Record<string, string> = {
   training: '训练项目：可先 use_guide 搜"训练"参考内置流程',
   inference: '推理项目：可先 use_guide 搜"推理"参考内置用法',
   shortfilm: '短剧项目：可先 use_guide 搜"短剧"参考内置制作流程',
+  research: '深度研究项目：可先 use_guide 搜"研究"参考检索取数+Python建模验证流程',
+  ppt: '演示文稿项目：可先 use_guide 搜"ppt"参考内置制作流程',
+  agent: 'Agent编排项目：可先 use_guide 搜"agent"参考chatbot→多轮工具调用两步构建流程',
 };
 
 export interface ProjectActivityStats {
@@ -705,6 +710,7 @@ export class ImportantObjectTracker {
     const objects = this.getConversationObjects(conversationId);
 
     if (objects.length === 0) {
+      console.log(`[ObjectInject] conversation=${conversationId.slice(0, 8)} 对象缓存为空——本轮无项目注入（重启后 cache 清空属正常，靠对话历史重建）`);
       return '';
     }
 
@@ -749,6 +755,8 @@ export class ImportantObjectTracker {
         const pt = (row as any)?.project_type;
         if (pt) typeByApp.set(app.id, String(pt));
       }));
+      // 🔥 诊断 log：验证每个注入项目的 cache 命中/类型/活跃度（DevTools Console 过滤 ObjectInject）
+      console.log(`[ObjectInject] apps=${apps.map(a => `${a.id.slice(0, 8)}(提及${a.mentionCount},库${(typeByApp.get(a.id) ? 'y:' + typeByApp.get(a.id) : 'n')})`).join(' ')}`);
 
       // 🔥 运行状态（每项目 ≤20 字）：服务进程存活 + 探活状态码 + 运行时长。
       //    数据源 = 主进程运行日志池配套的 runtime:summary（进程登记/URL 记忆/退出码）
@@ -849,7 +857,9 @@ export class ImportantObjectTracker {
     // 🔥 聚焦项目关联：Files/Paths/其他对象段已移除——fileId/路径在执行历史里随取随用，
     // 常驻注入只会膨胀上下文，对"快速建立项目认知"没有增量价值
 
-    return lines.join('\n');
+    const text = lines.join('\n');
+    console.log(`[ObjectInject] 本轮注入文本:\n${text}`);
+    return text;
   }
 
   /**

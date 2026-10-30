@@ -527,6 +527,79 @@ const recordCommandSuccess = (cmd: string): void => {
   _cmdFailCounts.delete(normalizeCommandForRetry(cmd));
 };
 
+/**
+ * 🔥 批量杀进程检测（自杀防护，userpc_shell / userpc_run_python 共用）
+ * Teegal 自身（dev/打包）就跑在 node 进程链上，LLM 写"重启=先杀旧"脚本时容易把宿主应用
+ * 一起杀掉。返回拦截原因文案，null = 放行。
+ *
+ * 🔥 设计：语义判定而非写法枚举——"kill 原语 × 宿主名特征"邻域命中即拦。
+ *    写法枚举是猫鼠游戏（别名 ps/gps/gwmi、/FI 过滤器、wmic delete、CIM Terminate、
+ *    路径 -like 匹配……实测都漏过）；按"意图对象是不是宿主"判定一次覆盖所有变体。
+ *
+ * 判定顺序（先拦明确恶意 → 放行明确安全 → 启发式兜底）：
+ * 1. psutil/CIM/wmic 进程枚举 + kill 原语组合 → 拦（整族遍历杀）
+ * 2. 按名整族杀（taskkill /IM、Stop-Process -Name、pkill、killall 直接指名宿主）→ 拦
+ * 3. 字面数字 PID 精确杀 → 放行（先看一眼 Get-Process node 再 taskkill /PID xxx 是合法两步）
+ * 4. 端口反查路径（Get-NetTCPConnection / netstat -ano 拿 PID 再按 Id 杀）→ 放行
+ * 5. 启发式：按名枚举宿主 + kill 原语、过滤器(-Filter/IMAGENAME/-like/-eq)邻域含宿主名、
+ *    wmic delete、grep 宿主名后 xargs kill → 拦
+ */
+export function detectMassKill(scan: string): string | null {
+  // 宿主名特征：node/npm/electron/teegal（teegal 覆盖按产品名/路径名匹配杀宿主）
+  const HOST = '(?:node|npm|electron|teegal)';
+
+  // 1. 脚本级整族枚举杀：枚举原语 + kill 原语同时出现
+  if (/\.kill\(\)|os\.kill\(|TerminateProcess|\.terminate\(\)/.test(scan)
+    && /process_iter|Get-CimInstance|gwmi\s|wmic\s+process/i.test(scan)) {
+    return '进程枚举（psutil/wmic/CimInstance）+ kill 原语组合';
+  }
+
+  // 2. 按名整族杀：kill 语法槽位里直接写着宿主名
+  const byName = new RegExp(`taskkill[^&|;\\n]*(\\/im|-im|-fi)\\s+"?[^&|;\\n]*\\b${HOST}\\b`, 'i').test(scan)
+    || new RegExp(`Stop-Process\\s+(-name|-Name)\\s+"?${HOST}\\b`).test(scan)
+    || new RegExp(`pkill\\s+(-f\\s+)?${HOST}\\b`, 'i').test(scan)
+    || new RegExp(`killall\\s+${HOST}\\b`, 'i').test(scan)
+    || new RegExp(`wmic\\s+process[^&|;\\n]*${HOST}[^&|;\\n]*(delete|terminate)`, 'i').test(scan);
+  if (byName) return '按映像名整族杀（node/npm/electron/teegal）';
+
+  // 3. 白名单：字面数字 PID 精确杀（先枚举看看再按 PID 杀是合法操作流）
+  if (/Stop-Process\s+-Id\s+\d+\b/i.test(scan)
+    || /taskkill[^&|;\n]*\/PID\s+\d+/i.test(scan)
+    || /psutil\.Process\(\s*\d+\s*\)/i.test(scan)) {
+    return null;
+  }
+
+  // 4. 白名单：端口反查路径（PID 来自端口监听者，语义精确；按名杀仍在上面被拦）
+  if (/Get-NetTCPConnection|netstat\s+-an/i.test(scan)
+    && !new RegExp(`(Get-Process|gps|\\bps)\\s+(-Name\\s+)?"?${HOST}\\b`, 'i').test(scan)) {
+    return null;
+  }
+
+  // 5. 启发式兜底
+  // 5a. 按名枚举宿主（含别名 ps/gps）+ kill 原语同命令
+  const enumHost = new RegExp(`(Get-Process|gps|\\bps)\\s+(-Name\\s+)?"?${HOST}\\b`, 'i').test(scan)
+    && /Stop-Process|\|\s*kill\b|\.Kill\(\)/i.test(scan);
+  // 5b. 过滤器/匹配邻域含宿主名（-Filter "Name='node.exe'"、-like '*teegal*'、IMAGENAME eq 等）+ kill 原语
+  const filterHost = new RegExp(`(-filter|imagename|-like|-match|-eq|-clike|name\\s*=?\\s*['"])[^&|;\\n]*\\b${HOST}\\b`, 'i').test(scan)
+    && /taskkill|Stop-Process|Terminate|\.kill\(|killall|pkill/i.test(scan);
+  // 5c. grep/Select-String 宿主名取 PID 再杀（bash 惯用法）
+  const grepKill = new RegExp(`grep\\s+[^&|;\\n]*\\b${HOST}\\b`, 'i').test(scan)
+    && /\|\s*(xargs\s+)?kill\b|kill\s+-9/i.test(scan);
+  if (enumHost) return '按名枚举宿主进程后整批杀（Get-Process node → Stop-Process）';
+  if (filterHost) return '过滤器/路径匹配定位宿主进程后杀（-Filter/-like/IMAGENAME + 宿主名）';
+  if (grepKill) return 'grep 宿主进程名后 xargs kill';
+  return null;
+}
+
+const MASS_KILL_BLOCK_MSG = (reason: string) => formatErrorMessage({
+  title: '❌ 批量杀进程已被拦截（自杀防护）',
+  reason: `检测到${reason}——Teegal 应用本身就运行在 node 进程链上，宽匹配会把它自己一起杀掉（应用直接自杀关闭）`,
+  suggestion: `安全做法：
+1. 先枚举打印候选 PID 与完整 cmdline，人工确认目标清单里不含 Teegal 自身进程
+2. 用精确 PID 逐个杀（psutil.Process(pid).kill() 不受限制），禁止按 cmdline 子串宽匹配圈杀；按服务端口反查 PID（Get-NetTCPConnection -LocalPort xxx）再 Stop-Process -Id 也是安全做法
+3. 杀完打印存活列表核验，再进行后续启动步骤`
+});
+
 export async function executeExecuteCommandTool(
   step: AutoStep,
   _planId: string,
@@ -619,30 +692,15 @@ export async function executeExecuteCommandTool(
     };
   }
 
-  // 🔥 批量杀进程短路（两种模式）：Teegal 自身（dev/打包）就跑在 node 进程链上，LLM 写
-  //    "重启=先杀旧"脚本时按 cmdline 宽匹配（如 'workbees-Qoder' in cmdline）或按端口反查爬
-  //    进程树选杀目标，实测把 electron/vite/backend 全圈进去、一条脚本杀死宿主应用。
-  //    python 脚本经 base64 藏在命令里，先解码再扫。组合判定：
-  //    ① 脚本"进程枚举 + kill 原语"同时出现 → 短路（精确 PID kill、纯枚举查看均放行）
-  //    ② 按映像名整族杀（taskkill /IM node.exe、Stop-Process -Name node）→ 一条命令灭全家，必拦
+  // 🔥 批量杀进程短路（自杀防护，详见 detectMassKill 注释）：python 脚本经 base64 藏在
+  //    命令里，先解码再一起扫。命中即短路，不执行任何字节
   {
     const b64 = [...command.matchAll(/FromBase64String\("([A-Za-z0-9+/=]+)"\)/g)]
       .map(m => { try { return atob(m[1]); } catch { return ''; } })
       .join('\n');
-    const scan = command + '\n' + b64;
-    const scriptKill = /\.kill\(\)|os\.kill\(|TerminateProcess/.test(scan)
-      && /process_iter|Get-CimInstance|wmic\s+process/.test(scan);
-    const nameKill = /taskkill[^&|;]*(\/IM|-IM)\s+"?(node|npm|python|electron)\.exe/i.test(scan)
-      || /Stop-Process\s+(-Name|-name)\s+"?(node|npm|python|electron)"/.test(scan);
-    if (scriptKill || nameKill) {
-      const msg = formatErrorMessage({
-        title: '❌ 批量杀进程已被拦截（自杀防护）',
-        reason: '检测到"进程枚举 + kill"或"按映像名整族杀"——Teegal 应用本身就运行在 node 进程链上，宽匹配会把它自己一起杀掉（应用直接自杀关闭）',
-        suggestion: `安全做法：
-1. 先枚举打印候选 PID 与完整 cmdline，人工确认目标清单里不含 Teegal 自身进程
-2. 用精确 PID 逐个杀（psutil.Process(pid).kill() 不受限制），禁止按 cmdline 子串宽匹配圈杀
-3. 杀完打印存活列表核验，再进行后续启动步骤`
-      });
+    const reason = detectMassKill(command + '\n' + b64);
+    if (reason) {
+      const msg = MASS_KILL_BLOCK_MSG(reason);
       return {
         success: false,
         error: msg,
@@ -1091,6 +1149,26 @@ export async function executeRunPythonTool(
       success: false,
       error: '缺少 code 参数或类型不正确',
       metadata: { toolName: 'userpc_run_python' }
+    };
+  }
+
+  // 🔥 自杀防护：python 通道此前完全无检查，脚本里 subprocess/os.system 调 taskkill /IM node
+  //    或 psutil 整族枚举杀同样会杀死宿主 Teegal。与 shell 通道共用同一检测
+  const killReason = detectMassKill(code);
+  if (killReason) {
+    const msg = MASS_KILL_BLOCK_MSG(killReason);
+    return {
+      success: false,
+      error: msg,
+      data: {
+        type: 'terminal',
+        command: code.slice(0, 2000),
+        outputs: [msg],
+        exitCode: -1,
+        executionTime: 0,
+        error: msg,
+      },
+      metadata: { toolName: 'userpc_run_python' },
     };
   }
 

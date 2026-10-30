@@ -113,6 +113,8 @@ export const DesktopAppCard = memo(({ app, index, hasResident, onAppUpdated, onA
         inference: { label: t('workspace.desktopModule.desktopAppCard.inferenceLabel'), color: 'bg-purple-100 text-purple-700' },
         shortfilm: { label: t('workspace.desktopModule.desktopAppCard.shortfilmLabel'), color: 'bg-pink-100 text-pink-700' },
         agent: { label: t('workspace.desktopModule.desktopAppCard.agentLabel'), color: 'bg-blue-100 text-blue-700' },
+        research: { label: t('workspace.desktopModule.desktopAppCard.researchLabel'), color: 'bg-teal-100 text-teal-700' },
+        ppt: { label: t('workspace.desktopModule.desktopAppCard.pptLabel'), color: 'bg-emerald-100 text-emerald-700' },
       };
       const hit = byType[pt];
       if (hit) return { type: pt, ...hit };

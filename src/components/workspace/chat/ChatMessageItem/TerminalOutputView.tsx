@@ -99,7 +99,6 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
 
   const isSuccess = exitCode === 0 || (exitCode === null && !error && !isStreaming);
   const statusColor = isSuccess ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400';
-  const bgColor = isSuccess ? 'bg-green-600' : 'bg-red-600';
 
   return (
     <div className="bg-gray-50 dark:bg-gray-900 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 font-mono text-xs">
@@ -128,13 +127,22 @@ export const TerminalOutputView: React.FC<TerminalOutputViewProps> = ({ result, 
           {executionTime && (
             <span className="text-gray-400 dark:text-gray-500">{(executionTime / 1000).toFixed(1)}s</span>
           )}
+          {/* 🔥 退出状态降权为色点：成功=安静绿点（退出码进 hover），失败=红点+退出码，与卡片浅色风统一 */}
           {exitCode !== null && exitCode !== undefined && (
-            <span className={`px-1.5 py-0.5 rounded text-white text-[10px] ${bgColor}`}>
-              {isSuccess ? '✓' : `✗ ${exitCode}`}
-            </span>
+            isSuccess ? (
+              <span className="flex items-center gap-1 text-[10px] text-gray-400 dark:text-gray-500" title={`退出码 ${exitCode}（成功）`}>
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-[10px] text-red-500 dark:text-red-400" title={`退出码 ${exitCode}（失败）`}>
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+                {exitCode}
+              </span>
+            )
           )}
           {isStreaming && (
-            <span className="px-1.5 py-0.5 rounded text-white text-[10px] bg-blue-600">
+            <span className="flex items-center gap-1 text-[10px] text-blue-500 dark:text-blue-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse shrink-0" />
               执行中
             </span>
           )}

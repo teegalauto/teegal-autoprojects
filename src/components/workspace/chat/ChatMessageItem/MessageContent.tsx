@@ -1254,7 +1254,7 @@ const markdownComponents: Components = {
   },
   // 🔥 段落样式
   p({ children }) {
-    return <p className="mb-2 text-sm leading-relaxed text-gray-800 dark:text-gray-200">{children}</p>;
+    return <p className="mb-3 text-[14px] leading-[1.75] text-gray-900 dark:text-gray-200">{children}</p>;
   },
   // 🔥 标题样式 - 移除 prose 默认的 border-top
   h1({ children }) {
@@ -1264,24 +1264,24 @@ const markdownComponents: Components = {
     return <h2 className="text-base font-semibold mt-3 mb-2 !pt-0 !border-0 text-gray-900 dark:text-gray-100">{children}</h2>;
   },
   h3({ children }) {
-    return <h3 className="text-sm font-medium mt-3 mb-1.5 !pt-0 !border-0 text-gray-800 dark:text-gray-200">{children}</h3>;
+    return <h3 className="text-[15px] font-semibold mt-3 mb-1.5 !pt-0 !border-0 text-gray-900 dark:text-gray-200">{children}</h3>;
   },
   // 🔥 列表样式
   ul({ children }) {
-    return <ul className="list-disc list-inside my-2 space-y-1 text-sm text-gray-800 dark:text-gray-200">{children}</ul>;
+    return <ul className="list-disc list-inside my-2 space-y-1.5 text-[14px] leading-[1.75] text-gray-900 dark:text-gray-200">{children}</ul>;
   },
   ol({ children }) {
-    return <ol className="list-decimal list-inside my-2 space-y-1 text-sm text-gray-800 dark:text-gray-200">{children}</ol>;
+    return <ol className="list-decimal list-inside my-2 space-y-1.5 text-[14px] leading-[1.75] text-gray-900 dark:text-gray-200">{children}</ol>;
   },
   li({ children }) {
-    return <li className="text-sm text-gray-800 dark:text-gray-200">{children}</li>;
+    return <li className="text-[14px] text-gray-900 dark:text-gray-200">{children}</li>;
   },
   // 🔥 强调样式
   strong({ children }) {
     return <strong className="font-semibold text-gray-900 dark:text-gray-100">{children}</strong>;
   },
   em({ children }) {
-    return <em className="italic text-gray-800 dark:text-gray-200">{children}</em>;
+    return <em className="italic text-gray-900 dark:text-gray-200">{children}</em>;
   },
   // 🔥 链接样式（localPath = remarkLocalPaths 生成的本地路径行内链接，走 LocalPathLink 渲染）
   a({ children, href, localPath }: any) {
@@ -1302,7 +1302,7 @@ const markdownComponents: Components = {
   // 🔥 引用块样式
   blockquote({ children }) {
     return (
-      <blockquote className="border-l-4 border-gray-300 dark:border-gray-600 pl-4 my-2 italic text-gray-700 dark:text-gray-300">
+      <blockquote className="border-l-4 border-gray-300 dark:border-gray-600 pl-4 my-2 italic text-[14px] text-gray-700 dark:text-gray-300">
         {children}
       </blockquote>
     );
@@ -1348,7 +1348,7 @@ const markdownComponents: Components = {
       // 数值范围：正常显示，不使用删除线样式
       // 用浅色背景提示这是一个"范围"表示，而非删除内容
       return (
-        <span className="text-sm text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 px-1 rounded">
+        <span className="text-[14px] text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 px-1 rounded">
           {children}
         </span>
       );

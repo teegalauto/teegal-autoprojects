@@ -23,6 +23,19 @@ import { v4 as uuidv4 } from 'uuid';
 import { getUserDataPath, getAppBasePath, getAppHistoryPath, getCodePath } from './AppPathHelper';
 import { resolveProjectId } from './ProjectIdResolver';
 import { DOC_PARSE_EXTS, BINARY_TRAP_EXTS, parseDocFile, docReadError } from './docParser';
+import { detectMassKill } from '../systemtools/executeCommand';
+
+/**
+ * 🔥 写入通道自杀风险警告（save/edit_project_file 共用，警告不阻断——项目文件是用户资产）：
+ * LLM 把"批量杀宿主进程"的脚本写进项目（如重启脚本里 taskkill /IM node.exe），执行时
+ * userpc_shell 通道的静态扫描只看命令字面，跑文件路径会绕过——写入时提示一次，
+ * 让 LLM 当场改成精确 PID/端口反查写法。命中返回 ⚠️ 文案，否则返回空串。
+ */
+function massKillWriteWarning(content: string): string {
+  const reason = detectMassKill(content);
+  if (!reason) return '';
+  return `\n\n⚠️ 自杀风险提示：文件含「${reason}」代码——本应用（Teegal）自身就运行在 node/electron 进程链上，执行该文件可能把宿主应用一起杀掉。请改为：按服务端口反查 PID（Get-NetTCPConnection -LocalPort xxx）后 Stop-Process -Id 精确杀，或逐 PID 处理`;
+}
 
 // ============================================================================
 // 🔥 更新 app 的 updatedAt（touch 活跃度），使经常使用的项目排在列表前面
@@ -1380,9 +1393,9 @@ export async function executeSaveProjectFileTool(
         filePath,
         isNewFile,
         size: content.length,
-        message: isNewFile 
-          ? `创建文件 "${filePath}" 成功` 
-          : `保存文件 "${filePath}" 成功`,
+        message: (isNewFile
+          ? `创建文件 "${filePath}" 成功`
+          : `保存文件 "${filePath}" 成功`) + massKillWriteWarning(content),
       },
     };
   } catch (error) {
@@ -1765,7 +1778,7 @@ async function applyEditsToSingleFile(
     resultParts.push(`\`\`\`diff\n${diffText}\n\`\`\``);
   }
 
-  return { success: hasChanges, message: resultParts.join('\n\n'), applied: appliedEdits.length, failed: failedEdits.length };
+  return { success: hasChanges, message: resultParts.join('\n\n') + massKillWriteWarning(content), applied: appliedEdits.length, failed: failedEdits.length };
 }
 
 /**
@@ -2346,7 +2359,7 @@ const TRAIN_CODE_SPEC_HINT = `⚠️ GPU训练代码三规则：①产物（模�
  * 🔥 项目场景类型白名单：upsert_project 的 type 参数只接受这些枚举，
  * 未知值丢弃（不落库脏数据）。前端 AppCard 标签与注入提示都以此为准。
  */
-const PROJECT_TYPES = ['training', 'inference', 'shortfilm', 'agent', 'general'] as const;
+const PROJECT_TYPES = ['training', 'inference', 'shortfilm', 'agent', 'research', 'ppt', 'general'] as const;
 
 function normalizeProjectType(v: any): string | null {
   if (!v) return null;

@@ -123,7 +123,7 @@ const resources = {
           datasetRefPrompt: "Please build a training project based on this dataset."
         },
         chatHeader: {
-          title: "Chat",
+          title: "Teegal",
           newChat: "New Chat",
           projects: "Projects",
           files: "Files",
@@ -348,6 +348,8 @@ const resources = {
             inferenceLabel: "Inference",
             shortfilmLabel: "Short Film",
             agentLabel: "Agent",
+            researchLabel: "Research",
+            pptLabel: "PPT",
             codeUpdated: "Code updated",
             statusExecuting: "Executing",
             statusTraining: "Train/Run",
@@ -686,7 +688,7 @@ const resources = {
           datasetRefPrompt: "请帮我根据此数据集构建一个训练项目。"
         },
         chatHeader: {
-          title: "Chat",
+          title: "Teegal",
           newChat: "新对话",
           projects: "项目",
           files: "文件",
@@ -779,7 +781,7 @@ const resources = {
             errorOccurred: "发生错误",
             unsupportedFileType: "该文件类型暂不支持在线渲染",
             noAppsFound: "创建项目以获得GPU资源",
-            loadingApps: "加载更多项目...",
+            loadingApps: "更多项目...",
             appDetails: "应用详情",
             trainingHistory: "训练历史",
             backToList: "返回列表",
@@ -910,7 +912,9 @@ const resources = {
             trainingLabel: "训练",
             inferenceLabel: "推理",
             shortfilmLabel: "短剧",
-            agentLabel: "编排",
+            agentLabel: "Agent",
+            researchLabel: "研究",
+            pptLabel: "PPT",
             codeUpdated: "代码已更新",
             statusExecuting: "执行中",
             statusTraining: "Train/Run中",

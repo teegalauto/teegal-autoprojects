@@ -105,7 +105,7 @@ const UserMessageBubble: React.FC<UserMessageBubbleProps> = React.memo(({ messag
               // 🔥 行内代码高亮：先按 `code` 分割，代码段用 <code> 渲染，其余走 LinkText
               const parts = line.split(/(`[^`]+`)/g);
               return (
-                <p key={index} className="mb-1 text-sm leading-relaxed break-words" style={{ wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
+                <p key={index} className="mb-1 text-[14px] leading-[1.75] break-words" style={{ wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
                   {parts.map((part, i) => {
                     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
                       return (

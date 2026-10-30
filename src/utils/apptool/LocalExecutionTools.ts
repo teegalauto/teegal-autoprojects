@@ -217,9 +217,19 @@ export async function executeRunDevTool(
         },
       };
     } else {
+      // 🔥 失败回执带 stderr 尾部 + 日志指针（mvutnii1 轨迹实证：exit 1 回执只有笼统错误，
+      //    LLM 只能去项目目录翻历史日志文件（srv_err.log 是旧的，本次 stderr 根本不在那），
+      //    烧掉十几轮 shell；stderr 本就在日志池里，直接带回省掉整个排查循环——token 效率关键路径）
+      const stderrText = result.error || '';
+      const stderrTail = stderrText.length > 1500 ? '...\n' + stderrText.slice(-1500) : stderrText;
+      const parts = [
+        `本地执行失败（退出码 ${result.exitCode ?? '未知'}，耗时 ${(result.duration / 1000).toFixed(1)}秒）`,
+        stderrTail ? `\n--- stderr 尾部 ---\n${stderrTail}` : '\n(stderr 为空)',
+        result.logId ? `\n完整日志（含 stdout 全文）: get_task_detail(taskId='${result.logId}')` : '',
+      ];
       return {
         success: false,
-        error: result.error || '本地执行失败',
+        error: parts.filter(Boolean).join('\n'),
         data: {
           type: 'localExecution',
           logId: result.logId,

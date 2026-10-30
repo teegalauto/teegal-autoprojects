@@ -358,7 +358,7 @@ const OptimizedChatInput: React.FC<OptimizedChatInputProps> = ({
 
   // 🔥 新增：获取占位符文本（根据 isProcessing 状态动态变化）
   const placeholder = isProcessing
-    ? "运行过程中可以按 Enter 发送消息进行上下文补充"
+    ? "运行过程中可以按 Enter 补充上下文"
     : t('workspace.chatInput.placeholder');
 
   // 🔥 新增：禁用状态（仅禁用文件上传按钮，不禁用文本输入）

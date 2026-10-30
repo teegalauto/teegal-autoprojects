@@ -619,10 +619,12 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
 
 1. 目录约定：film/keyframes（原料帧）、film/clips（中间片段）、film/out（成品）、film/check（自查快照）——QA 快照不污染成品目录。
 2. 先定分镜和风格关键词（同一套质地/配色/纹理词在所有生图提示中逐字复述），生成关键帧与角色设定图；后续每张图都参考已有帧。
+   🔥 关键帧 check 保底：每帧生成后必须对照角色设定图核对角色一致性（脸型/发型/发色/服装/配饰），创意、情境、艺术性再好，角色漂移的帧也一律重生成——不一致的帧严禁进入下一步 image-to-video。
 3. 视频一律 image-to-video（以关键帧为输入），不要 text-to-video——一致性来自帧引用。
 4. 合成前 normalize（统一分辨率/帧率/时长）再拼接；重合成时缓存已转码片段。
-5. 成品自查三件套（生成≠完成，必须自查）：
-   - 视觉：抽帧（-ss 取中段）拼 contact sheet 后逐张读图，检查字幕对比度（白字落在浅色背景要加投影）、镜头衔接；
+5. 成品自查四件套（生成≠完成，必须自查）：
+   - 视觉：抽帧（-ss 取中段）拼 contact sheet 后逐张读图，检查镜头衔接与画面瑕疵；
+   - 字幕：当前管线默认无字幕，须按剧本主动补——对白/旁白按镜头时间轴写成 .ass（libass 渲染，样式/位置/中文字体可控），ffmpeg -i in.mp4 -vf "ass=subs.ass" out.mp4 烧录；抽帧核对时间轴对齐、无错别字、字体渲染、对比度（白字落浅色背景加投影）与位置（不压关键画面）；
    - 参数：ffprobe/ffmpeg -i 核对时长、分辨率、帧率是否符合承诺；
    - 音轨：volumedetect 分段查电平，忽大忽小就换成连续合成的环境音床（lavfi anoisesrc/sine 组合 + loudnorm）。
 6. 动手前先向用户报预算（镜头数/张数/秒数），控制在承诺范围内。
@@ -630,7 +632,42 @@ save_project_file 只用于保存代码，不生成代码。必须提供完整�
 8. 批量生图/生视频每批并发 2-3、失败单张重试；每批先落盘再继续，防中断丢批次。
 
 若项目类型标记为 shortfilm，注入环境会带提示引导先查阅本技能；自建方案更优可不参考。`,
-    keywords: ["短片", "短剧", "视频制作", "影片", "生视频", "文生视频", "图生视频", "分镜", "关键帧", "视频合成", "视频剪辑", "短视频", "电影感", "角色一致性", "风格一致", "video", "film"],
+    keywords: ["短片", "短剧", "视频制作", "影片", "生视频", "文生视频", "图生视频", "分镜", "关键帧", "视频合成", "视频剪辑", "短视频", "电影感", "角色一致性", "风格一致", "字幕", "对白", "视频加字幕", "video", "film"],
+    category: "platform"
+  },
+  {
+    question: "深度研究/数据分析类项目的标准流程是什么？",
+    answer: `研究/调研/数据分析类任务建议按"检索取数 → Python 建模验证"管线执行（比纯对话研究可靠得多，数字可复算）：
+
+1. 拆解研究问题为可检索的子问题，web_search 多轮换关键词组合，关键来源用 web_url_reader 读原文取数。
+2. 数据落盘：抓到的数字/表格立即存 CSV 或 JSON（save_project_file），不要只留在对话里——后续 Python 直接读文件复算。
+3. Python 处理（run_command）：pandas 清洗汇总，numpy/scipy 建立数学公式（拟合/回归/解析推导），matplotlib 出图存 figs/ 目录。
+4. 验证（结论前必做）：用来源中未参与建模的独立数据点对拍模型预测；同一数字多来源交叉核对；偏差大先怀疑数据口径或公式假设，再下结论。
+5. 给用户的最终报告用 HTML 而非 Markdown（save_project_file 存 report.html）——md 在无渲染环境可读性差；matplotlib 图转 base64 内嵌进 HTML，双击浏览器即可看图文报告。
+6. 结论附关键数字与图表，标注来源 URL；明确区分"来源实测数据"与"模型推算值"。
+
+若项目类型标记为 research，注入环境会带提示引导先查阅本技能；自建方案更优可不参考。`,
+    keywords: ["研究", "深度研究", "调研", "数据分析", "数学建模", "建模", "公式", "验证", "可视化", "matplotlib", "pandas", "研究报告", "research"],
+    category: "platform"
+  },
+  {
+    question: "如何构建 Agent（chatbot → 多轮工具调用）？",
+    answer: `构建 Agent 项目分两步，每步先写测试用例、测试通过再进下一步（架构红线：前端/hooks/后端分层，tool 注册与执行分离）：
+
+1. 第一步——chatbot：
+   - 前端：chat 页面（消息流/输入框/流式渲染）、conversation 列表管理、token 计数展示、模型配置面板；
+   - 后端：SQLite 三张表起步——messages（会话消息）、model_configs（模型配置）、token_usage（token 计数）；
+   - 测试分两层：逻辑层（后端接口/round 循环/SSE 事件序列）写自动化用例断言跑通；UI 层不能只看 HTTP 200——起服务截图后用 web_url_reader 读图自查（无样式/布局崩坏/交互缺失在 200 状态码下完全看不出来），两层都过才进第二步。
+2. 第二步——多轮 round react循环（在 chatbot 基础上叠加）：
+   - tool 注册表（声明 name/params/description）与 tool 执行器（分发到实际实现）分离——新增 tool 只动这两处，不改循环；
+   - round 输入固定五大模块：系统提示词、conversation history、user query、tool 列表、tool_result（round 1 为空，工具执行后回填）；
+   - 循环逻辑：LLM 返回 tool 调用 → 执行器执行 → 结果以 tool 角色消息追加回 history → 进入下一轮，直到 LLM 不再调用 tool 输出终答。
+3. 第二步同样先写用例再调测：mock tool 验证 round 循环（调用/结果回填/终止条件），测试与调整反复到位后产出。
+4. 技术栈与产出默认（用户未指定时）：前后端统一用 TypeScript（Node 后端 + ts 前端），messages/round/工具参数等核心结构共用同一套类型定义；API 用 OpenAI 格式（/v1/chat/completions、SSE data: 块 + [DONE] 终止符、标准 function calling），便于对接任意真模型；页面要美观整洁——统一 UI 组件库与配色，流式输出/加载/空态/错误态反馈齐全，交付前过一遍可用性自查。
+5. 产出后即可用该 Agent 去操作任务，或继续注册新 tool 扩展能力。
+
+若项目类型标记为 agent，注入环境会带提示引导先查阅本技能；自建方案更优可不参考。`,
+    keywords: ["agent", "智能体", "编排", "chatbot", "对话机器人", "聊天机器人", "tool", "工具调用", "多轮", "round", "function calling", "tool calling", "agent开发", "构建agent"],
     category: "platform"
   },
   {

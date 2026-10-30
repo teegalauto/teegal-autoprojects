@@ -171,10 +171,6 @@ const OptimizedChatPanel: React.FC<OptimizedChatPanelProps> = React.memo(({
             `引用凭据（项目或本地代码中用 os.environ['凭据名'] 引用会自动注入）：\n${credLines.join('\n')}`
           );
         }
-        // 🔥 引导 LLM 把重复的资源引用习惯沉淀为工具（写入工具扩展项目，固定 ID 直接可见）
-        sections.push(
-          `Tips：可将频繁引用写入projectId：base-extensiontool为扩展工具`
-        );
         finalMessage = `${messageToSend}\n\n--- 用户主动引用资源 ---\n${sections.join('\n\n')}`;
       }
 

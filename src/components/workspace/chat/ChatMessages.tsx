@@ -9,7 +9,7 @@ import { SessionMessageGroup } from './ChatMessageItem/SessionMessageGroup';
 import { MessageData } from './ChatMessageItem/types';
 import { TraceReportApi } from '@/services/cloud/CloudApiClient';
 import { ApiClient } from '@/utils/ApiClient';
-import { Clapperboard, ArrowUpCircle, Check, Loader2, XCircle } from 'lucide-react';
+import { Copy, ThumbsUp, ThumbsDown, Check, Loader2, XCircle } from 'lucide-react';
 import { isInjectedMessage } from '@/utils/auto/context/RoundMemory';
 
 interface ChatMessagesProps {
@@ -105,17 +105,71 @@ const formatTokenCount = (n: number): string => {
 };
 
 /**
- * 🔥 回合末尾工具行：复制/上报整个回合轨迹，挂在本回合最后一个渲染项下方（用户习惯位置）。
+ * 🔥 回合末尾工具行：复制 + 点赞/点踩反馈，挂在本回合最后一个渲染项下方（用户习惯位置）。
  * 正常收尾=最终 summarizer/SubAgent 卡片下面；abort/关机后最后剩什么就挂什么下面。
  * tokens>0 时追加「| token: xx」——本回合全部 LLM 调用消耗（local-backend token-usage 按 sessionId 聚合）。
+ *
+ * UI 包装说明：赞/踩背后都是「上报本回合轨迹」（收集蒸馏素材），但用户界面只呈现常规反馈
+ * ——文案不出现「轨迹/上报」字样；赞或踩仅在 trace 文本头部打 [反馈: 点赞/点踩] 标签区分。
+ * 两键共用一把锁：pending 防重入，done 锁定——同一回合反馈一次即止（防频繁提交打爆服务端）。
  */
 const RoundTraceActions: React.FC<{
   onCopy: () => Promise<void>;
-  onReport: () => Promise<boolean>;
+  onReport: (rating: 'up' | 'down') => Promise<boolean>;
   tokens?: number;
 }> = ({ onCopy, onReport, tokens }) => {
   const [copied, setCopied] = useState(false);
   const [state, setState] = useState<'idle' | 'pending' | 'done' | 'error'>('idle');
+  const [rating, setRating] = useState<'up' | 'down' | null>(null);
+
+  const submitFeedback = async (r: 'up' | 'down') => {
+    if (state !== 'idle') return; // pending 防重入；done 锁定——同一回合反馈一次即止
+    setState('pending');
+    setRating(r);
+    try {
+      const ok = await onReport(r);
+      if (ok) {
+        setState('done'); // 成功后锁定不回退（绿对勾常驻），失败才恢复可点
+      } else {
+        setState('error');
+        setTimeout(() => { setState('idle'); setRating(null); }, 2000);
+      }
+    } catch {
+      setState('error');
+      setTimeout(() => { setState('idle'); setRating(null); }, 2000);
+    }
+  };
+
+  const feedbackButton = (r: 'up' | 'down') => {
+    const isMine = rating === r;
+    const title = state === 'done'
+      ? '已反馈'
+      : state === 'error'
+      ? '提交失败，请稍后重试'
+      : (r === 'up' ? '有帮助' : '没帮助');
+    return (
+      <button
+        disabled={state !== 'idle'}
+        onClick={() => submitFeedback(r)}
+        className={`p-1 rounded transition-colors disabled:cursor-default ${
+          isMine && state === 'done'
+            ? 'text-green-500'
+            : 'text-gray-400 dark:text-gray-500 hover:text-gray-700 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 dark:hover:text-gray-300'
+        }`}
+        title={title}
+      >
+        {state === 'pending' && isMine ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        ) : state === 'done' && isMine ? (
+          <Check className="w-3.5 h-3.5 text-green-500" />
+        ) : state === 'error' && isMine ? (
+          <XCircle className="w-3.5 h-3.5 text-red-400" />
+        ) : (
+          r === 'up' ? <ThumbsUp className="w-3.5 h-3.5" /> : <ThumbsDown className="w-3.5 h-3.5" />
+        )}
+      </button>
+    );
+  };
 
   return (
     <div className="flex items-center gap-0.5 mb-3">
@@ -128,45 +182,12 @@ const RoundTraceActions: React.FC<{
           } catch { /* 忽略 */ }
         }}
         className="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-700 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 dark:hover:text-gray-300 transition-colors"
-        title={copied ? '已复制本回合完整轨迹' : '复制本回合完整轨迹'}
+        title={copied ? '已复制' : '复制'}
       >
-        {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clapperboard className="w-3.5 h-3.5" />}
+        {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
       </button>
-      <button
-        disabled={state !== 'idle'}
-        onClick={async () => {
-          if (state !== 'idle') return; // pending 防重入；done 锁定——同一回合上报一次即止（防频繁上报打爆服务端）
-          setState('pending');
-          try {
-            const ok = await onReport();
-            if (ok) {
-              setState('done'); // 成功后锁定不回退（绿对勾常驻），失败才恢复可点
-            } else {
-              setState('error');
-              setTimeout(() => setState('idle'), 2000);
-            }
-          } catch {
-            setState('error');
-            setTimeout(() => setState('idle'), 2000);
-          }
-        }}
-        className="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-700 hover:bg-gray-200/60 dark:hover:bg-gray-700/60 dark:hover:text-gray-300 transition-colors disabled:cursor-default"
-        title={state === 'done'
-          ? '已上报，服务端保留 7 天'
-          : state === 'error'
-          ? '上报失败，请稍后重试'
-          : '上报本回合轨迹'}
-      >
-        {state === 'pending' ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-        ) : state === 'done' ? (
-          <Check className="w-3.5 h-3.5 text-green-500" />
-        ) : state === 'error' ? (
-          <XCircle className="w-3.5 h-3.5 text-red-400" />
-        ) : (
-          <ArrowUpCircle className="w-3.5 h-3.5" />
-        )}
-      </button>
+      {feedbackButton('up')}
+      {feedbackButton('down')}
       {typeof tokens === 'number' && tokens > 0 && (
         <span
           className="ml-1 text-[11px] text-gray-400 dark:text-gray-500 select-none"
@@ -471,12 +492,15 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
     }
   }, [messages]);
 
-  // 🔍 上报回合轨迹到 homeweb（服务端保留 7 天）；返回是否成功供按钮反馈
-  const handleReportTrace = useCallback(async (anchorId: string): Promise<boolean> => {
+  // 🔍 上报回合轨迹到 homeweb（服务端保留 7 天）；rating 以标签形式打在 trace 文本头部
+  // （服务端零改动：/api/trace-report 存的是纯文本，标签在正文里存查时一眼可见）。
+  // UI 呈现为点赞/点踩反馈，返回是否成功供按钮反馈
+  const handleReportTrace = useCallback(async (anchorId: string, rating: 'up' | 'down'): Promise<boolean> => {
     const round = getRoundSlice(messages, anchorId);
     if (!round || !currentConversationId || currentConversationId === 'null') return false;
+    const header = rating === 'up' ? '[反馈: 点赞]' : '[反馈: 点踩]';
     try {
-      const res = await TraceReportApi.report({ conversationId: currentConversationId, trace: formatRoundTrace(round) });
+      const res = await TraceReportApi.report({ conversationId: currentConversationId, trace: `${header}\n\n${formatRoundTrace(round)}` });
       return !!res?.success;
     } catch (err) {
       console.error('上报回合轨迹失败:', err);
@@ -692,7 +716,7 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
                     {isRoundEnd && anchorId && (
                       <RoundTraceActions
                         onCopy={() => handleCopyRoundTrace(anchorId)}
-                        onReport={() => handleReportTrace(anchorId)}
+                        onReport={(rating) => handleReportTrace(anchorId, rating)}
                         tokens={roundTokenMap.get(itemKey)}
                       />
                     )}
